@@ -40,9 +40,11 @@ export function parseGeminiOtel(
   for (const root of roots) {
     for (const record of collectOtelRecords(root)) {
       const attrs = attributesToObject(record.attributes ?? record.attribute);
+      const input = finiteNumber(...attr(attrs, "gen_ai.usage.input_tokens", "input_token_count", "input_tokens"));
+      const cached = finiteNumber(...attr(attrs, "gen_ai.usage.cached_tokens", "cached_content_token_count", "cached_token_count", "cached_tokens"));
       const tokens = {
-        input: finiteNumber(...attr(attrs, "gen_ai.usage.input_tokens", "input_token_count", "input_tokens")),
-        cached: finiteNumber(...attr(attrs, "gen_ai.usage.cached_tokens", "cached_token_count", "cached_tokens")),
+        input: Math.max(0, input - cached),
+        cached,
         output: finiteNumber(...attr(attrs, "gen_ai.usage.output_tokens", "output_token_count", "output_tokens")),
         reasoning: finiteNumber(...attr(attrs, "gen_ai.usage.reasoning_tokens", "thoughts_token_count", "reasoning_tokens")),
         tool: finiteNumber(...attr(attrs, "gen_ai.usage.tool_tokens", "tool_token_count", "tool_tokens")),

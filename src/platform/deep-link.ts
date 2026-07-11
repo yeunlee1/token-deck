@@ -2,8 +2,22 @@
 import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
 
 export const AUTH_REDIRECT_URL = "token-deck://auth";
+export const AUTH_STATE_KEY = "token-deck-auth-state";
 
 export type AuthDeepLinkHandler = (url: URL) => void | Promise<void>;
+
+export function authRedirectWithState(state: string, redirectTo = AUTH_REDIRECT_URL): string {
+  const url = new URL(redirectTo);
+  url.searchParams.set("state", state);
+  return url.toString();
+}
+
+export function verifyAuthRedirectState(url: string, expectedState: string | null): void {
+  const actualState = new URL(url).searchParams.get("state");
+  if (!expectedState || !actualState || actualState !== expectedState) {
+    throw new Error("요청하지 않은 로그인 콜백을 차단했습니다.");
+  }
+}
 
 function isTauriRuntime(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;

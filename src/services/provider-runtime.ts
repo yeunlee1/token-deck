@@ -1,5 +1,6 @@
 // 저장된 공급사 자격 증명으로 사용량을 조회하고 동기화 이벤트로 변환하는 서비스
 import { loadProviderSecret, type CredentialProvider } from "./credential-store";
+import { stableId } from "../core/parse-utils";
 import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
 import { AnthropicUsageAdapter, type AnthropicCredentials } from "./providers/anthropic";
 import { GoogleCloudBillingAdapter, type GoogleCloudCredentials } from "./providers/google-cloud";
@@ -7,6 +8,7 @@ import { OpenAIUsageAdapter, type OpenAICredentials } from "./providers/openai";
 import type { ProviderUsageRecord, UsageEvent, UsageQuery } from "./types";
 
 export type ProviderCredentials = OpenAICredentials | AnthropicCredentials | GoogleCloudCredentials;
+export const ACCOUNT_PROVIDER_DEVICE_ID = "00000000-0000-4000-8000-000000000001";
 
 export function parseProviderCredentials(provider: CredentialProvider, value: string): ProviderCredentials {
   let parsed: unknown;
@@ -33,12 +35,12 @@ export async function fetchStoredProviderUsage(
   return new GoogleCloudBillingAdapter(request).fetchUsage(credentials as GoogleCloudCredentials, query);
 }
 
-export function providerRecordsToUsageEvents(records: ProviderUsageRecord[], deviceId: string): UsageEvent[] {
+export function providerRecordsToUsageEvents(records: ProviderUsageRecord[], _deviceId: string): UsageEvent[] {
   return records.map((record) => ({
     eventId: providerEventId(record),
     provider: record.provider,
     source: record.kind === "cost" ? "cloud_billing" : "provider_api",
-    deviceId,
+    deviceId: ACCOUNT_PROVIDER_DEVICE_ID,
     projectId: record.projectRef,
     model: record.model,
     occurredAt: record.occurredAt,
@@ -55,10 +57,8 @@ export function providerRecordsToUsageEvents(records: ProviderUsageRecord[], dev
 }
 
 function providerEventId(record: ProviderUsageRecord): string {
-  const value = [record.provider, record.kind, record.occurredAt, record.projectRef ?? "", record.model ?? "", record.inputTokens ?? 0, record.cachedTokens ?? 0, record.outputTokens ?? 0, record.amount ?? 0, record.currency ?? ""].join("|");
-  let hash = 2166136261;
-  for (let offset = 0; offset < value.length; offset += 1) hash = Math.imul(hash ^ value.charCodeAt(offset), 16777619);
-  return `provider_${record.provider}_${(hash >>> 0).toString(16).padStart(8, "0")}`;
+  const identity = stableId(record.provider, record.kind, record.occurredAt, record.projectRef, record.model, record.currency);
+  return `provider_${record.provider}_${identity}`;
 }
 
 function providerFetch(): typeof fetch {

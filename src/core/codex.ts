@@ -12,11 +12,15 @@ function codexTotals(record: Record<string, unknown>): TokenBreakdown | undefine
     objectAt(record, "usage");
   if (!usage) return undefined;
 
+  const input = finiteNumber(usage.input_tokens, usage.input);
+  const cached = finiteNumber(usage.cached_input_tokens, usage.cache_read_input_tokens, usage.cached);
+  const output = finiteNumber(usage.output_tokens, usage.output);
+  const reasoning = finiteNumber(usage.reasoning_output_tokens, usage.reasoning_tokens, usage.reasoning);
   return {
-    input: finiteNumber(usage.input_tokens, usage.input),
-    cached: finiteNumber(usage.cached_input_tokens, usage.cache_read_input_tokens, usage.cached),
-    output: finiteNumber(usage.output_tokens, usage.output),
-    reasoning: finiteNumber(usage.reasoning_output_tokens, usage.reasoning_tokens, usage.reasoning),
+    input: Math.max(0, input - cached),
+    cached,
+    output: Math.max(0, output - reasoning),
+    reasoning,
     tool: finiteNumber(usage.tool_tokens, usage.tool),
   };
 }
@@ -59,8 +63,15 @@ export function parseCodexJsonl(
 
     const occurredAt = isoTimestamp(record.timestamp ?? record.created_at, fallbackNow);
     const model = firstString(valueAt(record, "payload", "model"), record.model);
+    const identityTotals = [
+      cumulative.input + cumulative.cached,
+      cumulative.cached,
+      cumulative.output + cumulative.reasoning,
+      cumulative.reasoning,
+      cumulative.tool,
+    ];
     events.push({
-      id: stableId("codex", context.deviceId, sessionId, occurredAt, ...Object.values(cumulative)),
+      id: stableId("codex", context.deviceId, sessionId, occurredAt, ...identityTotals),
       provider: "codex",
       source: "local-jsonl",
       deviceId: context.deviceId,

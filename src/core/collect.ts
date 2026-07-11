@@ -12,6 +12,8 @@ export interface CollectorDocument {
   path: string;
   content: string;
   gitRemote?: string;
+  projectId?: string;
+  projectName?: string;
 }
 
 interface DocumentMetadata {
@@ -20,21 +22,23 @@ interface DocumentMetadata {
 }
 
 function metadataFromDocument(document: CollectorDocument): DocumentMetadata {
+  const metadata: DocumentMetadata = {};
   for (const record of parseJsonLines(document.content)) {
-    const cwd = firstString(
+    metadata.cwd ??= firstString(
       record.cwd,
       valueAt(record, "payload", "cwd"),
       valueAt(record, "workspace", "path"),
       valueAt(record, "attributes", "project_dir"),
     );
-    const sessionId = firstString(
+    metadata.sessionId ??= firstString(
       record.sessionId,
       record.session_id,
       valueAt(record, "payload", "session_id"),
       valueAt(record, "payload", "id"),
     );
-    if (cwd || sessionId) return { cwd, sessionId };
+    if (metadata.cwd && metadata.sessionId) return metadata;
   }
+  if (metadata.cwd || metadata.sessionId) return metadata;
 
   try {
     const root: unknown = JSON.parse(document.content);
@@ -57,7 +61,7 @@ export function collectUsageDocuments(
 ): UsageEvent[] {
   return documents.flatMap((document) => {
     const metadata = metadataFromDocument(document);
-    const projectId = identifyProject({
+    const projectId = document.projectId ?? identifyProject({
       gitRemote: document.gitRemote,
       localPath: metadata.cwd ?? `log:${document.path}`,
     }).id;
@@ -78,9 +82,9 @@ export function collectProjectDisplayNames(documents: CollectorDocument[]): Proj
   const names: ProjectNameMap = {};
   for (const document of documents) {
     const metadata = metadataFromDocument(document);
-    const name = inferProjectDisplayName({ gitRemote: document.gitRemote, cwd: metadata.cwd });
+    const name = document.projectName ?? inferProjectDisplayName({ gitRemote: document.gitRemote, cwd: metadata.cwd });
     if (!name) continue;
-    const projectId = identifyProject({
+    const projectId = document.projectId ?? identifyProject({
       gitRemote: document.gitRemote,
       localPath: metadata.cwd ?? `log:${document.path}`,
     }).id;

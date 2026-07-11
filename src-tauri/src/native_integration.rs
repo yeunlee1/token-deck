@@ -3,13 +3,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::{
     fs,
-    io::{ErrorKind, Read},
+    io::{ErrorKind, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 const AUTOSTART_VALUE_NAME: &str = "Token Deck";
+const MAX_QUOTA_SCAN_DEPTH: usize = 32;
+const MAX_QUOTA_FILES: usize = 10_000;
+const MAX_QUOTA_TAIL_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -378,18 +381,50 @@ fn parse_codex_quota(value: &Value) -> Option<ProviderQuotaStatus> {
 
 fn newest_codex_quota(root: &Path) -> Option<ProviderQuotaStatus> {
     let mut newest: Option<(SystemTime, ProviderQuotaStatus)> = None;
-    find_codex_quota(root, &mut newest);
+    let mut files_seen = 0;
+    find_codex_quota(root, &mut newest, 0, &mut files_seen);
     newest.map(|(_, quota)| quota)
 }
 
-fn find_codex_quota(root: &Path, newest: &mut Option<(SystemTime, ProviderQuotaStatus)>) {
+fn read_file_tail(path: &Path, max_bytes: u64) -> Option<String> {
+    let mut file = fs::File::open(path).ok()?;
+    let length = file.metadata().ok()?.len();
+    let start = length.saturating_sub(max_bytes);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut bytes = Vec::with_capacity((length - start).min(max_bytes) as usize);
+    file.take(max_bytes).read_to_end(&mut bytes).ok()?;
+    if start > 0 {
+        let newline = bytes.iter().position(|byte| *byte == b'\n')?;
+        bytes.drain(..=newline);
+    }
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn find_codex_quota(
+    root: &Path,
+    newest: &mut Option<(SystemTime, ProviderQuotaStatus)>,
+    depth: usize,
+    files_seen: &mut usize,
+) {
+    if depth > MAX_QUOTA_SCAN_DEPTH || *files_seen >= MAX_QUOTA_FILES {
+        return;
+    }
     let Ok(entries) = fs::read_dir(root) else {
         return;
     };
     for entry in entries.flatten() {
+        if *files_seen >= MAX_QUOTA_FILES {
+            return;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if crate::is_link_like(&file_type) {
+            continue;
+        }
         let path = entry.path();
-        if path.is_dir() {
-            find_codex_quota(&path, newest);
+        if file_type.is_dir() {
+            find_codex_quota(&path, newest, depth + 1, files_seen);
             continue;
         }
         if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
@@ -398,13 +433,14 @@ fn find_codex_quota(root: &Path, newest: &mut Option<(SystemTime, ProviderQuotaS
         let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified()) else {
             continue;
         };
+        *files_seen += 1;
         if newest
             .as_ref()
             .is_some_and(|(current, _)| *current > modified)
         {
             continue;
         }
-        let Ok(content) = fs::read_to_string(&path) else {
+        let Some(content) = read_file_tail(&path, MAX_QUOTA_TAIL_BYTES) else {
             continue;
         };
         let quota = content.lines().rev().find_map(|line| {
@@ -656,12 +692,13 @@ mod tests {
     use super::{
         autostart_launch_command, claude_quota_from_statusline, claude_statusline_command,
         is_telemetry_configured, merge_claude_statusline, merge_telemetry_settings,
-        parse_codex_quota,
+        parse_codex_quota, read_file_tail,
     };
     use serde_json::json;
     use std::{
+        fs,
         path::Path,
-        time::{Duration, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     #[test]
@@ -770,5 +807,22 @@ mod tests {
             .unwrap()
             .clone();
         assert!(merge_claude_statusline(malformed, &command).is_err());
+    }
+
+    #[test]
+    fn quota_reader_only_returns_complete_lines_from_bounded_tail() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("token-deck-quota-tail-{unique}.jsonl"));
+        let latest = r#"{"payload":{"rate_limits":{"primary":{"used_percent":9}}}}"#;
+        fs::write(&path, format!("{}\nolder\n{latest}\n", "x".repeat(200))).unwrap();
+
+        let tail = read_file_tail(&path, 100).unwrap();
+
+        assert!(!tail.contains(&"x".repeat(20)));
+        assert!(tail.contains(latest));
+        fs::remove_file(path).unwrap();
     }
 }

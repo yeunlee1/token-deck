@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import { parseClaudeJsonl } from "./claude";
 import { parseCodexJsonl } from "./codex";
 import { parseGeminiOtel } from "./gemini";
+import { stableId } from "./parse-utils";
 import { createCollectorState } from "./types";
 
 const context = {
@@ -24,10 +25,27 @@ describe("Codex JSONL collector", () => {
 
     const events = parseCodexJsonl(lines, context, state);
     expect(events.map((event) => event.tokens)).toEqual([
-      { input: 100, cached: 20, output: 10, reasoning: 0, tool: 0 },
-      { input: 40, cached: 5, output: 8, reasoning: 0, tool: 0 },
+      { input: 80, cached: 20, output: 10, reasoning: 0, tool: 0 },
+      { input: 35, cached: 5, output: 8, reasoning: 0, tool: 0 },
     ]);
     expect(parseCodexJsonl(lines, context, state)).toEqual([]);
+  });
+
+  it("does not count cached input or reasoning output twice", () => {
+    const record = JSON.stringify({
+      timestamp: "2026-07-11T00:00:01Z",
+      payload: { session_id: "s1", info: { total_token_usage: {
+        input_tokens: 23_692,
+        cached_input_tokens: 9_984,
+        output_tokens: 733,
+        reasoning_output_tokens: 255,
+        total_tokens: 24_425,
+      } } },
+    });
+
+    const [event] = parseCodexJsonl(record, context, createCollectorState());
+    expect(Object.values(event.tokens).reduce((sum, value) => sum + value, 0)).toBe(24_425);
+    expect(event.id).toBe(stableId("codex", "device-a", "s1", "2026-07-11T00:00:01.000Z", 23_692, 9_984, 733, 255, 0));
   });
 
   it("ignores malformed and content-only lines", () => {
@@ -46,13 +64,13 @@ describe("Claude JSONL collector", () => {
       message: {
         model: "claude-sonnet",
         content: [{ type: "text", text: "private response" }],
-        usage: { input_tokens: 20, cache_read_input_tokens: 4, output_tokens: 7 },
+        usage: { input_tokens: 20, cache_creation_input_tokens: 6, cache_read_input_tokens: 4, output_tokens: 7, thinking_tokens: 3 },
       },
     });
 
     const events = parseClaudeJsonl(`${record}\n${record}`, context, state);
     expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({ requestId: "req-1", tokens: { input: 20, cached: 4, output: 7 } });
+    expect(events[0]).toMatchObject({ requestId: "req-1", tokens: { input: 20, cached: 10, output: 4, reasoning: 3 } });
     expect(JSON.stringify(events)).not.toContain("private response");
   });
 });
@@ -70,6 +88,7 @@ describe("Gemini OTel collector", () => {
               { key: "gen_ai.request.id", value: { stringValue: "gemini-r1" } },
               { key: "gen_ai.request.model", value: { stringValue: "gemini-2.5-pro" } },
               { key: "gen_ai.usage.input_tokens", value: { intValue: "11" } },
+              { key: "cached_content_token_count", value: { intValue: "4" } },
               { key: "gen_ai.usage.output_tokens", value: { intValue: "9" } },
               { key: "thoughts_token_count", value: { intValue: 3 } },
             ],
@@ -85,7 +104,7 @@ describe("Gemini OTel collector", () => {
       sessionId: "gemini-s1",
       requestId: "gemini-r1",
       model: "gemini-2.5-pro",
-      tokens: { input: 11, output: 9, reasoning: 3 },
+      tokens: { input: 7, cached: 4, output: 9, reasoning: 3 },
     });
     expect(parseGeminiOtel(payload, context, state)).toEqual([]);
     expect(JSON.stringify(events)).not.toContain("private prompt");

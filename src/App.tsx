@@ -1,6 +1,7 @@
 // AI 도구별 실제 토큰 사용량과 계정 연결 상태를 통합해 보여주는 데스크톱 대시보드
 import { useEffect, useMemo, useState } from "react";
 import { buildUsageChart, type ChartPeriod } from "./components/chart-data";
+import { selectProjectDeviceEvents } from "./components/dashboard-usage";
 import { Icon, type IconName } from "./components/Icon";
 import { MiniDashboard } from "./components/MiniDashboard";
 import { ProjectNameEditor } from "./components/ProjectNameEditor";
@@ -71,6 +72,7 @@ export default function App() {
   const usageEvents = runtime.combinedEvents;
   const visibleEvents = useMemo(() => usageEvents.filter((event) => displayProviders.includes(event.provider)), [displayProviders, usageEvents]);
   const periodEvents = useMemo(() => usageInPeriod(visibleEvents, period), [visibleEvents, period]);
+  const projectDeviceEvents = useMemo(() => selectProjectDeviceEvents(runtime.localSessionEvents, displayProviders, periodStart(period)), [displayProviders, period, runtime.localSessionEvents]);
   const actualTotal = useMemo(() => periodEvents.reduce((sum, event) => sum + tokenTotal(event.tokens), 0), [periodEvents]);
   const chartData = useMemo(() => buildUsageChart(visibleEvents, period), [visibleEvents, period]);
 
@@ -106,7 +108,7 @@ export default function App() {
 
   const projects = useMemo(() => {
     const grouped = new Map<string, UsageEvent[]>();
-    periodEvents.forEach((event) => grouped.set(event.projectId, [...(grouped.get(event.projectId) ?? []), event]));
+    projectDeviceEvents.forEach((event) => grouped.set(event.projectId, [...(grouped.get(event.projectId) ?? []), event]));
     const totals = [...grouped.entries()].map(([id, events]) => ({ id, events, value: events.reduce((sum, event) => sum + tokenTotal(event.tokens), 0) }));
     const max = Math.max(...totals.map((project) => project.value), 1);
     return totals.sort((a, b) => b.value - a.value).map(({ id, events, value }, index) => ({
@@ -118,10 +120,10 @@ export default function App() {
       devices: new Set(events.map((event) => event.deviceId)).size,
       providers: new Set(events.map((event) => event.provider)).size,
     }));
-  }, [periodEvents, runtime.projectNameOverrides, runtime.projectNames]);
+  }, [projectDeviceEvents, runtime.projectNameOverrides, runtime.projectNames]);
 
   const deviceUsage = useMemo(() => runtime.devices.map((device) => {
-    const events = periodEvents.filter((event) => event.deviceId === device.id);
+    const events = projectDeviceEvents.filter((event) => event.deviceId === device.id);
     const byProvider = displayProviders.map((provider) => ({
       provider,
       value: events.filter((event) => event.provider === provider).reduce((sum, event) => sum + tokenTotal(event.tokens), 0),
@@ -134,7 +136,7 @@ export default function App() {
       projectCount: new Set(events.map((event) => event.projectId)).size,
       byProvider,
     };
-  }).sort((a, b) => b.total - a.total), [currentDeviceId, displayProviders, periodEvents, runtime.devices]);
+  }).sort((a, b) => b.total - a.total), [currentDeviceId, displayProviders, projectDeviceEvents, runtime.devices]);
 
   const sessions = useMemo(() => {
     const latest = new Map<string, UsageEvent>();

@@ -7,7 +7,7 @@ export interface AnthropicCredentials {
 }
 
 interface UsagePage {
-  data?: Array<Record<string, unknown>>;
+  data?: Array<{ starting_at?: string; results?: Array<Record<string, unknown>> }>;
   has_more?: boolean;
   next_page?: string | null;
 }
@@ -34,24 +34,31 @@ export class AnthropicUsageAdapter implements ProviderUsageAdapter<AnthropicCred
           "anthropic-version": "2023-06-01",
         },
       });
-      for (const item of response.data ?? []) records.push(toRecord(item));
+      for (const bucket of response.data ?? []) {
+        for (const result of bucket.results ?? []) records.push(toRecord(bucket.starting_at, result));
+      }
       page = response.has_more ? response.next_page ?? undefined : undefined;
     } while (page);
     return records;
   }
 }
 
-function toRecord(value: Record<string, unknown>): ProviderUsageRecord {
+function toRecord(startingAt: string | undefined, value: Record<string, unknown>): ProviderUsageRecord {
   const usage = objectValue(value.usage);
+  const cacheCreation = objectValue(value.cache_creation);
   return {
     provider: "anthropic",
     kind: "tokens",
-    occurredAt: stringValue(value.starting_at) ?? new Date(0).toISOString(),
+    occurredAt: startingAt ?? new Date(0).toISOString(),
     projectRef: stringValue(value.workspace_id),
     model: stringValue(value.model),
-    inputTokens: numberValue(usage.input_tokens),
-    cachedTokens: numberValue(usage.cache_read_input_tokens) + numberValue(usage.cache_creation_input_tokens),
-    outputTokens: numberValue(usage.output_tokens),
+    inputTokens: numberValue(value.uncached_input_tokens) + numberValue(usage.input_tokens),
+    cachedTokens: numberValue(value.cache_read_input_tokens)
+      + numberValue(cacheCreation.ephemeral_1h_input_tokens)
+      + numberValue(cacheCreation.ephemeral_5m_input_tokens)
+      + numberValue(usage.cache_read_input_tokens)
+      + numberValue(usage.cache_creation_input_tokens),
+    outputTokens: numberValue(value.output_tokens) + numberValue(usage.output_tokens),
     raw: value,
   };
 }

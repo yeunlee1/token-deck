@@ -7,6 +7,8 @@ export interface LocalLogDocument {
   modifiedAt: number;
   content: string;
   gitRemote?: string;
+  projectId?: string;
+  projectName?: string;
 }
 
 export interface IntegrationStatus {

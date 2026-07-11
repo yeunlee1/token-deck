@@ -12,14 +12,21 @@ describe("공급사 사용량 어댑터", () => {
       data: [{ start_time: 1782864000, results: [{ project_id: "p1", model: "gpt-5", input_tokens: 12, input_cached_tokens: 3, output_tokens: 4 }] }],
     }));
     const result = await new OpenAIUsageAdapter(request).fetchUsage({ adminApiKey: "secret" }, query);
-    expect(result[0]).toEqual(expect.objectContaining({ kind: "tokens", projectRef: "p1", inputTokens: 12, cachedTokens: 3 }));
+    expect(result[0]).toEqual(expect.objectContaining({ kind: "tokens", projectRef: "p1", inputTokens: 9, cachedTokens: 3 }));
     expect(new Headers(request.mock.calls[0][1].headers).get("Authorization")).toBe("Bearer secret");
   });
 
   it("Anthropic 캐시 생성과 읽기 토큰을 합산한다", async () => {
-    const request = vi.fn().mockResolvedValue(json({ data: [{ starting_at: "2026-07-01T00:00:00Z", usage: { input_tokens: 7, cache_creation_input_tokens: 2, cache_read_input_tokens: 5, output_tokens: 3 } }] }));
+    const request = vi.fn().mockResolvedValue(json({ data: [{
+      starting_at: "2026-07-01T00:00:00Z",
+      results: [{
+        workspace_id: "workspace-1", model: "claude-sonnet", uncached_input_tokens: 7,
+        cache_creation: { ephemeral_1h_input_tokens: 2, ephemeral_5m_input_tokens: 3 },
+        cache_read_input_tokens: 5, output_tokens: 3,
+      }],
+    }] }));
     const result = await new AnthropicUsageAdapter(request).fetchUsage({ adminApiKey: "admin" }, query);
-    expect(result[0]).toEqual(expect.objectContaining({ inputTokens: 7, cachedTokens: 7, outputTokens: 3 }));
+    expect(result[0]).toEqual(expect.objectContaining({ projectRef: "workspace-1", inputTokens: 7, cachedTokens: 10, outputTokens: 3 }));
   });
 
   it("Google Billing 비용 행을 토큰과 분리한다", async () => {

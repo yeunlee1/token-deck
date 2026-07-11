@@ -22,3 +22,8 @@ export async function removeProviderSecret(provider: CredentialKey): Promise<voi
   ensureDesktop();
   await invoke("remove_provider_secret", { provider });
 }
+
+export async function removeProviderSecretIfMarker(provider: CredentialKey, marker: string): Promise<boolean> {
+  ensureDesktop();
+  return invoke<boolean>("remove_provider_secret_if_marker", { provider, marker });
+}

@@ -2,7 +2,8 @@
 import { describe, expect, it } from "vitest";
 
 import { aggregateByProject, aggregateByProvider } from "./aggregate";
-import { collectUsageDocuments } from "./collect";
+import { collectProjectDisplayNames, collectUsageDocuments } from "./collect";
+import { identifyProject } from "./project-identity";
 import { createCollectorState } from "./types";
 
 describe("usage document orchestration", () => {
@@ -21,6 +22,42 @@ describe("usage document orchestration", () => {
     expect(events[0].sessionId).toBe("session-1");
     expect(events[0].projectId).toMatch(/^local_[a-f0-9]{64}$/);
     expect(JSON.stringify(events)).not.toContain("private-repo");
+  });
+
+  it("accumulates a session id and cwd found on different JSONL rows", () => {
+    const cwd = "C:\\work\\split-metadata-project";
+    const content = [
+      JSON.stringify({ type: "session_meta", payload: { id: "session-split" } }),
+      JSON.stringify({ cwd, timestamp: "2026-07-11T00:00:00Z", payload: { session_id: "session-split", info: { total_token_usage: { input_tokens: 8, output_tokens: 2 } } } }),
+    ].join("\n");
+
+    const events = collectUsageDocuments(
+      [{ provider: "codex", path: "C:\\logs\\unrelated-session-file.jsonl", content }],
+      "device-1",
+      createCollectorState(),
+    );
+
+    expect(events).toHaveLength(1);
+    expect(events[0].sessionId).toBe("session-split");
+    expect(events[0].projectId).toBe(identifyProject({ localPath: cwd }).id);
+    expect(events[0].projectId).not.toBe(identifyProject({ localPath: "log:C:\\logs\\unrelated-session-file.jsonl" }).id);
+  });
+
+  it("uses Rust project identity and basename without exposing the original cwd", () => {
+    const cwd = "C:\\Users\\person\\private\\newSteel";
+    const projectId = identifyProject({ localPath: cwd }).id;
+    const content = [
+      JSON.stringify({ type: "session_meta", payload: { id: "session-safe", cwd: "local_redacted" } }),
+      JSON.stringify({ timestamp: "2026-07-11T00:00:00Z", payload: { session_id: "session-safe", info: { total_token_usage: { input_tokens: 5 } } } }),
+    ].join("\n");
+    const document = { provider: "codex" as const, path: "log_safe", content, projectId, projectName: "newSteel" };
+
+    const events = collectUsageDocuments([document], "device-1", createCollectorState());
+    const names = collectProjectDisplayNames([document]);
+
+    expect(events[0].projectId).toBe(projectId);
+    expect(names[projectId]).toBe("newSteel");
+    expect(JSON.stringify(document)).not.toContain("person");
   });
 
   it("aggregates normalized events by provider and project", () => {

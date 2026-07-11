@@ -44,6 +44,34 @@ export function mergeUsageWithProviderAuthority(local: CollectorUsageEvent[], cl
   return mergeCollectorUsageEvents(localWithoutCloudDuplicates, cloudWithoutLocalDuplicates);
 }
 
+export interface UsageViews {
+  localSessionEvents: CollectorUsageEvent[];
+  accountProviderEvents: CollectorUsageEvent[];
+  combinedEvents: CollectorUsageEvent[];
+}
+
+export function buildUsageViews(local: CollectorUsageEvent[], cloud: CollectorUsageEvent[]): UsageViews {
+  const localSessions = local.filter((event) => event.source !== "provider-api");
+  const syncedSessions = cloud.filter((event) => event.source !== "provider-api");
+  const accountProviderEvents = deduplicateProviderBuckets(cloud.filter((event) => event.source === "provider-api"));
+  const localSessionEvents = mergeCollectorUsageEvents(localSessions, syncedSessions);
+  return {
+    localSessionEvents,
+    accountProviderEvents,
+    combinedEvents: localSessionEvents,
+  };
+}
+
+function deduplicateProviderBuckets(events: CollectorUsageEvent[]): CollectorUsageEvent[] {
+  const buckets = new Map<string, CollectorUsageEvent>();
+  for (const event of events) {
+    const key = [event.provider, event.occurredAt, event.projectId, event.model ?? ""].join("\u001f");
+    const current = buckets.get(key);
+    if (!current || event.id.length >= current.id.length) buckets.set(key, event);
+  }
+  return [...buckets.values()];
+}
+
 export function mergeSessionTitles(current: Record<string, string>, events: SyncUsageEvent[]): Record<string, string> {
   const merged = { ...current };
   let changed = false;

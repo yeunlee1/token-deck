@@ -48,14 +48,16 @@ function headers(credentials: OpenAICredentials): HeadersInit {
 }
 
 function toRecord(startTime: number | undefined, value: Record<string, unknown>): ProviderUsageRecord {
+  const input = numberValue(value.input_tokens);
+  const cached = numberValue(value.input_cached_tokens);
   return {
     provider: "openai",
     kind: "tokens",
     occurredAt: new Date((startTime ?? 0) * 1000).toISOString(),
     projectRef: stringValue(value.project_id),
     model: stringValue(value.model),
-    inputTokens: numberValue(value.input_tokens),
-    cachedTokens: numberValue(value.input_cached_tokens),
+    inputTokens: Math.max(0, input - cached),
+    cachedTokens: cached,
     outputTokens: numberValue(value.output_tokens),
     raw: value,
   };

@@ -1,15 +1,17 @@
 // 로컬 수집, 계정 동기화, 공급사 사용량 조회를 하나의 앱 런타임으로 연결하는 훅
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { UsageEvent as LocalUsageEvent } from "../core";
-import { AUTH_REDIRECT_URL, listenForAuthDeepLinks } from "../platform/deep-link";
+import { AUTH_REDIRECT_URL, AUTH_STATE_KEY, authRedirectWithState, listenForAuthDeepLinks, verifyAuthRedirectState } from "../platform/deep-link";
 import {
   fetchStoredProviderUsage,
+  ACCOUNT_PROVIDER_DEVICE_ID,
+  buildUsageViews,
   loadProviderSecret,
-  mergeUsageWithProviderAuthority,
   mergeSessionTitles,
   providerRecordsToUsageEvents,
   parseProviderCredentials,
   removeProviderSecret,
+  removeProviderSecretIfMarker,
   storeProviderSecret,
   SupabaseAuthService,
   SupabaseRestClient,
@@ -53,10 +55,13 @@ export function useAppRuntime() {
   const [credentials, setCredentials] = useState<Record<CredentialProvider, CredentialStatus>>(() => emptyCredentialStatus());
   const [providerUsage, setProviderUsage] = useState<ProviderUsageRecord[]>([]);
   const [remoteEvents, setRemoteEvents] = useState<LocalUsageEvent[]>([]);
+  const [remoteAccountEvents, setRemoteAccountEvents] = useState<SyncUsageEvent[]>([]);
   const [devices, setDevices] = useState<DeviceRegistration[]>(() => [currentDevice()]);
   const [providerEvents, setProviderEvents] = useState<SyncUsageEvent[]>([]);
   const [sessionTitles, setSessionTitles] = useState<Record<string, string>>(() => readJson(TITLES_KEY, {}));
   const syncingRef = useRef(false);
+  const accountGenerationRef = useRef(0);
+  const skipNextRestoreRef = useRef(false);
 
   const refreshCredentialStatus = useCallback(async () => {
     const providers: CredentialProvider[] = ["openai", "anthropic", "google"];
@@ -75,44 +80,73 @@ export function useAppRuntime() {
 
   useEffect(() => {
     if (!client.enabled) return;
+    if (skipNextRestoreRef.current) {
+      skipNextRestoreRef.current = false;
+      return;
+    }
+    const generation = accountGenerationRef.current;
+    let cancelled = false;
     const restore = async () => {
       try {
-        const saved = await loadStoredSession();
+        const saved = await loadStoredSession(sessionScope(client.config));
         if (!saved?.accessToken) return;
         const session = saved.expiresAt && saved.expiresAt <= Math.floor(Date.now() / 1000) + 30 && saved.refreshToken
           ? await authService.refresh(saved.refreshToken)
           : saved;
+        if (cancelled || generation !== accountGenerationRef.current) return;
         authService.acceptSession(session);
-        await persistSession(session);
+        const marker = await persistSession(session, sessionScope(client.config));
+        if (cancelled || generation !== accountGenerationRef.current) {
+          await removePersistedSession(marker);
+          return;
+        }
         setAuth({ enabled: true, status: "authenticated", userId: session.userId ?? jwtSubject(session.accessToken) });
         setCloudSync((current) => ({ ...current, status: "idle", error: undefined }));
       } catch (cause) {
+        if (cancelled || generation !== accountGenerationRef.current) return;
         window.localStorage.removeItem(SESSION_KEY);
         setAuth({ enabled: true, status: "signed_out", error: message(cause) });
       }
     };
     void restore();
-  }, [authService, client.enabled]);
+    return () => { cancelled = true; };
+  }, [authService, client]);
 
   const sendMagicLink = useCallback(async (email: string, redirectTo?: string) => {
     if (!client.enabled) throw new Error("Supabase 환경 설정이 없어 로컬 전용 모드입니다.");
-    await authService.sendMagicLink(email, redirectTo ?? AUTH_REDIRECT_URL);
+    const state = crypto.randomUUID();
+    window.localStorage.setItem(AUTH_STATE_KEY, state);
+    await authService.sendMagicLink(email, authRedirectWithState(state, redirectTo ?? AUTH_REDIRECT_URL));
   }, [authService, client.enabled]);
 
   const acceptAuthRedirect = useCallback(async (url: string) => {
+    const generation = accountGenerationRef.current;
+    const scope = sessionScope(client.config);
+    verifyAuthRedirectState(url, window.localStorage.getItem(AUTH_STATE_KEY));
+    window.localStorage.removeItem(AUTH_STATE_KEY);
     const session = authService.acceptRedirectUrl(url);
     const complete = { ...session, userId: session.userId ?? jwtSubject(session.accessToken) };
     authService.acceptSession(complete);
-    await persistSession(complete);
+    if (generation !== accountGenerationRef.current || scope !== sessionScope(client.config)) return;
+    const marker = await persistSession(complete, scope);
+    if (generation !== accountGenerationRef.current || scope !== sessionScope(client.config)) {
+      await removePersistedSession(marker);
+      return;
+    }
     setAuth({ enabled: true, status: "authenticated", userId: complete.userId });
     setCloudSync((current) => ({ ...current, status: "idle", error: undefined }));
-  }, [authService]);
+  }, [authService, client.config?.url]);
 
   useEffect(() => {
     let disposed = false;
     let unlisten: (() => void) | undefined;
     void listenForAuthDeepLinks(async (url) => {
-      if (!disposed) await acceptAuthRedirect(url.toString());
+      if (disposed) return;
+      try {
+        await acceptAuthRedirect(url.toString());
+      } catch (cause) {
+        if (!disposed) setAuth((current) => ({ ...current, error: message(cause) }));
+      }
     }).then((cleanup) => {
       if (disposed) cleanup();
       else unlisten = cleanup;
@@ -120,18 +154,24 @@ export function useAppRuntime() {
     return () => { disposed = true; unlisten?.(); };
   }, [acceptAuthRedirect]);
 
-  const signOut = useCallback(() => {
+  const signOut = useCallback(async () => {
+    accountGenerationRef.current += 1;
+    syncingRef.current = false;
     authService.signOutLocally();
     window.localStorage.removeItem(SESSION_KEY);
-    void removeProviderSecret("supabase").catch(() => undefined);
+    window.localStorage.removeItem(AUTH_STATE_KEY);
     setAuth({ enabled: client.enabled, status: client.enabled ? "signed_out" : "local" });
     setRemoteEvents([]);
+    setRemoteAccountEvents([]);
     setDevices([currentDevice()]);
     setCloudSync({ status: client.enabled ? "signed_out" : "disabled", uploaded: 0, pending: 0 });
+    await removeProviderSecret("supabase").catch(() => undefined);
   }, [authService, client.enabled]);
 
   const syncNow = useCallback(async () => {
+    const generation = accountGenerationRef.current;
     await local.refresh();
+    if (generation !== accountGenerationRef.current) return;
     if (!client.enabled) {
       setCloudSync({ status: "disabled", uploaded: 0, pending: 0 });
       return;
@@ -141,15 +181,22 @@ export function useAppRuntime() {
       return;
     }
     if (client.currentSession.expiresAt && client.currentSession.expiresAt <= Math.floor(Date.now() / 1000) + 30) {
-      const refreshToken = client.currentSession.refreshToken ?? (await loadStoredSession())?.refreshToken;
+      const refreshScope = sessionScope(client.config);
+      const refreshToken = client.currentSession.refreshToken ?? (await loadStoredSession(sessionScope(client.config)))?.refreshToken;
+      if (generation !== accountGenerationRef.current) return;
       if (!refreshToken) {
-        signOut();
+        void signOut();
         setAuth({ enabled: true, status: "signed_out", error: "로그인 세션이 만료되었습니다." });
         return;
       }
       try {
         const refreshed = await authService.refresh(refreshToken);
-        await persistSession(refreshed);
+        if (generation !== accountGenerationRef.current || refreshScope !== sessionScope(client.config)) return;
+        const marker = await persistSession(refreshed, refreshScope);
+        if (generation !== accountGenerationRef.current || refreshScope !== sessionScope(client.config)) {
+          await removePersistedSession(marker);
+          return;
+        }
         setAuth({ enabled: true, status: "authenticated", userId: refreshed.userId ?? jwtSubject(refreshed.accessToken) });
       } catch (cause) {
         setAuth((current) => ({ ...current, error: message(cause) }));
@@ -174,20 +221,34 @@ export function useAppRuntime() {
         lastSeenAt: new Date().toISOString(),
       });
       if (deviceResult.error) throw new Error(deviceResult.error);
+      if (providerEvents.length) {
+        const accountDeviceResult = await syncService.registerDevice({
+          id: ACCOUNT_PROVIDER_DEVICE_ID,
+          name: "계정 API 집계",
+          platform: "account",
+          appVersion: "0.2.0",
+          lastSeenAt: new Date().toISOString(),
+        });
+        if (accountDeviceResult.error) throw new Error(accountDeviceResult.error);
+      }
       const result = await syncService.upsertUsageEvents(outgoing);
       if (result.error) throw new Error(result.error);
       const [downloaded, accountDevices] = await Promise.all([syncService.listUsageEvents(), syncService.listDevices()]);
+      if (generation !== accountGenerationRef.current) return;
       setRemoteEvents(downloaded.flatMap(toLocalUsageEvent));
+      setRemoteAccountEvents(downloaded.filter((event) => event.source === "provider_api" || event.source === "cloud_billing"));
       const mergedTitles = mergeSessionTitles(sessionTitles, downloaded);
       setSessionTitles(mergedTitles);
       window.localStorage.setItem(TITLES_KEY, JSON.stringify(mergedTitles));
-      setDevices(accountDevices.length ? accountDevices : [currentDevice()]);
+      const physicalDevices = accountDevices.filter((device) => device.id !== ACCOUNT_PROVIDER_DEVICE_ID);
+      setDevices(physicalDevices.length ? physicalDevices : [currentDevice()]);
       setCloudSync({ status: "idle", uploaded: result.uploaded, pending: 0, lastSyncedAt: new Date() });
     } catch (cause) {
+      if (generation !== accountGenerationRef.current) return;
       const offline = typeof navigator !== "undefined" && navigator.onLine === false;
       setCloudSync((current) => ({ ...current, status: offline ? "offline" : "error", pending: outgoing.length, error: message(cause) }));
     } finally {
-      syncingRef.current = false;
+      if (generation === accountGenerationRef.current) syncingRef.current = false;
     }
   }, [authService, client, local.events, local.refresh, providerEvents, sessionTitles, signOut, syncService]);
 
@@ -234,42 +295,63 @@ export function useAppRuntime() {
     window.localStorage.setItem(TITLES_KEY, JSON.stringify(next));
   }, [sessionTitles]);
 
-  const configureSupabase = useCallback((url: string, anonKey: string) => {
+  const configureSupabase = useCallback(async (url: string, anonKey: string) => {
     const normalizedUrl = url.trim().replace(/\/+$/, "");
     const normalizedKey = anonKey.trim();
-    if (!/^https?:\/\//i.test(normalizedUrl) || !normalizedKey) throw new Error("올바른 Supabase URL과 anon key가 필요합니다.");
+    if (!isSecureSupabaseUrl(normalizedUrl) || !normalizedKey) throw new Error("HTTPS Supabase URL과 anon key가 필요합니다. 로컬 개발 주소만 HTTP를 사용할 수 있습니다.");
     const config = { url: normalizedUrl, anonKey: normalizedKey };
+    accountGenerationRef.current += 1;
+    syncingRef.current = false;
+    skipNextRestoreRef.current = true;
+    authService.signOutLocally();
     window.localStorage.setItem(CONFIG_KEY, JSON.stringify(config));
+    window.localStorage.removeItem(SESSION_KEY);
+    window.localStorage.removeItem(AUTH_STATE_KEY);
+    await removeProviderSecret("supabase").catch(() => undefined);
     setRuntimeConfig(config);
+    setRemoteEvents([]);
+    setRemoteAccountEvents([]);
+    setDevices([currentDevice()]);
     setAuth({ enabled: true, status: "signed_out" });
     setCloudSync({ status: "signed_out", uploaded: 0, pending: 0 });
-  }, []);
+  }, [authService]);
 
-  const clearSupabaseConfig = useCallback(() => {
+  const clearSupabaseConfig = useCallback(async () => {
+    accountGenerationRef.current += 1;
+    syncingRef.current = false;
+    authService.signOutLocally();
     window.localStorage.removeItem(CONFIG_KEY);
     window.localStorage.removeItem(SESSION_KEY);
-    void removeProviderSecret("supabase").catch(() => undefined);
+    window.localStorage.removeItem(AUTH_STATE_KEY);
+    await removeProviderSecret("supabase").catch(() => undefined);
     setRuntimeConfig(null);
     setRemoteEvents([]);
+    setRemoteAccountEvents([]);
     setDevices([currentDevice()]);
     setAuth({ enabled: false, status: "local" });
     setCloudSync({ status: "disabled", uploaded: 0, pending: 0 });
-  }, []);
+  }, [authService]);
 
-  const events = useMemo(() => {
+  const usageViews = useMemo(() => {
     const currentProviderEvents = providerEvents.flatMap(toLocalUsageEvent);
     const cloudEvents = [...remoteEvents, ...currentProviderEvents];
-    return mergeUsageWithProviderAuthority(local.events, cloudEvents);
+    return buildUsageViews(local.events, cloudEvents);
   }, [local.events, providerEvents, remoteEvents]);
+  const accountProviderUsage = useMemo(
+    () => mergeAccountProviderUsage(remoteAccountEvents, providerUsage),
+    [providerUsage, remoteAccountEvents],
+  );
 
   return {
     ...local,
-    events,
-    combinedEvents: events,
+    events: usageViews.combinedEvents,
+    combinedEvents: usageViews.combinedEvents,
+    localSessionEvents: usageViews.localSessionEvents,
+    accountProviderEvents: usageViews.accountProviderEvents,
     auth,
     cloudSync,
     credentials,
-    providerUsage,
+    providerUsage: accountProviderUsage,
     devices,
     sessionTitles,
     sendMagicLink,
@@ -304,22 +386,44 @@ function defaultQuery(): UsageQuery {
   startTime.setDate(startTime.getDate() - 30);
   return { startTime, endTime };
 }
-async function persistSession(session: SupabaseSession): Promise<void> {
-  await storeProviderSecret("supabase", JSON.stringify(session));
+async function persistSession(session: SupabaseSession, scope?: string): Promise<string> {
+  if (!scope) throw new Error("Supabase 세션을 저장할 서버 설정이 없습니다.");
+  const marker = crypto.randomUUID();
+  await storeProviderSecret("supabase", JSON.stringify({ scope, session, marker }));
   window.localStorage.removeItem(SESSION_KEY);
+  return marker;
 }
-async function loadStoredSession(): Promise<SupabaseSession | null> {
+
+async function removePersistedSession(marker: string): Promise<void> {
+  await removeProviderSecretIfMarker("supabase", marker).catch(() => undefined);
+}
+async function loadStoredSession(scope?: string): Promise<SupabaseSession | null> {
+  if (!scope) return null;
   const secure = await loadProviderSecret("supabase").catch(() => undefined);
   if (secure) {
     try {
-      const parsed = JSON.parse(secure) as SupabaseSession;
-      if (parsed.accessToken) return parsed;
+      const parsed = JSON.parse(secure) as { scope?: string; session?: SupabaseSession };
+      if (parsed.scope === scope && parsed.session?.accessToken) return parsed.session;
+      return null;
     } catch {
       const legacy = readJson<SupabaseSession | null>(SESSION_KEY, null);
       if (legacy?.accessToken) return { ...legacy, refreshToken: secure };
     }
   }
   return readJson<SupabaseSession | null>(SESSION_KEY, null);
+}
+
+function sessionScope(config: SupabaseConfig | null): string | undefined {
+  return config ? `${config.url}\n${config.anonKey}` : undefined;
+}
+
+function isSecureSupabaseUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" || (url.protocol === "http:" && ["localhost", "127.0.0.1", "::1"].includes(url.hostname));
+  } catch {
+    return false;
+  }
 }
 function readJson<T>(key: string, fallback: T): T {
   try { return JSON.parse(window.localStorage.getItem(key) ?? "") as T; } catch { return fallback; }
@@ -329,6 +433,39 @@ function jwtSubject(token: string): string | undefined {
 }
 function message(cause: unknown): string { return cause instanceof Error ? cause.message : String(cause); }
 function deduplicateSyncEvents(events: SyncUsageEvent[]): SyncUsageEvent[] { return [...new Map(events.map((event) => [event.eventId, event])).values()]; }
+export function mergeAccountProviderUsage(remote: SyncUsageEvent[], current: ProviderUsageRecord[]): ProviderUsageRecord[] {
+  const byBucket = new Map<string, { record: ProviderUsageRecord; priority: number }>();
+  for (const event of remote) {
+    const record = syncEventToProviderUsage(event);
+    if (!record) continue;
+    const key = providerUsageBucketKey(record);
+    const priority = event.eventId.length;
+    if (!byBucket.has(key) || priority >= (byBucket.get(key)?.priority ?? 0)) byBucket.set(key, { record, priority });
+  }
+  for (const record of current) byBucket.set(providerUsageBucketKey(record), { record, priority: Number.MAX_SAFE_INTEGER });
+  return [...byBucket.values()].map((item) => item.record);
+}
+function syncEventToProviderUsage(event: SyncUsageEvent): ProviderUsageRecord | undefined {
+  if (event.source !== "provider_api" && event.source !== "cloud_billing") return undefined;
+  const provider = ({ openai: "openai", codex: "openai", anthropic: "anthropic", claude: "anthropic", google: "google", gemini: "google" } as const)[event.provider];
+  if (!provider) return undefined;
+  return {
+    provider,
+    kind: event.source === "cloud_billing" ? "cost" : "tokens",
+    occurredAt: event.occurredAt,
+    projectRef: event.projectId,
+    model: event.model,
+    inputTokens: event.inputTokens,
+    cachedTokens: event.cachedTokens,
+    outputTokens: event.outputTokens,
+    amount: typeof event.metadata?.amount === "number" ? event.metadata.amount : undefined,
+    currency: typeof event.metadata?.currency === "string" ? event.metadata.currency : undefined,
+    raw: { eventId: event.eventId, source: "synced" },
+  };
+}
+function providerUsageBucketKey(record: ProviderUsageRecord): string {
+  return [record.provider, record.kind, record.occurredAt, record.projectRef ?? "", record.model ?? "", record.currency ?? ""].join("\u001f");
+}
 function toLocalUsageEvent(event: SyncUsageEvent): LocalUsageEvent[] {
   if (event.source === "cloud_billing") return [];
   const provider = ({ openai: "codex", anthropic: "claude", google: "gemini", codex: "codex", claude: "claude", gemini: "gemini" } as const)[event.provider];

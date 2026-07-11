@@ -27,11 +27,13 @@ export function parseClaudeJsonl(
     const requestKey = `${context.deviceId}:${requestId}`;
     if (state.claudeRequestIds.has(requestKey)) continue;
 
+    const output = finiteNumber(usage.output_tokens, usage.output);
+    const reasoning = finiteNumber(usage.thinking_tokens, usage.reasoning_tokens, usage.reasoning);
     const tokens = {
       input: finiteNumber(usage.input_tokens, usage.input),
-      cached: finiteNumber(usage.cache_read_input_tokens, usage.cached_input_tokens, usage.cached),
-      output: finiteNumber(usage.output_tokens, usage.output),
-      reasoning: finiteNumber(usage.thinking_tokens, usage.reasoning_tokens, usage.reasoning),
+      cached: finiteNumber(usage.cache_read_input_tokens) + finiteNumber(usage.cache_creation_input_tokens, usage.cached_input_tokens, usage.cached),
+      output: Math.max(0, output - reasoning),
+      reasoning,
       tool: finiteNumber(usage.tool_tokens, usage.tool),
     };
     if (tokenTotal(tokens) === 0) continue;

@@ -1,7 +1,7 @@
 // 로컬 이벤트 변환 시 토큰 보존과 민감 정보 배제를 검증하는 테스트
 import { describe, expect, it } from "vitest";
 import type { UsageEvent as CollectorUsageEvent } from "../core/types";
-import { mergeCollectorUsageEvents, mergeSessionTitles, mergeUsageWithProviderAuthority, toSyncUsageEvent } from "./core-adapter";
+import { buildUsageViews, mergeCollectorUsageEvents, mergeSessionTitles, mergeUsageWithProviderAuthority, toSyncUsageEvent } from "./core-adapter";
 
 describe("toSyncUsageEvent", () => {
   it.each([
@@ -61,6 +61,28 @@ describe("toSyncUsageEvent", () => {
     const localCodex = { ...localEvent("local-jsonl"), id: "codex-event", provider: "codex" as const };
 
     expect(mergeUsageWithProviderAuthority([localClaude, localCodex], [providerClaude])).toEqual([providerClaude, localCodex]);
+  });
+
+  it("대시보드 총량은 중복 여부를 증명할 수 없는 계정 API와 로컬 세션을 합산하지 않는다", () => {
+    const localClaude = localEvent("local-jsonl");
+    const remoteClaude = { ...localEvent("local-jsonl"), id: "remote-event", deviceId: "device-2", projectId: "project-2" };
+    const providerClaude = { ...localEvent("provider-api"), id: "provider-event", deviceId: "device-1", projectId: "api-project" };
+
+    const views = buildUsageViews([localClaude], [remoteClaude, providerClaude]);
+
+    expect(views.localSessionEvents.map((event) => event.id).sort()).toEqual(["event-1", "remote-event"]);
+    expect(views.accountProviderEvents).toEqual([providerClaude]);
+    expect(views.combinedEvents.map((event) => event.id).sort()).toEqual(["event-1", "remote-event"]);
+  });
+
+  it("이전 버전의 값 기반 ID가 남아 있어도 같은 공급사 버킷을 중복 합산하지 않는다", () => {
+    const legacy = { ...localEvent("provider-api"), id: "provider_openai_deadbeef", provider: "codex" as const };
+    const corrected = { ...legacy, id: `provider_openai_${"a".repeat(64)}`, tokens: { ...legacy.tokens, input: 50 } };
+
+    const views = buildUsageViews([], [legacy, corrected]);
+
+    expect(views.accountProviderEvents).toEqual([corrected]);
+    expect(views.combinedEvents).toEqual([]);
   });
 
   it("원격 세션 제목이 같으면 기존 참조를 유지해 자동 동기화 루프를 막는다", () => {
