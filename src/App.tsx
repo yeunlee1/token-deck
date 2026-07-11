@@ -2,16 +2,20 @@
 import { useEffect, useMemo, useState } from "react";
 import { buildUsageChart, type ChartPeriod } from "./components/chart-data";
 import { Icon, type IconName } from "./components/Icon";
+import { MiniDashboard, type MiniSelection } from "./components/MiniDashboard";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { UsageChart } from "./components/UsageChart";
 import { tokenTotal, type UsageEvent } from "./core";
 import { useAppRuntime } from "./hooks/useAppRuntime";
 import { getOrCreateDeviceId } from "./hooks/useLocalUsage";
 import { useNativeSettings } from "./hooks/useNativeSettings";
+import { applyWindowMode } from "./platform/window-mode";
 import "./styles.css";
 
 type Period = ChartPeriod;
 type ActiveView = "overview" | "projects" | "devices";
+const MINI_MODE_KEY = "token-deck-mini-mode";
+const MINI_SELECTION_KEY = "token-deck-mini-selection";
 
 const providerInfo = {
   codex: { name: "Codex", model: "앱 + CLI", tone: "ink", monogram: "CX" },
@@ -48,6 +52,9 @@ export default function App() {
   const [currentDeviceId] = useState(() => getOrCreateDeviceId());
   const [period, setPeriod] = useState<Period>("7일");
   const [activeView, setActiveView] = useState<ActiveView>("overview");
+  const [miniMode, setMiniMode] = useState(() => window.localStorage.getItem(MINI_MODE_KEY) === "true");
+  const [miniSelection, setMiniSelection] = useState<MiniSelection>(() => readMiniSelection());
+  const [windowModeError, setWindowModeError] = useState("");
   const [privacy, setPrivacy] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const usageEvents = runtime.combinedEvents;
@@ -61,6 +68,15 @@ export default function App() {
     window.addEventListener("keydown", close);
     return () => window.removeEventListener("keydown", close);
   }, [settingsOpen]);
+
+  useEffect(() => {
+    if (!miniMode) return;
+    void applyWindowMode(true).catch((cause) => {
+      setMiniMode(false);
+      window.localStorage.removeItem(MINI_MODE_KEY);
+      setWindowModeError(cause instanceof Error ? cause.message : "미니 창으로 전환하지 못했습니다.");
+    });
+  }, []);
 
   const providers = useMemo(() => {
     const totals = (["codex", "claude", "gemini"] as const).map((provider) => ({
@@ -128,6 +144,22 @@ export default function App() {
   const syncLabel = runtime.cloudSync.status === "syncing" || runtime.syncing ? "동기화 중" : runtime.cloudSync.status === "error" || runtime.error ? "수집 오류" : "실시간 수집 중";
 
   const runSync = () => void runtime.syncNow();
+  const changeWindowMode = async (enabled: boolean) => {
+    try {
+      await applyWindowMode(enabled);
+      setMiniMode(enabled);
+      window.localStorage.setItem(MINI_MODE_KEY, String(enabled));
+      setWindowModeError("");
+    } catch (cause) {
+      setWindowModeError(cause instanceof Error ? cause.message : "창 모드를 변경하지 못했습니다.");
+    }
+  };
+  const changeMiniSelection = (selection: MiniSelection) => {
+    setMiniSelection(selection);
+    window.localStorage.setItem(MINI_SELECTION_KEY, selection);
+  };
+
+  if (miniMode) return <MiniDashboard events={usageEvents} selection={miniSelection} updatedAt={runtime.updatedAt} syncing={runtime.syncing} onSelectionChange={changeMiniSelection} onExit={() => void changeWindowMode(false)} onRefresh={runSync} />;
 
   return (
     <div className="app-shell">
@@ -148,10 +180,10 @@ export default function App() {
       <main id="main" className="dashboard">
         <header className="topbar">
           <div><p className="kicker">{activeView === "overview" ? "통합 사용량 관제" : activeView === "projects" ? "프로젝트 분석" : "기기 분석"}</p><h1>{activeView === "overview" ? "토큰 흐름을 확인하세요." : activeView === "projects" ? "프로젝트별 사용량" : "기기별 사용량"}</h1><p>{activeView === "overview" ? "모든 AI 코딩 도구의 실제 사용 흐름을 한눈에 확인하세요." : activeView === "projects" ? "작업한 프로젝트마다 사용한 토큰과 참여 기기를 확인하세요." : "같은 계정으로 연결된 각 기기의 토큰 사용량을 비교하세요."}</p></div>
-          <div className="top-actions"><span className={`live-pill ${runtime.error ? "error" : ""}`}><i /> {syncLabel}</span><button className="icon-button" aria-label="지금 동기화" onClick={runSync}><Icon className={runtime.syncing ? "spin" : ""} name="refresh" /></button><button className="icon-button mobile-settings" aria-label="설정 열기" onClick={() => setSettingsOpen(true)}><Icon name="settings" /></button></div>
+          <div className="top-actions"><button className="mini-mode-entry" onClick={() => void changeWindowMode(true)}><Icon name="spark" /> 미니 모드</button><span className={`live-pill ${runtime.error ? "error" : ""}`}><i /> {syncLabel}</span><button className="icon-button" aria-label="지금 동기화" onClick={runSync}><Icon className={runtime.syncing ? "spin" : ""} name="refresh" /></button><button className="icon-button mobile-settings" aria-label="설정 열기" onClick={() => setSettingsOpen(true)}><Icon name="settings" /></button></div>
         </header>
 
-        {(runtime.error || runtime.cloudSync.error) && <div className="error-banner" role="alert"><Icon name="warning" /><span>{runtime.error ?? runtime.cloudSync.error}</span></div>}
+        {(runtime.error || runtime.cloudSync.error || windowModeError) && <div className="error-banner" role="alert"><Icon name="warning" /><span>{runtime.error ?? runtime.cloudSync.error ?? windowModeError}</span></div>}
 
         <section id="overview" className="hero-grid" aria-label="사용량 요약" hidden={activeView !== "overview"}>
           <article className="total-card">
@@ -256,4 +288,9 @@ export default function App() {
       />
     </div>
   );
+}
+
+function readMiniSelection(): MiniSelection {
+  const value = window.localStorage.getItem(MINI_SELECTION_KEY);
+  return value === "codex" || value === "claude" || value === "gemini" || value === "codex_claude" ? value : "codex_claude";
 }
