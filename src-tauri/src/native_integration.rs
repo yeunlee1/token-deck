@@ -1,15 +1,47 @@
 // Windows 자동 시작과 Gemini CLI 로컬 텔레메트리 설정을 관리하는 네이티브 통합 모듈
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::{
     fs,
-    io::ErrorKind,
+    io::{ErrorKind, Read},
     path::{Path, PathBuf},
     process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 const AUTOSTART_VALUE_NAME: &str = "Token Deck";
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaWindowStatus {
+    used_percent: f64,
+    remaining_percent: f64,
+    window_minutes: u64,
+    resets_at: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderQuotaStatus {
+    provider: String,
+    supported: bool,
+    plan_type: Option<String>,
+    five_hour: Option<QuotaWindowStatus>,
+    weekly: Option<QuotaWindowStatus>,
+    daily: Option<QuotaWindowStatus>,
+    message: Option<String>,
+    updated_at: Option<u64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeQuotaCaptureStatus {
+    configured: bool,
+    settings_path: String,
+    data_path: String,
+    has_data: bool,
+    existing_status_line: bool,
+}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -292,11 +324,345 @@ pub fn configure_gemini_telemetry() -> Result<GeminiConfigurationResult, String>
     })
 }
 
+fn quota_window(value: &Value, default_minutes: u64) -> Option<QuotaWindowStatus> {
+    let raw = value
+        .get("used_percent")
+        .or_else(|| value.get("used_percentage"))
+        .or_else(|| value.get("utilization"))?
+        .as_f64()?;
+    let used = if raw <= 1.0
+        && value.get("used_percent").is_none()
+        && value.get("used_percentage").is_none()
+    {
+        raw * 100.0
+    } else {
+        raw
+    };
+    let used = used.clamp(0.0, 100.0);
+    Some(QuotaWindowStatus {
+        used_percent: used,
+        remaining_percent: 100.0 - used,
+        window_minutes: value
+            .get("window_minutes")
+            .and_then(Value::as_u64)
+            .unwrap_or(default_minutes),
+        resets_at: value
+            .get("resets_at")
+            .or_else(|| value.get("reset_at"))
+            .and_then(Value::as_u64),
+    })
+}
+
+fn parse_codex_quota(value: &Value) -> Option<ProviderQuotaStatus> {
+    let limits = value.pointer("/payload/rate_limits")?;
+    let primary = limits
+        .get("primary")
+        .and_then(|window| quota_window(window, 300));
+    let secondary = limits
+        .get("secondary")
+        .and_then(|window| quota_window(window, 10_080));
+    Some(ProviderQuotaStatus {
+        provider: "codex".to_owned(),
+        supported: primary.is_some() || secondary.is_some(),
+        plan_type: limits
+            .get("plan_type")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        five_hour: primary.filter(|window| window.window_minutes == 300),
+        weekly: secondary.filter(|window| window.window_minutes == 10_080),
+        daily: None,
+        message: None,
+        updated_at: None,
+    })
+}
+
+fn newest_codex_quota(root: &Path) -> Option<ProviderQuotaStatus> {
+    let mut newest: Option<(SystemTime, ProviderQuotaStatus)> = None;
+    find_codex_quota(root, &mut newest);
+    newest.map(|(_, quota)| quota)
+}
+
+fn find_codex_quota(root: &Path, newest: &mut Option<(SystemTime, ProviderQuotaStatus)>) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            find_codex_quota(&path, newest);
+            continue;
+        }
+        if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified()) else {
+            continue;
+        };
+        if newest
+            .as_ref()
+            .is_some_and(|(current, _)| *current > modified)
+        {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let quota = content.lines().rev().find_map(|line| {
+            serde_json::from_str::<Value>(line)
+                .ok()
+                .and_then(|value| parse_codex_quota(&value))
+        });
+        if let Some(mut quota) = quota {
+            quota.updated_at = modified
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .map(|value| value.as_secs());
+            *newest = Some((modified, quota));
+        }
+    }
+}
+
+fn claude_paths() -> Result<(PathBuf, PathBuf), String> {
+    let home = user_home()?;
+    Ok((
+        home.join(".claude").join("settings.json"),
+        home.join(".token-deck").join("claude-quota.json"),
+    ))
+}
+
+fn claude_capture_status_inner() -> Result<ClaudeQuotaCaptureStatus, String> {
+    let (settings_path, data_path) = claude_paths()?;
+    let settings = match fs::read_to_string(&settings_path) {
+        Ok(content) => serde_json::from_str::<Value>(&content)
+            .map_err(|error| format!("Claude 설정 JSON을 읽을 수 없습니다. {error}"))?,
+        Err(error) if error.kind() == ErrorKind::NotFound => Value::Object(Map::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let command = settings
+        .pointer("/statusLine/command")
+        .and_then(Value::as_str);
+    let expected =
+        claude_statusline_command(&std::env::current_exe().map_err(|error| error.to_string())?);
+    Ok(ClaudeQuotaCaptureStatus {
+        configured: settings.pointer("/statusLine/type").and_then(Value::as_str) == Some("command")
+            && command == Some(expected.as_str()),
+        existing_status_line: settings.get("statusLine").is_some(),
+        settings_path: settings_path.to_string_lossy().into_owned(),
+        data_path: data_path.to_string_lossy().into_owned(),
+        has_data: data_path.exists(),
+    })
+}
+
+fn claude_statusline_command(executable: &Path) -> String {
+    let portable_path = executable.to_string_lossy().replace('\\', "/");
+    format!("\"{portable_path}\" --claude-statusline")
+}
+
+fn merge_claude_statusline(
+    mut settings: Map<String, Value>,
+    command: &str,
+) -> Result<Map<String, Value>, String> {
+    match settings.get("statusLine") {
+        Some(Value::Object(status_line))
+            if status_line.get("type").and_then(Value::as_str) == Some("command")
+                && status_line.get("command").and_then(Value::as_str) == Some(command) =>
+        {
+            return Ok(settings);
+        }
+        Some(_) => {
+            return Err(
+                "기존 Claude statusLine 설정이 있어 자동으로 덮어쓰지 않았습니다".to_owned(),
+            );
+        }
+        None => {}
+    }
+    settings.insert(
+        "statusLine".to_owned(),
+        serde_json::json!({
+            "type": "command",
+            "command": command
+        }),
+    );
+    Ok(settings)
+}
+
+#[tauri::command]
+pub fn claude_quota_capture_status() -> Result<ClaudeQuotaCaptureStatus, String> {
+    claude_capture_status_inner()
+}
+
+#[tauri::command]
+pub fn configure_claude_quota_capture() -> Result<ClaudeQuotaCaptureStatus, String> {
+    let (settings_path, _) = claude_paths()?;
+    let existing = match fs::read_to_string(&settings_path) {
+        Ok(content) => Some(
+            serde_json::from_str::<Value>(&content)
+                .map_err(|error| format!("Claude 설정 JSON을 읽을 수 없습니다. {error}"))?,
+        ),
+        Err(error) if error.kind() == ErrorKind::NotFound => None,
+        Err(error) => return Err(error.to_string()),
+    };
+    let settings = match existing
+        .clone()
+        .unwrap_or_else(|| Value::Object(Map::new()))
+    {
+        Value::Object(settings) => settings,
+        _ => return Err("Claude 설정의 최상위 값은 JSON 객체여야 합니다".to_owned()),
+    };
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let command = claude_statusline_command(&executable);
+    if settings
+        .get("statusLine")
+        .and_then(|value| value.get("type"))
+        .and_then(Value::as_str)
+        == Some("command")
+        && settings
+            .get("statusLine")
+            .and_then(|value| value.get("command"))
+            .and_then(Value::as_str)
+            == Some(command.as_str())
+    {
+        return claude_capture_status_inner();
+    }
+    let settings = merge_claude_statusline(settings, &command)?;
+    if existing.is_some() {
+        fs::copy(&settings_path, backup_path(&settings_path)?)
+            .map_err(|error| error.to_string())?;
+    }
+    if let Some(parent) = settings_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    fs::write(
+        &settings_path,
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&Value::Object(settings))
+                .map_err(|error| error.to_string())?
+        ),
+    )
+    .map_err(|error| error.to_string())?;
+    claude_capture_status_inner()
+}
+
+fn claude_quota_from_file(path: &Path) -> Option<ProviderQuotaStatus> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|content| serde_json::from_str(&content).ok())
+}
+
+#[tauri::command]
+pub fn quota_statuses() -> Result<Vec<ProviderQuotaStatus>, String> {
+    let home = user_home()?;
+    let codex = newest_codex_quota(&home.join(".codex").join("sessions")).unwrap_or_else(|| {
+        ProviderQuotaStatus {
+            provider: "codex".to_owned(),
+            supported: false,
+            plan_type: None,
+            five_hour: None,
+            weekly: None,
+            daily: None,
+            message: Some("Codex 한도 이벤트를 기다리는 중입니다".to_owned()),
+            updated_at: None,
+        }
+    });
+    let (_, claude_data) = claude_paths()?;
+    let claude = claude_quota_from_file(&claude_data).unwrap_or_else(|| ProviderQuotaStatus {
+        provider: "claude".to_owned(),
+        supported: false,
+        plan_type: None,
+        five_hour: None,
+        weekly: None,
+        daily: None,
+        message: Some("설정에서 Claude 한도 연동을 활성화하세요".to_owned()),
+        updated_at: None,
+    });
+    let gemini = ProviderQuotaStatus {
+        provider: "gemini".to_owned(),
+        supported: false,
+        plan_type: None,
+        five_hour: None,
+        weekly: None,
+        daily: None,
+        message: Some("Gemini CLI 정액제는 5시간·주간 한도를 제공하지 않습니다".to_owned()),
+        updated_at: None,
+    };
+    Ok(vec![codex, claude, gemini])
+}
+
+pub fn run_claude_statusline_capture() -> Result<(), String> {
+    let mut input = String::new();
+    std::io::stdin()
+        .read_to_string(&mut input)
+        .map_err(|error| error.to_string())?;
+    let value: Value = serde_json::from_str(&input).map_err(|error| error.to_string())?;
+    let quota = claude_quota_from_statusline(&value, SystemTime::now())?;
+    let (_, data_path) = claude_paths()?;
+    if let Some(parent) = data_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    fs::write(
+        &data_path,
+        serde_json::to_string(&quota).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let five = quota
+        .five_hour
+        .as_ref()
+        .map(|window| format!("5h {:.0}%", window.remaining_percent));
+    let week = quota
+        .weekly
+        .as_ref()
+        .map(|window| format!("7d {:.0}%", window.remaining_percent));
+    println!(
+        "{}",
+        [five, week]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" · ")
+    );
+    Ok(())
+}
+
+fn claude_quota_from_statusline(
+    value: &Value,
+    captured_at: SystemTime,
+) -> Result<ProviderQuotaStatus, String> {
+    let limits = value.get("rate_limits").unwrap_or(&Value::Null);
+    let five_hour = limits
+        .get("five_hour")
+        .and_then(|window| quota_window(window, 300));
+    let weekly = limits
+        .get("seven_day")
+        .and_then(|window| quota_window(window, 10_080));
+    let now = captured_at
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_secs();
+    Ok(ProviderQuotaStatus {
+        provider: "claude".to_owned(),
+        supported: five_hour.is_some() || weekly.is_some(),
+        plan_type: None,
+        five_hour,
+        weekly,
+        daily: None,
+        message: None,
+        updated_at: Some(now),
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{autostart_launch_command, is_telemetry_configured, merge_telemetry_settings};
+    use super::{
+        autostart_launch_command, claude_quota_from_statusline, claude_statusline_command,
+        is_telemetry_configured, merge_claude_statusline, merge_telemetry_settings,
+        parse_codex_quota,
+    };
     use serde_json::json;
-    use std::path::Path;
+    use std::{
+        path::Path,
+        time::{Duration, UNIX_EPOCH},
+    };
 
     #[test]
     fn telemetry_requires_prompt_logging_to_be_disabled() {
@@ -341,5 +707,68 @@ mod tests {
     #[test]
     fn autostart_launches_without_opening_the_main_window() {
         assert!(autostart_launch_command().unwrap().ends_with(" --hidden"));
+    }
+
+    #[test]
+    fn codex_jsonl_rate_limits_map_to_five_hour_and_weekly_windows() {
+        let value = json!({
+            "timestamp": "2026-07-11T14:29:51.652Z",
+            "payload": {
+                "type": "token_count",
+                "rate_limits": {
+                    "primary": { "used_percent": 6.0, "window_minutes": 300, "resets_at": 1783794411 },
+                    "secondary": { "used_percent": 8.0, "window_minutes": 10080, "resets_at": 1784359202 },
+                    "plan_type": "pro"
+                }
+            }
+        });
+        let quota = parse_codex_quota(&value).unwrap();
+
+        assert!(quota.supported);
+        assert_eq!(quota.plan_type.as_deref(), Some("pro"));
+        assert_eq!(quota.five_hour.unwrap().remaining_percent, 94.0);
+        assert_eq!(quota.weekly.unwrap().remaining_percent, 92.0);
+    }
+
+    #[test]
+    fn claude_statusline_parses_subscription_rate_limits() {
+        let value = json!({
+            "rate_limits": {
+                "five_hour": { "used_percentage": 23.5, "resets_at": 1738425600 },
+                "seven_day": { "used_percentage": 41.2, "resets_at": 1738857600 }
+            }
+        });
+        let quota =
+            claude_quota_from_statusline(&value, UNIX_EPOCH + Duration::from_secs(100)).unwrap();
+
+        assert_eq!(quota.five_hour.unwrap().remaining_percent, 76.5);
+        assert_eq!(quota.weekly.unwrap().remaining_percent, 58.8);
+        assert_eq!(quota.updated_at, Some(100));
+    }
+
+    #[test]
+    fn claude_statusline_preserves_other_settings_and_rejects_conflicts() {
+        let command =
+            claude_statusline_command(Path::new("C:\\Program Files\\Token Deck\\token-deck.exe"));
+        let settings = json!({ "theme": "dark" }).as_object().unwrap().clone();
+        let merged = merge_claude_statusline(settings, &command).unwrap();
+
+        assert_eq!(merged.get("theme"), Some(&json!("dark")));
+        assert_eq!(
+            merged["statusLine"]["command"],
+            json!("\"C:/Program Files/Token Deck/token-deck.exe\" --claude-statusline")
+        );
+
+        let conflicting =
+            json!({ "statusLine": { "type": "command", "command": "custom-status" } })
+                .as_object()
+                .unwrap()
+                .clone();
+        assert!(merge_claude_statusline(conflicting, &command).is_err());
+        let malformed = json!({ "statusLine": { "padding": 2 } })
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(merge_claude_statusline(malformed, &command).is_err());
     }
 }

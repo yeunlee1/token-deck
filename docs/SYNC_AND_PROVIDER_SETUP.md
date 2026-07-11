@@ -23,9 +23,9 @@ VITE_SUPABASE_ANON_KEY=YOUR_ANON_KEY
 - Anthropic은 Admin API 키로 `/v1/organizations/usage_report/messages`를 조회합니다.
 - Google Cloud는 사용자 OAuth 액세스 토큰으로 BigQuery `jobs.query`를 호출합니다. `billingTable`에는 Billing Export의 `project.dataset.gcp_billing_export_v1_ACCOUNT` 테이블을 지정합니다.
 
-공급사 관리자 키는 각 조직의 관리 API 권한이 있어야 합니다. 개인 구독 화면의 잔여 메시지 한도는 공식 Usage API로 제공되지 않으므로 Token Deck은 로컬 로그에서 확인한 토큰과 조직 API가 반환한 사용량·비용만 표시합니다.
+공급사 관리자 키는 각 조직의 관리 API 권한이 있어야 합니다. 토큰 사용량과 비용은 로컬 로그 및 조직 API에서 집계합니다. 개인 정액제의 잔여 한도는 이 사용량과 별개의 값으로 취급하며, Codex는 로컬 세션의 실제 5시간·주간 한도 이벤트를 읽고 Claude는 Claude Code status line 입력에 포함된 5시간·주간 한도를 사용합니다.
 
-토큰 레코드와 비용 레코드는 각각 `kind: "tokens"`, `kind: "cost"`로 유지합니다. 비용을 토큰으로 환산하거나 개인 구독의 잔여 한도처럼 표시하면 안 됩니다.
+토큰 레코드와 비용 레코드는 각각 `kind: "tokens"`, `kind: "cost"`로 유지합니다. 비용이나 최근 토큰 사용량을 개인 구독의 잔여 한도로 환산하면 안 됩니다. Gemini CLI는 5시간·주간 구간이 아니라 일일 요청 쿼터를 사용하므로 해당 두 구간은 미제공으로 표시합니다.
 
 ## 데이터 최소화
 

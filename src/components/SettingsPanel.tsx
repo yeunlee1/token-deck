@@ -32,6 +32,8 @@ interface SettingsPanelProps {
   providerUsage: ProviderUsageRecord[];
   sessions: SessionOption[];
   displayProviders: Provider[];
+  claudeQuotaCapture: { configured: boolean; hasData: boolean; existingStatusLine: boolean };
+  quotaBusy: boolean;
   onClose: () => void;
   onConfigureSupabase: (url: string, anonKey: string) => Promise<void> | void;
   onClearSupabaseConfig: () => Promise<void> | void;
@@ -44,6 +46,7 @@ interface SettingsPanelProps {
   onSetAutostart: (enabled: boolean) => Promise<void>;
   onConfigureGemini: () => Promise<void>;
   onToggleDisplayProvider: (provider: Provider) => void;
+  onConfigureClaudeQuota: () => Promise<void>;
 }
 
 const providerLabels: Record<CredentialProvider, string> = {
@@ -197,6 +200,11 @@ export function SettingsPanel(props: SettingsPanelProps) {
             <div className="setting-section-title"><span className="setting-icon"><Icon name="activity" /></span><div><h3 id="display-title">대시보드 표시 항목</h3><p>개요, 프로젝트와 기기 화면에서 보고 싶은 공급사를 선택합니다.</p></div></div>
             <div className="provider-visibility" aria-label="대시보드에 표시할 공급사">{(["codex", "claude", "gemini"] as Provider[]).map((provider) => <button key={provider} type="button" aria-pressed={props.displayProviders.includes(provider)} onClick={() => props.onToggleDisplayProvider(provider)}><span className={`project-dot ${provider === "claude" ? "lime" : provider === "gemini" ? "violet" : "ink"}`} /><strong>{provider === "codex" ? "Codex" : provider === "claude" ? "Claude" : "Gemini"}</strong><small>{props.displayProviders.includes(provider) ? "표시 중" : "숨김"}</small></button>)}</div>
             <p className="setting-hint">최소 한 개는 항상 표시됩니다. 수집과 동기화는 선택과 관계없이 계속됩니다.</p>
+          </section>
+
+          <section className="setting-section" aria-labelledby="quota-title">
+            <div className="setting-section-title"><span className="setting-icon"><Icon name="activity" /></span><div><h3 id="quota-title">정액제 잔여 한도</h3><p>Codex와 Claude가 제공하는 5시간·주간 잔여 퍼센트를 표시합니다.</p></div><span className={`connection-badge ${props.claudeQuotaCapture.hasData ? "connected" : ""}`}><i />{props.claudeQuotaCapture.hasData ? "Claude 연결됨" : "Claude 설정 필요"}</span></div>
+            {props.claudeQuotaCapture.configured ? <div className="signed-in-card"><div><span className="avatar">CL</span><div><strong>Claude 한도 수집 활성</strong><small>{props.claudeQuotaCapture.hasData ? "최근 정액제 한도 데이터를 받았습니다." : "Claude Code를 한 번 실행하면 한도 정보가 표시됩니다."}</small></div></div></div> : <div className="setting-notice"><Icon name="warning" /><div><strong>{props.claudeQuotaCapture.existingStatusLine ? "기존 Claude 상태 표시 설정이 있습니다." : "Claude 한도 연동이 꺼져 있습니다."}</strong><p>{props.claudeQuotaCapture.existingStatusLine ? "기존 설정을 보호하기 위해 자동으로 덮어쓰지 않습니다." : "Claude Code 상태 표시에서 토큰 내용 없이 잔여 퍼센트만 로컬로 전달합니다."}</p>{!props.claudeQuotaCapture.existingStatusLine && <button className="primary-button inline-action" disabled={props.quotaBusy} onClick={() => void props.onConfigureClaudeQuota()}>{props.quotaBusy ? "설정 중…" : "Claude 한도 연동"}</button>}</div></div>}
           </section>
 
           <section className="setting-section" aria-labelledby="providers-title">

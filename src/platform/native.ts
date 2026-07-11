@@ -23,6 +23,34 @@ export interface GeminiConfigurationResult {
   telemetryOutfile: string;
 }
 
+export type QuotaProvider = "codex" | "claude" | "gemini";
+
+export interface QuotaWindowStatus {
+  usedPercent: number;
+  remainingPercent: number;
+  windowMinutes: number;
+  resetsAt: number | null;
+}
+
+export interface ProviderQuotaStatus {
+  provider: QuotaProvider;
+  supported: boolean;
+  planType: string | null;
+  fiveHour: QuotaWindowStatus | null;
+  weekly: QuotaWindowStatus | null;
+  daily: QuotaWindowStatus | null;
+  message: string | null;
+  updatedAt: number | null;
+}
+
+export interface ClaudeQuotaCaptureStatus {
+  configured: boolean;
+  settingsPath: string;
+  dataPath: string;
+  hasData: boolean;
+  existingStatusLine: boolean;
+}
+
 function isTauriRuntime(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
@@ -55,4 +83,32 @@ export async function getGeminiStatus(): Promise<GeminiStatus> {
 export async function configureGeminiTelemetry(): Promise<GeminiConfigurationResult> {
   if (!isTauriRuntime()) throw new Error("Gemini 설정은 데스크톱 앱에서만 변경할 수 있습니다.");
   return invoke<GeminiConfigurationResult>("configure_gemini_telemetry");
+}
+
+export function unsupportedQuotaStatuses(): ProviderQuotaStatus[] {
+  return (["codex", "claude", "gemini"] as QuotaProvider[]).map((provider) => ({
+    provider,
+    supported: false,
+    planType: null,
+    fiveHour: null,
+    weekly: null,
+    daily: null,
+    message: "한도 상태는 데스크톱 앱에서 확인할 수 있습니다.",
+    updatedAt: null,
+  }));
+}
+
+export async function getQuotaStatuses(): Promise<ProviderQuotaStatus[]> {
+  if (!isTauriRuntime()) return unsupportedQuotaStatuses();
+  return invoke<ProviderQuotaStatus[]>("quota_statuses");
+}
+
+export async function getClaudeQuotaCaptureStatus(): Promise<ClaudeQuotaCaptureStatus> {
+  if (!isTauriRuntime()) return { configured: false, settingsPath: "", dataPath: "", hasData: false, existingStatusLine: false };
+  return invoke<ClaudeQuotaCaptureStatus>("claude_quota_capture_status");
+}
+
+export async function configureClaudeQuotaCapture(): Promise<ClaudeQuotaCaptureStatus> {
+  if (!isTauriRuntime()) throw new Error("Claude 한도 수집 설정은 데스크톱 앱에서만 변경할 수 있습니다.");
+  return invoke<ClaudeQuotaCaptureStatus>("configure_claude_quota_capture");
 }

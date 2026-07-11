@@ -5,10 +5,12 @@ import { Icon, type IconName } from "./components/Icon";
 import { MiniDashboard } from "./components/MiniDashboard";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { UsageChart } from "./components/UsageChart";
-import { buildProviderWindowUsage, tokenTotal, type Provider, type UsageEvent } from "./core";
+import { quotaStatusLabel, remainingLabel, remainingTone } from "./components/quota-display";
+import { tokenTotal, type Provider, type UsageEvent } from "./core";
 import { useAppRuntime } from "./hooks/useAppRuntime";
 import { getOrCreateDeviceId } from "./hooks/useLocalUsage";
 import { useNativeSettings } from "./hooks/useNativeSettings";
+import { useProviderQuotas } from "./hooks/useProviderQuotas";
 import { applyWindowMode } from "./platform/window-mode";
 import "./styles.css";
 
@@ -52,6 +54,7 @@ function SectionTitle({ eyebrow, title, action }: { eyebrow: string; title: stri
 export default function App() {
   const runtime = useAppRuntime();
   const nativeSettings = useNativeSettings();
+  const providerQuotas = useProviderQuotas();
   const [currentDeviceId] = useState(() => getOrCreateDeviceId());
   const [period, setPeriod] = useState<Period>("7일");
   const [activeView, setActiveView] = useState<ActiveView>("overview");
@@ -67,7 +70,6 @@ export default function App() {
   const periodEvents = useMemo(() => usageInPeriod(visibleEvents, period), [visibleEvents, period]);
   const actualTotal = useMemo(() => periodEvents.reduce((sum, event) => sum + tokenTotal(event.tokens), 0), [periodEvents]);
   const chartData = useMemo(() => buildUsageChart(visibleEvents, period), [visibleEvents, period]);
-  const windowUsage = useMemo(() => new Map(buildProviderWindowUsage(usageEvents, ALL_PROVIDERS).map((item) => [item.provider, item])), [usageEvents]);
 
   useEffect(() => {
     if (!settingsOpen) return;
@@ -95,10 +97,9 @@ export default function App() {
       value: formatTokens(tokens),
       percent: actualTotal ? Math.round(tokens / actualTotal * 100) : 0,
       status: runtime.integrations[provider] ? (tokens ? "수집됨" : "연결됨") : "미감지",
-      fiveHours: windowUsage.get(provider)?.fiveHours ?? 0,
-      week: windowUsage.get(provider)?.week ?? 0,
+      quota: providerQuotas.quotas[provider],
     }));
-  }, [actualTotal, displayProviders, periodEvents, runtime.integrations, windowUsage]);
+  }, [actualTotal, displayProviders, periodEvents, providerQuotas.quotas, runtime.integrations]);
 
   const projects = useMemo(() => {
     const grouped = new Map<string, UsageEvent[]>();
@@ -152,7 +153,7 @@ export default function App() {
   const accountMeta = authenticated ? "여러 기기 동기화 활성" : runtime.auth.enabled ? "로그인 필요" : "Supabase 연결 대기";
   const syncLabel = runtime.cloudSync.status === "syncing" || runtime.syncing ? "동기화 중" : runtime.cloudSync.status === "error" || runtime.error ? "수집 오류" : "실시간 수집 중";
 
-  const runSync = () => void runtime.syncNow();
+  const runSync = () => void Promise.all([runtime.syncNow(), providerQuotas.refresh()]);
   const changeWindowMode = async (enabled: boolean) => {
     try {
       await applyWindowMode(enabled);
@@ -175,7 +176,7 @@ export default function App() {
     window.localStorage.setItem(MINI_OPACITY_KEY, String(next));
   };
 
-  if (miniMode) return <MiniDashboard events={usageEvents} providers={miniProviders} opacity={miniOpacity} updatedAt={runtime.updatedAt} syncing={runtime.syncing} onToggleProvider={(provider) => toggleProvider(provider, miniProviders, setMiniProviders, MINI_PROVIDERS_KEY)} onOpacityChange={changeMiniOpacity} onExit={() => void changeWindowMode(false)} onRefresh={runSync} />;
+  if (miniMode) return <MiniDashboard quotas={Object.values(providerQuotas.quotas)} providers={miniProviders} opacity={miniOpacity} updatedAt={providerQuotas.updatedAt} syncing={providerQuotas.loading || providerQuotas.busy} error={providerQuotas.error} onToggleProvider={(provider) => toggleProvider(provider, miniProviders, setMiniProviders, MINI_PROVIDERS_KEY)} onOpacityChange={changeMiniOpacity} onExit={() => void changeWindowMode(false)} onRefresh={runSync} />;
 
   return (
     <div className="app-shell">
@@ -199,7 +200,7 @@ export default function App() {
           <div className="top-actions"><button className="mini-mode-entry" onClick={() => void changeWindowMode(true)}><Icon name="spark" /> 미니 모드</button><span className={`live-pill ${runtime.error ? "error" : ""}`}><i /> {syncLabel}</span><button className="icon-button" aria-label="지금 동기화" onClick={runSync}><Icon className={runtime.syncing ? "spin" : ""} name="refresh" /></button><button className="icon-button mobile-settings" aria-label="설정 열기" onClick={() => setSettingsOpen(true)}><Icon name="settings" /></button></div>
         </header>
 
-        {(runtime.error || runtime.cloudSync.error || windowModeError) && <div className="error-banner" role="alert"><Icon name="warning" /><span>{runtime.error ?? runtime.cloudSync.error ?? windowModeError}</span></div>}
+        {(runtime.error || runtime.cloudSync.error || providerQuotas.error || windowModeError) && <div className="error-banner" role="alert"><Icon name="warning" /><span>{runtime.error ?? runtime.cloudSync.error ?? providerQuotas.error ?? windowModeError}</span></div>}
 
         <section id="overview" className="hero-grid" aria-label="사용량 요약" hidden={activeView !== "overview"}>
           <article className="total-card">
@@ -220,9 +221,9 @@ export default function App() {
           <SectionTitle eyebrow="PROVIDERS" title="공급사별 사용량" action={<button className="text-button" onClick={() => setSettingsOpen(true)}>연결 설정 <Icon name="chevron" /></button>} />
           <div className="provider-grid">{providers.map((provider) => (
             <article className={`provider-card ${provider.tone}`} key={provider.name}>
-              <div className="provider-heading"><span className="provider-logo">{provider.monogram}</span><div><h3>{provider.name}</h3><p>{provider.model}</p></div><span className="provider-delta">{provider.status}</span></div>
+              <div className="provider-heading"><span className="provider-logo">{provider.monogram}</span><div><h3>{provider.name}</h3><p>{provider.model}</p></div><span className="provider-delta">{quotaStatusLabel(provider.quota)}</span></div>
               <strong className="provider-value">{provider.value}</strong><span className="provider-unit">tokens</span>
-              <div className="provider-windows"><div><span>최근 5시간</span><strong>{formatTokens(provider.fiveHours)}</strong></div><div><span>최근 7일</span><strong>{formatTokens(provider.week)}</strong></div></div>
+              <div className="provider-windows"><div className={remainingTone(provider.quota.fiveHour)}><span>5시간 한도 잔여</span><strong>{remainingLabel(provider.quota.fiveHour)}</strong></div><div className={remainingTone(provider.quota.weekly)}><span>주간 한도 잔여</span><strong>{remainingLabel(provider.quota.weekly)}</strong></div></div>
               <div className="meter" aria-label={`${provider.name}의 선택 기간 내 비중 ${provider.percent}%`}><i style={{ width: `${provider.percent}%` }} /></div>
               <div className="meter-label"><span>기간 내 비중</span><strong>{provider.percent}%</strong></div>
             </article>
@@ -292,6 +293,8 @@ export default function App() {
         providerUsage={runtime.providerUsage}
         sessions={sessions}
         displayProviders={displayProviders}
+        claudeQuotaCapture={providerQuotas.claudeCapture}
+        quotaBusy={providerQuotas.busy}
         onClose={() => setSettingsOpen(false)}
         onConfigureSupabase={(url, anonKey) => runtime.configureSupabase(url, anonKey)}
         onClearSupabaseConfig={() => runtime.clearSupabaseConfig()}
@@ -304,6 +307,7 @@ export default function App() {
         onSetAutostart={(enabled) => nativeSettings.toggleAutostart(enabled)}
         onConfigureGemini={() => nativeSettings.enableGeminiTelemetry()}
         onToggleDisplayProvider={(provider) => toggleProvider(provider, displayProviders, setDisplayProviders, DISPLAY_PROVIDERS_KEY)}
+        onConfigureClaudeQuota={() => providerQuotas.enableClaudeCapture()}
       />
     </div>
   );
