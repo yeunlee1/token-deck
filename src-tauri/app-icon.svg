@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- 세 공급사의 토큰 흐름을 겹친 궤도로 표현한 앱 아이콘 -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="112" fill="#171914"/>
+  <circle cx="256" cy="256" r="151" fill="none" stroke="#dfff57" stroke-width="34" stroke-dasharray="580 370" stroke-linecap="round" transform="rotate(-38 256 256)"/>
+  <circle cx="256" cy="256" r="91" fill="none" stroke="#a89af5" stroke-width="34" stroke-dasharray="290 280" stroke-linecap="round" transform="rotate(88 256 256)"/>
+  <circle cx="256" cy="256" r="31" fill="#f4f6ef"/>
+</svg>
