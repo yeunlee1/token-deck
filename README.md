@@ -2,14 +2,18 @@
 
 Codex, Claude Code, Gemini CLI와 각 공급사의 API 사용량을 한 화면에서 비교하는 Windows 우선 데스크톱 앱입니다.
 
-## 현재 구현
+## 구현된 기능
 
 - Codex와 Claude Code JSONL 수집 및 중복 없는 토큰 집계.
 - Gemini CLI OpenTelemetry 토큰 이벤트 수집.
 - Git 원격 기반 프로젝트 통합 식별.
 - Tauri 트레이 앱과 React 사용량 대시보드.
-- Supabase 매직 링크 인증, RLS 스키마, 멱등 동기화 계층.
-- OpenAI Usage, Anthropic Admin, Google Cloud Billing 커넥터 골격.
+- Supabase 매직 링크 인증, 계정별 기기·프로젝트·세션·사용량 멱등 동기화.
+- OpenAI Usage, Anthropic Admin, Google Cloud Billing 실데이터 커넥터.
+- 앱 설정 화면에서 Supabase 연결, 로그인, 공급사 자격 증명, 세션 제목 관리.
+- Windows Credential Manager를 통한 공급사 키와 로그인 갱신 토큰 보관.
+- Gemini CLI 설치 상태 확인과 프롬프트를 제외한 로컬 텔레메트리 설정.
+- Windows 로그인 시 트레이 백그라운드 자동 시작.
 - 프롬프트, 코드, 전체 로컬 경로를 업로드하지 않는 메타데이터 전용 설계.
 
 ## 실행
@@ -25,9 +29,13 @@ Tauri 데스크톱 모드는 Rust와 Microsoft C++ 빌드 도구가 필요합니
 npm run desktop:dev
 ```
 
-## 환경 변수
+## 클라우드 연결
 
-`.env.example`을 `.env.local`로 복사한 뒤 Supabase 프로젝트 정보를 입력합니다. 값이 없으면 클라우드 기능만 비활성화되고 로컬 대시보드는 계속 동작합니다.
+앱의 설정 화면에서 Supabase 프로젝트 URL과 anon 키를 입력할 수 있습니다. 빌드 시 기본값이 필요하면 `.env.example`을 `.env.local`로 복사해도 됩니다. 값이 없으면 클라우드 기능만 비활성화되고 로컬 대시보드는 계속 동작합니다.
+
+원격 DB에는 `supabase/migrations/202607110001_initial_usage_sync.sql`을 한 번 적용해야 합니다. 이 SQL은 5개 테이블과 RLS 정책을 새로 만들며 자동 적용되지 않습니다.
+
+자세한 절차는 `docs/SYNC_AND_PROVIDER_SETUP.md`와 `docs/GEMINI_SETUP.md`를 확인합니다.
 
 ## 검증
 
@@ -37,4 +45,4 @@ npm run build
 npm run desktop:build
 ```
 
-`supabase/migrations`의 SQL은 자동 적용되지 않습니다. 대상 데이터베이스와 영향 범위를 확인한 뒤 별도로 승인받아 적용해야 합니다.
+Windows 설치 파일은 `src-tauri/target/release/bundle/nsis/Token Deck_0.2.0_x64-setup.exe`에 생성됩니다.

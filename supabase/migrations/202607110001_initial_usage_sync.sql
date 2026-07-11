@@ -1,6 +1,4 @@
 -- 사용자별 기기와 토큰 사용량을 격리 저장하는 초기 스키마
-create extension if not exists pgcrypto;
-
 create table public.devices (
   id uuid not null,
   user_id uuid not null default auth.uid() references auth.users(id) on delete cascade,
@@ -13,7 +11,7 @@ create table public.devices (
 );
 
 create table public.projects (
-  id uuid not null default gen_random_uuid(),
+  id text not null,
   user_id uuid not null default auth.uid() references auth.users(id) on delete cascade,
   name text not null,
   git_remote_hash text,
@@ -31,10 +29,10 @@ create unique index projects_local_hash_unique
   where git_remote_hash is null and local_project_hash is not null;
 
 create table public.sessions (
-  id uuid not null default gen_random_uuid(),
+  id text not null,
   user_id uuid not null default auth.uid() references auth.users(id) on delete cascade,
   device_id uuid not null,
-  project_id uuid,
+  project_id text,
   provider text not null check (provider in ('openai', 'anthropic', 'google', 'codex', 'claude', 'gemini')),
   external_id text not null,
   title text,
@@ -52,8 +50,8 @@ create table public.usage_events (
   provider text not null check (provider in ('openai', 'anthropic', 'google', 'codex', 'claude', 'gemini')),
   source text not null check (source in ('local_session', 'provider_api', 'cloud_billing')),
   device_id uuid not null,
-  session_id uuid,
-  project_id uuid,
+  session_id text,
+  project_id text,
   model text,
   occurred_at timestamptz not null,
   input_tokens bigint not null default 0 check (input_tokens >= 0),

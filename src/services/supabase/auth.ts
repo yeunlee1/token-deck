@@ -5,6 +5,7 @@ interface AuthResponse {
   access_token: string;
   refresh_token?: string;
   expires_at?: number;
+  expires_in?: number;
   user?: { id?: string };
 }
 
@@ -70,7 +71,7 @@ function toSession(response: AuthResponse): SupabaseSession {
   return {
     accessToken: response.access_token,
     refreshToken: response.refresh_token,
-    expiresAt: response.expires_at,
+    expiresAt: response.expires_at ?? (response.expires_in ? Math.floor(Date.now() / 1000) + response.expires_in : undefined),
     userId: response.user?.id,
   };
 }

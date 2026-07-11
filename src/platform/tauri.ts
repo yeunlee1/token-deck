@@ -25,6 +25,6 @@ export async function scanLocalUsage(modifiedSince?: number): Promise<LocalLogDo
 }
 
 export async function getIntegrationStatus(): Promise<IntegrationStatus> {
-  if (!isTauriRuntime()) return { codex: true, claude: true, gemini: false };
+  if (!isTauriRuntime()) return { codex: false, claude: false, gemini: false };
   return invoke<IntegrationStatus>("integration_status");
 }

@@ -2,24 +2,28 @@
 
 ## Supabase 설정
 
-앱에는 공개 가능한 프로젝트 URL과 anon 키만 설정합니다.
+앱의 설정 화면에는 공개 가능한 프로젝트 URL과 anon 키만 입력합니다. 빌드 기본값은 다음 환경 변수로도 지정할 수 있습니다.
 
 ```env
 VITE_SUPABASE_URL=https://YOUR_PROJECT.supabase.co
 VITE_SUPABASE_ANON_KEY=YOUR_ANON_KEY
 ```
 
-두 값 중 하나라도 없으면 클라이언트는 동기화를 비활성화하고 로컬 기능만 유지합니다. `supabase/migrations/202607110001_initial_usage_sync.sql`은 검토용이며 자동 적용되지 않습니다. 적용 전 대상 Supabase 프로젝트와 신규 테이블, RLS 정책의 영향을 확인해야 합니다.
+두 값 중 하나라도 없으면 클라이언트는 동기화를 비활성화하고 로컬 기능만 유지합니다. 설정 화면의 값은 이 PC에만 저장됩니다. `supabase/migrations/202607110001_initial_usage_sync.sql`은 검토용이며 자동 적용되지 않습니다. 적용 시 `devices`, `projects`, `sessions`, `usage_events`, `sync_checkpoints` 테이블과 각 테이블의 RLS 정책이 새로 생성됩니다.
 
-인증은 이메일 매직링크를 사용합니다. 링크가 돌아올 앱 URL을 Supabase Auth의 허용된 Redirect URL에 등록하고, 콜백에서 받은 세션을 `SupabaseAuthService.acceptSession`에 전달합니다.
+인증은 이메일 매직링크를 사용합니다. Supabase Auth의 Redirect URLs에 `token-deck://auth`를 등록합니다. 데스크톱 앱은 딥링크 콜백을 단일 실행 인스턴스로 전달하고 세션을 복원합니다. 로그인 갱신 토큰은 Windows Credential Manager에 저장합니다.
+
+동기화는 로컬 이벤트를 안정적인 ID로 upsert하고 원격 이벤트를 페이지 단위로 내려받습니다. 같은 계정으로 로그인한 다른 기기에서는 동일한 프로젝트와 세션 사용량이 합산됩니다. 네트워크 오류가 발생하면 로컬 데이터는 유지되고 다음 수집 주기에 다시 시도합니다.
 
 ## 공급사 관리자 자격 증명
 
-공급사 키와 Google OAuth 액세스 토큰은 어댑터 호출 인자로만 전달합니다. Supabase 테이블과 사용 이벤트의 `metadata`에는 저장하지 않습니다. 데스크톱 앱에서는 Windows Credential Manager 같은 OS 비밀 저장소에 보관해야 합니다.
+공급사 키와 Google OAuth 액세스 토큰은 설정 화면에서 입력하며 Windows Credential Manager에 보관합니다. Supabase 테이블과 사용 이벤트의 `metadata`에는 저장하지 않습니다.
 
 - OpenAI는 조직 Admin API 키로 `/v1/organization/usage/completions`를 조회합니다.
 - Anthropic은 Admin API 키로 `/v1/organizations/usage_report/messages`를 조회합니다.
 - Google Cloud는 사용자 OAuth 액세스 토큰으로 BigQuery `jobs.query`를 호출합니다. `billingTable`에는 Billing Export의 `project.dataset.gcp_billing_export_v1_ACCOUNT` 테이블을 지정합니다.
+
+공급사 관리자 키는 각 조직의 관리 API 권한이 있어야 합니다. 개인 구독 화면의 잔여 메시지 한도는 공식 Usage API로 제공되지 않으므로 Token Deck은 로컬 로그에서 확인한 토큰과 조직 API가 반환한 사용량·비용만 표시합니다.
 
 토큰 레코드와 비용 레코드는 각각 `kind: "tokens"`, `kind: "cost"`로 유지합니다. 비용을 토큰으로 환산하거나 개인 구독의 잔여 한도처럼 표시하면 안 됩니다.
 

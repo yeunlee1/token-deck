@@ -1,10 +1,5 @@
 // 기간별 토큰 사용량 추이를 SVG로 시각화하는 차트
-type ChartPoint = {
-  label: string;
-  codex: number;
-  claude: number;
-  gemini: number;
-};
+import type { ChartPoint } from "./chart-data";
 
 interface UsageChartProps {
   data: ChartPoint[];
@@ -20,7 +15,7 @@ export function UsageChart({ data }: UsageChartProps) {
   const width = 760;
   const height = 250;
   const pad = { top: 18, right: 14, bottom: 35, left: 14 };
-  const max = Math.max(...data.flatMap((item) => series.map(({ key }) => item[key]))) * 1.12;
+  const max = Math.max(1, ...data.flatMap((item) => series.map(({ key }) => item[key]))) * 1.12;
 
   const pointsFor = (key: (typeof series)[number]["key"]) =>
     data

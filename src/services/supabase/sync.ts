@@ -33,6 +33,7 @@ export class UsageSyncService {
 
     let uploaded = 0;
     try {
+      await this.upsertReferences(events);
       for (let index = 0; index < events.length; index += BATCH_SIZE) {
         const batch = events.slice(index, index + BATCH_SIZE).map(toRow);
         await this.client.call("/rest/v1/usage_events?on_conflict=user_id,event_id", {
@@ -47,15 +48,90 @@ export class UsageSyncService {
       return { ...failed(error), uploaded };
     }
   }
+
+  private async upsertReferences(events: UsageEvent[]): Promise<void> {
+    const projects = new Map<string, { id: string; name: string; git_remote_hash: string | null; local_project_hash: string | null }>();
+    const sessions = new Map<string, { id: string; device_id: string; project_id: string | null; provider: UsageEvent["provider"]; external_id: string; started_at: string; title: string | null }>();
+    for (const event of events) {
+      if (event.projectId) {
+        projects.set(event.projectId, {
+          id: event.projectId,
+          name: `프로젝트 ${event.projectId.slice(-8)}`,
+          git_remote_hash: event.projectId.startsWith("git_") ? event.projectId : null,
+          local_project_hash: event.projectId.startsWith("git_") ? null : event.projectId,
+        });
+      }
+      if (event.sessionId) {
+        const id = sessionRowId(event);
+        const current = sessions.get(id);
+        sessions.set(id, {
+          id,
+          device_id: event.deviceId,
+          project_id: event.projectId ?? null,
+          provider: event.provider,
+          external_id: event.sessionId,
+          started_at: current && current.started_at < event.occurredAt ? current.started_at : event.occurredAt,
+          title: event.sessionTitle ?? current?.title ?? null,
+        });
+      }
+    }
+    if (projects.size) {
+      await this.client.call("/rest/v1/projects?on_conflict=user_id,id", {
+        method: "POST",
+        headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+        body: JSON.stringify([...projects.values()]),
+      });
+    }
+    if (sessions.size) {
+      await this.client.call("/rest/v1/sessions?on_conflict=user_id,id", {
+        method: "POST",
+        headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+        body: JSON.stringify([...sessions.values()]),
+      });
+    }
+  }
+
+  async listUsageEvents(): Promise<UsageEvent[]> {
+    if (!this.client.enabled) return [];
+    const events: UsageEvent[] = [];
+    for (let offset = 0; ; offset += 1000) {
+      const rows = await this.client.call<Array<Record<string, unknown>>>(
+        "/rest/v1/usage_events?select=event_id,provider,source,device_id,session_id,project_id,model,occurred_at,input_tokens,cached_tokens,output_tokens,reasoning_tokens,tool_tokens,session_title,metadata&order=occurred_at.asc",
+        { headers: { Range: `${offset}-${offset + 999}` } },
+      );
+      events.push(...rows.map(fromRow));
+      if (rows.length < 1000) break;
+    }
+    return events;
+  }
+
+  async listDevices(): Promise<DeviceRegistration[]> {
+    if (!this.client.enabled) return [];
+    const rows = await this.client.call<Array<Record<string, unknown>>>(
+      "/rest/v1/devices?select=id,name,platform,app_version,last_seen_at&order=last_seen_at.desc",
+    );
+    return rows.map((row) => ({
+      id: String(row.id),
+      name: String(row.name),
+      platform: String(row.platform),
+      appVersion: String(row.app_version),
+      lastSeenAt: String(row.last_seen_at),
+    }));
+  }
 }
 
 function toRow(event: UsageEvent): Record<string, unknown> {
+  const metadata = {
+    ...(event.metadata ?? {}),
+    ...(event.sessionId ? { externalSessionId: event.sessionId } : {}),
+    ...(event.projectId ? { externalProjectId: event.projectId } : {}),
+  };
   return {
     event_id: event.eventId,
     provider: event.provider,
     source: event.source,
     device_id: event.deviceId,
-    session_id: event.sessionId ?? null,
+    session_id: event.sessionId ? sessionRowId(event) : null,
     project_id: event.projectId ?? null,
     model: event.model ?? null,
     occurred_at: event.occurredAt,
@@ -65,8 +141,38 @@ function toRow(event: UsageEvent): Record<string, unknown> {
     reasoning_tokens: event.reasoningTokens,
     tool_tokens: event.toolTokens,
     session_title: event.sessionTitle ?? null,
-    metadata: event.metadata ?? {},
+    metadata,
   };
+}
+
+function fromRow(row: Record<string, unknown>): UsageEvent {
+  const metadata = objectValue(row.metadata);
+  return {
+    eventId: String(row.event_id),
+    provider: row.provider as UsageEvent["provider"],
+    source: row.source as UsageEvent["source"],
+    deviceId: String(row.device_id),
+    sessionId: stringValue(metadata.externalSessionId) ?? stringValue(row.session_id),
+    projectId: stringValue(metadata.externalProjectId) ?? stringValue(row.project_id),
+    model: stringValue(row.model),
+    occurredAt: String(row.occurred_at),
+    inputTokens: numberValue(row.input_tokens),
+    cachedTokens: numberValue(row.cached_tokens),
+    outputTokens: numberValue(row.output_tokens),
+    reasoningTokens: numberValue(row.reasoning_tokens),
+    toolTokens: numberValue(row.tool_tokens),
+    sessionTitle: stringValue(row.session_title),
+    metadata,
+  };
+}
+
+function objectValue(value: unknown): Record<string, string | number | boolean | null> {
+  return value && typeof value === "object" ? value as Record<string, string | number | boolean | null> : {};
+}
+function stringValue(value: unknown): string | undefined { return typeof value === "string" ? value : undefined; }
+function numberValue(value: unknown): number { return typeof value === "number" ? value : Number(value ?? 0); }
+function sessionRowId(event: Pick<UsageEvent, "deviceId" | "provider" | "sessionId">): string {
+  return `${event.deviceId}:${event.provider}:${event.sessionId}`;
 }
 
 function failed(error: unknown): SyncResult {

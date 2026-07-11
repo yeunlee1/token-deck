@@ -1,50 +1,15 @@
-// AI 도구별 토큰 사용량을 통합해 보여주는 데스크톱 대시보드
-import { useMemo, useState } from "react";
+// AI 도구별 실제 토큰 사용량과 계정 연결 상태를 통합해 보여주는 데스크톱 대시보드
+import { useEffect, useMemo, useState } from "react";
+import { buildUsageChart, type ChartPeriod } from "./components/chart-data";
 import { Icon, type IconName } from "./components/Icon";
+import { SettingsPanel } from "./components/SettingsPanel";
 import { UsageChart } from "./components/UsageChart";
 import { tokenTotal, type UsageEvent } from "./core";
-import { useLocalUsage } from "./hooks/useLocalUsage";
+import { useAppRuntime } from "./hooks/useAppRuntime";
+import { useNativeSettings } from "./hooks/useNativeSettings";
 import "./styles.css";
 
-type Period = "오늘" | "7일" | "30일";
-
-const sampleProviders = [
-  { name: "Codex", model: "GPT-5 · 앱 + CLI", value: "482K", percent: 78, delta: "+12.4%", tone: "ink", monogram: "CX" },
-  { name: "Claude", model: "Opus 4.1 · Claude Code", value: "315K", percent: 52, delta: "+8.1%", tone: "lime", monogram: "CL" },
-  { name: "Gemini", model: "2.5 Pro · CLI", value: "161K", percent: 27, delta: "−3.2%", tone: "violet", monogram: "GM" },
-];
-
-const sampleProjects = [
-  { name: "newSteel", path: "github.com/acme/newsteel", value: "351K", share: 82, color: "ink" },
-  { name: "WOS Helper", path: "github.com/acme/wos-sfc", value: "247K", share: 58, color: "violet" },
-  { name: "Data Governance", path: "github.com/acme/governance", value: "196K", share: 46, color: "lime" },
-  { name: "Personal Sandbox", path: "로컬 프로젝트", value: "164K", share: 38, color: "blue" },
-];
-
-const sampleDevices = [
-  { name: "WORKSTATION-01", meta: "Windows 11 · 현재 기기", status: "수집 중", icon: "device" as IconName, current: true },
-  { name: "SURFACE-LAPTOP", meta: "Windows 11 · 4분 전", status: "동기화됨", icon: "device" as IconName, current: false },
-];
-
-const chartSets: Record<Period, { label: string; codex: number; claude: number; gemini: number }[]> = {
-  오늘: [
-    { label: "09시", codex: 18, claude: 10, gemini: 6 }, { label: "11시", codex: 33, claude: 21, gemini: 8 },
-    { label: "13시", codex: 26, claude: 30, gemini: 14 }, { label: "15시", codex: 51, claude: 25, gemini: 18 },
-    { label: "17시", codex: 44, claude: 36, gemini: 13 }, { label: "19시", codex: 68, claude: 41, gemini: 22 },
-    { label: "21시", codex: 57, claude: 48, gemini: 28 },
-  ],
-  "7일": [
-    { label: "월", codex: 44, claude: 31, gemini: 18 }, { label: "화", codex: 52, claude: 26, gemini: 22 },
-    { label: "수", codex: 48, claude: 38, gemini: 15 }, { label: "목", codex: 65, claude: 42, gemini: 24 },
-    { label: "금", codex: 59, claude: 36, gemini: 29 }, { label: "토", codex: 22, claude: 19, gemini: 8 },
-    { label: "일", codex: 39, claude: 28, gemini: 13 },
-  ],
-  "30일": [
-    { label: "1주", codex: 38, claude: 25, gemini: 12 }, { label: "2주", codex: 54, claude: 33, gemini: 17 },
-    { label: "3주", codex: 47, claude: 41, gemini: 22 }, { label: "4주", codex: 66, claude: 38, gemini: 29 },
-    { label: "현재", codex: 71, claude: 49, gemini: 25 },
-  ],
-};
+type Period = ChartPeriod;
 
 const providerInfo = {
   codex: { name: "Codex", model: "앱 + CLI", tone: "ink", monogram: "CX" },
@@ -59,7 +24,10 @@ function formatTokens(value: number): string {
 function periodStart(period: Period): Date {
   const start = new Date();
   if (period === "오늘") start.setHours(0, 0, 0, 0);
-  else start.setDate(start.getDate() - (period === "7일" ? 6 : 29));
+  else {
+    start.setHours(0, 0, 0, 0);
+    start.setDate(start.getDate() - (period === "7일" ? 6 : 29));
+  }
   return start;
 }
 
@@ -73,16 +41,24 @@ function SectionTitle({ eyebrow, title, action }: { eyebrow: string; title: stri
 }
 
 export default function App() {
-  const localUsage = useLocalUsage();
+  const runtime = useAppRuntime();
+  const nativeSettings = useNativeSettings();
   const [period, setPeriod] = useState<Period>("7일");
   const [privacy, setPrivacy] = useState(true);
-  const periodEvents = useMemo(() => usageInPeriod(localUsage.events, period), [localUsage.events, period]);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const usageEvents = runtime.combinedEvents;
+  const periodEvents = useMemo(() => usageInPeriod(usageEvents, period), [usageEvents, period]);
   const actualTotal = useMemo(() => periodEvents.reduce((sum, event) => sum + tokenTotal(event.tokens), 0), [periodEvents]);
-  const hasActualData = localUsage.events.length > 0;
-  const total = hasActualData ? actualTotal.toLocaleString("ko-KR") : period === "오늘" ? "127,840" : period === "7일" ? "958,240" : "3,821,700";
+  const chartData = useMemo(() => buildUsageChart(usageEvents, period), [usageEvents, period]);
+
+  useEffect(() => {
+    if (!settingsOpen) return;
+    const close = (event: KeyboardEvent) => event.key === "Escape" && setSettingsOpen(false);
+    window.addEventListener("keydown", close);
+    return () => window.removeEventListener("keydown", close);
+  }, [settingsOpen]);
 
   const providers = useMemo(() => {
-    if (!hasActualData) return sampleProviders;
     const totals = (["codex", "claude", "gemini"] as const).map((provider) => ({
       provider,
       tokens: periodEvents.filter((event) => event.provider === provider).reduce((sum, event) => sum + tokenTotal(event.tokens), 0),
@@ -91,26 +67,42 @@ export default function App() {
       ...providerInfo[provider],
       value: formatTokens(tokens),
       percent: actualTotal ? Math.round(tokens / actualTotal * 100) : 0,
-      delta: tokens ? "수집됨" : "대기",
+      status: runtime.integrations[provider] ? (tokens ? "수집됨" : "연결됨") : "미감지",
     }));
-  }, [actualTotal, hasActualData, periodEvents]);
+  }, [actualTotal, periodEvents, runtime.integrations]);
 
   const projects = useMemo(() => {
-    if (!hasActualData) return sampleProjects;
     const totals = new Map<string, number>();
     periodEvents.forEach((event) => totals.set(event.projectId, (totals.get(event.projectId) ?? 0) + tokenTotal(event.tokens)));
     const max = Math.max(...totals.values(), 1);
     return [...totals.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4).map(([id, value], index) => ({
       name: `프로젝트 ${id.slice(-6).toUpperCase()}`,
-      path: id.startsWith("git_") ? "Git 원격으로 통합됨" : "로컬 식별자",
+      path: id.startsWith("git_") ? "Git 원격으로 기기 간 통합" : "익명 로컬 식별자",
       value: formatTokens(value), share: Math.round(value / max * 100), color: (["ink", "violet", "lime", "blue"] as const)[index],
     }));
-  }, [hasActualData, periodEvents]);
+  }, [periodEvents]);
 
-  const connectedCount = Object.values(localUsage.integrations).filter(Boolean).length;
-  const devices = hasActualData ? [{ name: "현재 Windows 기기", meta: "10초 간격 로컬 수집", status: "수집 중", icon: "device" as IconName, current: true }] : sampleDevices;
+  const sessions = useMemo(() => {
+    const latest = new Map<string, UsageEvent>();
+    usageEvents.forEach((event) => {
+      const current = latest.get(event.sessionId);
+      if (!current || event.occurredAt > current.occurredAt) latest.set(event.sessionId, event);
+    });
+    return [...latest.values()].sort((a, b) => b.occurredAt.localeCompare(a.occurredAt)).slice(0, 30).map((event) => ({
+      id: event.sessionId,
+      provider: event.provider,
+      occurredAt: event.occurredAt,
+      title: runtime.sessionTitles[event.sessionId] ?? "",
+    }));
+  }, [usageEvents, runtime.sessionTitles]);
 
-  const runSync = () => void localUsage.refresh();
+  const connectedCount = Object.values(runtime.integrations).filter(Boolean).length;
+  const authenticated = runtime.auth.status === "authenticated";
+  const accountName = authenticated ? "동기화 계정" : "로컬 사용자";
+  const accountMeta = authenticated ? "여러 기기 동기화 활성" : runtime.auth.enabled ? "로그인 필요" : "Supabase 연결 대기";
+  const syncLabel = runtime.cloudSync.status === "syncing" || runtime.syncing ? "동기화 중" : runtime.cloudSync.status === "error" || runtime.error ? "수집 오류" : "실시간 수집 중";
+
+  const runSync = () => void runtime.syncNow();
 
   return (
     <div className="app-shell">
@@ -123,68 +115,94 @@ export default function App() {
           <a href="#devices" className="nav-item"><Icon name="device" /><span>기기</span></a>
         </nav>
         <div className="sidebar-bottom">
-          <button className="nav-item"><Icon name="settings" /><span>설정</span></button>
-          <div className="account-chip"><span className="avatar">TD</span><div><strong>로컬 사용자</strong><small>Supabase 연결 대기</small></div><Icon name="chevron" /></div>
+          <button className="nav-item" onClick={() => setSettingsOpen(true)}><Icon name="settings" /><span>설정</span></button>
+          <button className="account-chip account-button" onClick={() => setSettingsOpen(true)}><span className="avatar">TD</span><div><strong>{accountName}</strong><small>{accountMeta}</small></div><Icon name="chevron" /></button>
         </div>
       </aside>
 
       <main id="main" className="dashboard">
         <header className="topbar">
-          <div><p className="kicker">통합 사용량 관제</p><h1>토큰 흐름을 확인하세요.</h1><p>모든 AI 코딩 도구의 사용 흐름을 한눈에 확인하세요.</p></div>
-          <div className="top-actions"><span className="live-pill"><i /> {localUsage.error ? "수집 오류" : "실시간 수집 중"}</span><button className="icon-button" aria-label="지금 동기화" onClick={runSync}><Icon className={localUsage.syncing ? "spin" : ""} name="refresh" /></button></div>
+          <div><p className="kicker">통합 사용량 관제</p><h1>토큰 흐름을 확인하세요.</h1><p>모든 AI 코딩 도구의 실제 사용 흐름을 한눈에 확인하세요.</p></div>
+          <div className="top-actions"><span className={`live-pill ${runtime.error ? "error" : ""}`}><i /> {syncLabel}</span><button className="icon-button" aria-label="지금 동기화" onClick={runSync}><Icon className={runtime.syncing ? "spin" : ""} name="refresh" /></button><button className="icon-button mobile-settings" aria-label="설정 열기" onClick={() => setSettingsOpen(true)}><Icon name="settings" /></button></div>
         </header>
+
+        {(runtime.error || runtime.cloudSync.error) && <div className="error-banner" role="alert"><Icon name="warning" /><span>{runtime.error ?? runtime.cloudSync.error}</span></div>}
 
         <section id="overview" className="hero-grid" aria-label="사용량 요약">
           <article className="total-card">
             <div className="card-topline"><span className="eyebrow">TOTAL TOKENS</span><div className="segmented" aria-label="조회 기간">{(["오늘", "7일", "30일"] as Period[]).map((item) => <button key={item} className={period === item ? "selected" : ""} aria-pressed={period === item} onClick={() => setPeriod(item)}>{item}</button>)}</div></div>
-            <div className="total-number"><strong>{total}</strong><span>tokens</span></div>
-            <div className="delta"><Icon name="arrowUp" /> 지난 기간보다 <strong>9.8%</strong> 증가</div>
+            <div className="total-number"><strong>{actualTotal.toLocaleString("ko-KR")}</strong><span>tokens</span></div>
+            <div className="delta"><Icon name="activity" /> 선택 기간에 <strong>{periodEvents.length.toLocaleString("ko-KR")}개</strong> 실제 이벤트 수집</div>
             <div className="pulse-orbit" aria-hidden="true"><span /><i /><b /></div>
           </article>
           <article className="status-card">
-            <span className="eyebrow">SYNC HEALTH</span><div className="health-score"><strong>99.9</strong><span>%</span></div>
-            <p>최근 동기화 <strong>{localUsage.syncing ? "진행 중" : localUsage.updatedAt ? "방금 전" : "대기 중"}</strong></p>
-            <div className="status-row"><span><i className="ok" /> 연결된 기기</span><strong>{hasActualData ? 1 : 2}</strong></div>
-            <div className="status-row"><span><i className="ok" /> 수집 커넥터</span><strong>{hasActualData ? connectedCount : 3} / 3</strong></div>
+            <span className="eyebrow">SYNC HEALTH</span><div className="health-label"><strong>{runtime.cloudSync.status === "disabled" ? "LOCAL" : runtime.cloudSync.status.toUpperCase()}</strong></div>
+            <p>최근 갱신 <strong>{runtime.syncing ? "진행 중" : runtime.updatedAt ? runtime.updatedAt.toLocaleTimeString("ko-KR") : "대기 중"}</strong></p>
+            <div className="status-row"><span><i className="ok" /> 현재 기기</span><strong>1</strong></div>
+            <div className="status-row"><span><i className={connectedCount ? "ok" : ""} /> 수집 커넥터</span><strong>{connectedCount} / 3</strong></div>
           </article>
         </section>
 
         <section className="provider-section">
-          <SectionTitle eyebrow="PROVIDERS" title="공급사별 사용량" action={<button className="text-button">세부 내역 <Icon name="chevron" /></button>} />
+          <SectionTitle eyebrow="PROVIDERS" title="공급사별 사용량" action={<button className="text-button" onClick={() => setSettingsOpen(true)}>연결 설정 <Icon name="chevron" /></button>} />
           <div className="provider-grid">{providers.map((provider) => (
             <article className={`provider-card ${provider.tone}`} key={provider.name}>
-              <div className="provider-heading"><span className="provider-logo">{provider.monogram}</span><div><h3>{provider.name}</h3><p>{provider.model}</p></div><span className={`provider-delta ${provider.delta.startsWith("−") ? "down" : ""}`}>{provider.delta}</span></div>
+              <div className="provider-heading"><span className="provider-logo">{provider.monogram}</span><div><h3>{provider.name}</h3><p>{provider.model}</p></div><span className="provider-delta">{provider.status}</span></div>
               <strong className="provider-value">{provider.value}</strong><span className="provider-unit">tokens</span>
-              <div className="meter" aria-label={`${provider.name} 월간 한도 ${provider.percent}% 사용`}><i style={{ width: `${provider.percent}%` }} /></div>
-              <div className="meter-label"><span>{hasActualData ? "기간 내 비중" : "월간 사용량"}</span><strong>{provider.percent}%</strong></div>
+              <div className="meter" aria-label={`${provider.name}의 선택 기간 내 비중 ${provider.percent}%`}><i style={{ width: `${provider.percent}%` }} /></div>
+              <div className="meter-label"><span>기간 내 비중</span><strong>{provider.percent}%</strong></div>
             </article>
           ))}</div>
         </section>
 
         <section className="content-grid">
           <article className="panel trend-panel">
-            <SectionTitle eyebrow="ACTIVITY" title="사용량 추이" action={<div className="legend"><span className="codex">Codex</span><span className="claude">Claude</span><span className="gemini">Gemini</span></div>} />
-            <UsageChart data={chartSets[period]} />
+            <SectionTitle eyebrow="ACTIVITY" title="실제 사용량 추이" action={<div className="legend"><span className="codex">Codex</span><span className="claude">Claude</span><span className="gemini">Gemini</span></div>} />
+            <UsageChart data={chartData} />
           </article>
           <article id="projects" className="panel project-panel">
-            <SectionTitle eyebrow="PROJECTS" title="프로젝트 순위" action={<button className="icon-plain" aria-label="프로젝트 상세 보기"><Icon name="chevron" /></button>} />
-            <ol className="project-list">{projects.map((project, index) => <li key={project.name}><span className="rank">0{index + 1}</span><div className="project-main"><div className="project-info"><span className={`project-dot ${project.color}`} /><div><strong>{project.name}</strong><small>{project.path}</small></div><b>{project.value}</b></div><div className="project-bar"><i className={project.color} style={{ width: `${project.share}%` }} /></div></div></li>)}</ol>
+            <SectionTitle eyebrow="PROJECTS" title="프로젝트 순위" />
+            {projects.length ? <ol className="project-list">{projects.map((project, index) => <li key={project.name}><span className="rank">0{index + 1}</span><div className="project-main"><div className="project-info"><span className={`project-dot ${project.color}`} /><div><strong>{project.name}</strong><small>{project.path}</small></div><b>{project.value}</b></div><div className="project-bar"><i className={project.color} style={{ width: `${project.share}%` }} /></div></div></li>)}</ol> : <div className="panel-empty"><Icon name="folder" /><strong>아직 프로젝트 사용량이 없습니다.</strong><p>지원되는 AI 도구에서 작업하면 자동으로 분류됩니다.</p></div>}
           </article>
         </section>
 
         <section className="lower-grid">
           <article id="devices" className="panel device-panel">
-            <SectionTitle eyebrow="DEVICES" title="연결된 기기" action={<span className="count-badge">2대 활성</span>} />
-            <div className="device-list">{devices.map((device) => <div className="device-row" key={device.name}><span className={`device-icon ${device.current ? "current" : ""}`}><Icon name={device.icon} /></span><div><strong>{device.name}</strong><small>{device.meta}</small></div><span className="device-status"><i />{device.status}</span></div>)}</div>
+            <SectionTitle eyebrow="DEVICES" title="연결된 기기" action={<span className="count-badge">{runtime.devices.length}대</span>} />
+            <div className="device-list">{runtime.devices.map((device, index) => <div className="device-row" key={device.id}><span className={`device-icon ${index === 0 ? "current" : ""}`}><Icon name={"device" as IconName} /></span><div><strong>{device.name}</strong><small>{device.platform} · {new Date(device.lastSeenAt).toLocaleString("ko-KR")}</small></div><span className="device-status"><i />{index === 0 ? "현재 기기" : "동기화됨"}</span></div>)}</div>
           </article>
           <article className="privacy-card">
             <div className="privacy-icon"><Icon name="lock" /></div><div className="privacy-copy"><span className="eyebrow">PRIVACY GUARD</span><h2>코드는 기기 밖으로 나가지 않아요.</h2><p>토큰 수치와 익명 프로젝트 ID만 암호화해 동기화합니다.</p><div className="privacy-meta"><Icon name="check" /> 전체 경로·프롬프트 수집 안 함</div></div>
-            <button className={`toggle ${privacy ? "on" : ""}`} role="switch" aria-checked={privacy} aria-label="개인정보 보호 활성화" onClick={() => setPrivacy(!privacy)}><span /></button>
+            <button className={`toggle ${privacy ? "on" : ""}`} role="switch" aria-checked={privacy} aria-label="개인정보 보호 안내 확인" onClick={() => setPrivacy(!privacy)}><span /></button>
           </article>
         </section>
 
-        <footer><span>Token Deck <b>v0.1.0</b></span><span><i /> {hasActualData ? "로컬 데이터 연결됨" : "브라우저 미리보기 데이터"}</span><span>마지막 갱신 · {localUsage.syncing ? "동기화 중" : localUsage.updatedAt?.toLocaleTimeString("ko-KR") ?? "대기 중"}</span></footer>
+        <footer><span>Token Deck <b>v0.2.0</b></span><span><i /> {usageEvents.length ? "실제 사용량 연결됨" : "수집 이벤트 대기 중"}</span><span>마지막 갱신 · {runtime.syncing ? "동기화 중" : runtime.updatedAt?.toLocaleTimeString("ko-KR") ?? "대기 중"}</span></footer>
       </main>
+
+      <SettingsPanel
+        open={settingsOpen}
+        auth={runtime.auth}
+        cloudSync={runtime.cloudSync}
+        credentials={runtime.credentials}
+        gemini={nativeSettings.gemini}
+        autostart={nativeSettings.autostart}
+        nativeBusy={nativeSettings.busy}
+        nativeMessage={nativeSettings.message}
+        providerUsage={runtime.providerUsage}
+        sessions={sessions}
+        onClose={() => setSettingsOpen(false)}
+        onConfigureSupabase={(url, anonKey) => runtime.configureSupabase(url, anonKey)}
+        onClearSupabaseConfig={() => runtime.clearSupabaseConfig()}
+        onSendMagicLink={(email) => runtime.sendMagicLink(email)}
+        onSignOut={() => runtime.signOut()}
+        onSaveCredential={(provider, credentials) => runtime.saveProviderCredential(provider, credentials)}
+        onRemoveCredential={(provider) => runtime.removeProviderCredential(provider)}
+        onRefreshProvider={(provider) => runtime.refreshProviderUsage(provider)}
+        onUpdateSessionTitle={(sessionId, title) => runtime.updateSessionTitle(sessionId, title)}
+        onSetAutostart={(enabled) => nativeSettings.toggleAutostart(enabled)}
+        onConfigureGemini={() => nativeSettings.enableGeminiTelemetry()}
+      />
     </div>
   );
 }

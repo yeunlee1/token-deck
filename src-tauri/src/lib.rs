@@ -3,8 +3,10 @@ use serde::Serialize;
 use std::{fs, io::{BufRead, BufReader}, path::{Path, PathBuf}, time::UNIX_EPOCH};
 use tauri::{menu::{Menu, MenuItem}, tray::TrayIconBuilder, Manager};
 
+mod native_integration;
+
 fn credential_entry(provider: &str) -> Result<keyring::Entry, String> {
-    if !matches!(provider, "openai" | "anthropic" | "google") {
+    if !matches!(provider, "openai" | "anthropic" | "google" | "supabase") {
         return Err("지원하지 않는 공급사입니다".into());
     }
     keyring::Entry::new("app.tokendeck.desktop", provider).map_err(|error| error.to_string())
@@ -56,18 +58,55 @@ fn cwd_from_content(content: &str) -> Option<PathBuf> {
 fn git_remote_from_cwd(cwd: Option<PathBuf>) -> Option<String> {
     let mut directory = cwd?;
     loop {
-        let config = directory.join(".git").join("config");
-        if let Ok(content) = fs::read_to_string(config) {
-            let mut in_origin = false;
-            for line in content.lines() {
-                let trimmed = line.trim();
-                if trimmed.starts_with('[') { in_origin = trimmed == "[remote \"origin\"]"; }
-                if in_origin && trimmed.starts_with("url") {
-                    return trimmed.split_once('=').map(|(_, url)| url.trim().to_owned());
+        if let Some(config) = git_config_path(&directory) {
+            if let Ok(content) = fs::read_to_string(config) {
+                let mut in_origin = false;
+                for line in content.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.starts_with('[') { in_origin = trimmed == "[remote \"origin\"]"; }
+                    if in_origin && trimmed.starts_with("url") {
+                        return trimmed.split_once('=').map(|(_, url)| url.trim().to_owned());
+                    }
                 }
             }
         }
         if !directory.pop() { return None; }
+    }
+}
+
+fn git_config_path(directory: &Path) -> Option<PathBuf> {
+    let dot_git = directory.join(".git");
+    if dot_git.is_dir() { return Some(dot_git.join("config")); }
+    let pointer = fs::read_to_string(&dot_git).ok()?;
+    let git_dir_value = pointer.trim().strip_prefix("gitdir:")?.trim();
+    let git_dir = {
+        let path = PathBuf::from(git_dir_value);
+        if path.is_absolute() { path } else { directory.join(path) }
+    };
+    let common_dir = fs::read_to_string(git_dir.join("commondir")).ok()
+        .map(|value| git_dir.join(value.trim()));
+    Some(common_dir.unwrap_or(git_dir).join("config"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::git_remote_from_cwd;
+    use std::{fs, time::{SystemTime, UNIX_EPOCH}};
+
+    #[test]
+    fn worktree_uses_common_repository_config() {
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("token-deck-worktree-{unique}"));
+        let worktree = root.join("worktree");
+        let git_dir = root.join("repo.git").join("worktrees").join("feature");
+        fs::create_dir_all(&worktree).unwrap();
+        fs::create_dir_all(&git_dir).unwrap();
+        fs::write(worktree.join(".git"), format!("gitdir: {}", git_dir.display())).unwrap();
+        fs::write(git_dir.join("commondir"), "../..").unwrap();
+        fs::write(root.join("repo.git").join("config"), "[remote \"origin\"]\n  url = git@github.com:owner/repo.git\n").unwrap();
+
+        assert_eq!(git_remote_from_cwd(Some(worktree)), Some("git@github.com:owner/repo.git".into()));
+        fs::remove_dir_all(root).unwrap();
     }
 }
 
@@ -131,7 +170,22 @@ fn integration_status() -> serde_json::Value {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(
+            |app, _arguments, _cwd| {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            },
+        ))
+        .plugin(tauri_plugin_deep_link::init())
+        .plugin(tauri_plugin_http::init())
         .setup(|app| {
+            #[cfg(all(debug_assertions, windows))]
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                app.deep_link().register_all()?;
+            }
             let show = MenuItem::with_id(app, "show", "Token Deck 열기", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "종료", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show, &quit])?;
@@ -144,6 +198,11 @@ pub fn run() {
                     _ => {}
                 })
                 .build(app)?;
+            if std::env::args_os().any(|argument| argument == "--hidden") {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.hide();
+                }
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -152,6 +211,10 @@ pub fn run() {
             store_provider_secret,
             load_provider_secret,
             remove_provider_secret,
+            native_integration::autostart_status,
+            native_integration::set_autostart,
+            native_integration::gemini_status,
+            native_integration::configure_gemini_telemetry,
         ])
         .run(tauri::generate_context!())
         .expect("Token Deck 실행 중 오류가 발생했습니다");

@@ -12,7 +12,7 @@ export interface TokenBreakdown {
 export interface UsageEvent {
   id: string;
   provider: Provider;
-  source: "local-jsonl" | "otel";
+  source: "local-jsonl" | "otel" | "provider-api";
   deviceId: string;
   sessionId: string;
   projectId: string;

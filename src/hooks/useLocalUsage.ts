@@ -3,7 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { collectUsageDocuments, createCollectorState, type UsageEvent } from "../core";
 import { getIntegrationStatus, scanLocalUsage, type IntegrationStatus } from "../platform/tauri";
 
-function deviceId(): string {
+export function getOrCreateDeviceId(): string {
   const existing = window.localStorage.getItem("token-deck-device-id");
   if (existing) return existing;
   const created = crypto.randomUUID();
@@ -25,7 +25,7 @@ export function useLocalUsage() {
     try {
       const scanStartedAt = Math.max(0, Math.floor(Date.now() / 1000) - 1);
       const [documents, status] = await Promise.all([scanLocalUsage(modifiedSince.current), getIntegrationStatus()]);
-      const incoming = collectUsageDocuments(documents, deviceId(), collectorState.current);
+      const incoming = collectUsageDocuments(documents, getOrCreateDeviceId(), collectorState.current);
       if (incoming.length) {
         setEvents((current) => {
           const byId = new Map(current.map((event) => [event.id, event]));

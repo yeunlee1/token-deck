@@ -5,6 +5,7 @@ import type { UsageEvent as SyncUsageEvent, UsageSource } from "./types";
 const SOURCE_MAP: Record<CollectorUsageEvent["source"], UsageSource> = {
   "local-jsonl": "local_session",
   otel: "local_session",
+  "provider-api": "provider_api",
 };
 
 export function toSyncUsageEvent(event: CollectorUsageEvent): SyncUsageEvent {
@@ -28,4 +29,29 @@ export function toSyncUsageEvent(event: CollectorUsageEvent): SyncUsageEvent {
 
 export function toSyncUsageEvents(events: CollectorUsageEvent[]): SyncUsageEvent[] {
   return events.map(toSyncUsageEvent);
+}
+
+export function mergeCollectorUsageEvents(local: CollectorUsageEvent[], remote: CollectorUsageEvent[]): CollectorUsageEvent[] {
+  const byId = new Map(remote.map((event) => [event.id, event]));
+  local.forEach((event) => byId.set(event.id, event));
+  return [...byId.values()];
+}
+
+export function mergeUsageWithProviderAuthority(local: CollectorUsageEvent[], cloud: CollectorUsageEvent[]): CollectorUsageEvent[] {
+  const authoritativeProviders = new Set(cloud.filter((event) => event.source === "provider-api").map((event) => event.provider));
+  const localWithoutCloudDuplicates = local.filter((event) => !authoritativeProviders.has(event.provider));
+  const cloudWithoutLocalDuplicates = cloud.filter((event) => event.source === "provider-api" || !authoritativeProviders.has(event.provider));
+  return mergeCollectorUsageEvents(localWithoutCloudDuplicates, cloudWithoutLocalDuplicates);
+}
+
+export function mergeSessionTitles(current: Record<string, string>, events: SyncUsageEvent[]): Record<string, string> {
+  const merged = { ...current };
+  let changed = false;
+  events.forEach((event) => {
+    if (event.sessionId && event.sessionTitle && merged[event.sessionId] !== event.sessionTitle) {
+      merged[event.sessionId] = event.sessionTitle;
+      changed = true;
+    }
+  });
+  return changed ? merged : current;
 }

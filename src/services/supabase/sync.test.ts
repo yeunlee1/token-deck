@@ -25,6 +25,74 @@ describe("UsageSyncService", () => {
     expect(new Headers(init.headers).get("Prefer")).toContain("resolution=merge-duplicates");
     expect(JSON.parse(String(init.body))).toEqual([expect.objectContaining({ event_id: "event-1" })]);
   });
+
+  it("프로젝트와 세션을 먼저 업서트한 뒤 문자열 식별자를 FK로 보존한다", async () => {
+    const request = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    const client = new SupabaseRestClient({ url: "https://example.supabase.co", anonKey: "anon" }, request);
+    client.setSession({ accessToken: "access" });
+    const item = { ...event(), projectId: "git_project-hash", sessionId: "session-external" };
+
+    await new UsageSyncService(client).upsertUsageEvents([item]);
+
+    expect(request).toHaveBeenCalledTimes(3);
+    expect(request.mock.calls[0][0]).toContain("/projects?on_conflict=user_id,id");
+    expect(request.mock.calls[1][0]).toContain("/sessions?on_conflict=user_id,id");
+    expect(request.mock.calls[2][0]).toContain("/usage_events?on_conflict=user_id,event_id");
+    expect(JSON.parse(String((request.mock.calls[2][1] as RequestInit).body))[0]).toEqual(expect.objectContaining({
+      project_id: "git_project-hash",
+      session_id: "00000000-0000-0000-0000-000000000001:codex:session-external",
+    }));
+  });
+
+  it("다른 기기의 클라우드 이벤트와 원본 프로젝트 식별자를 내려받는다", async () => {
+    const row = {
+      event_id: "event-remote", provider: "claude", source: "local_session", device_id: "device-2",
+      session_id: "session-2", project_id: "git_shared", occurred_at: "2026-07-11T01:00:00.000Z",
+      input_tokens: 9, cached_tokens: 2, output_tokens: 4, reasoning_tokens: 0, tool_tokens: 1,
+      metadata: { externalProjectId: "git_shared" },
+    };
+    const request = vi.fn().mockResolvedValue(new Response(JSON.stringify([row]), { status: 200 }));
+    const client = new SupabaseRestClient({ url: "https://example.supabase.co", anonKey: "anon" }, request);
+    client.setSession({ accessToken: "access" });
+
+    const result = await new UsageSyncService(client).listUsageEvents();
+
+    expect(result).toEqual([expect.objectContaining({ eventId: "event-remote", deviceId: "device-2", projectId: "git_shared", inputTokens: 9 })]);
+    expect(request.mock.calls[0][0]).toContain("usage_events?select=");
+  });
+
+  it("1000행 Range 페이지를 반복해 1001개 이벤트를 모두 내려받는다", async () => {
+    const base = {
+      provider: "codex", source: "local_session", device_id: "device-2", session_id: null, project_id: null,
+      occurred_at: "2026-07-11T01:00:00.000Z", input_tokens: 1, cached_tokens: 0, output_tokens: 0,
+      reasoning_tokens: 0, tool_tokens: 0, metadata: {},
+    };
+    const firstPage = Array.from({ length: 1000 }, (_, index) => ({ ...base, event_id: `event-${index}` }));
+    const request = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify(firstPage), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify([{ ...base, event_id: "event-1000" }]), { status: 200 }));
+    const client = new SupabaseRestClient({ url: "https://example.supabase.co", anonKey: "anon" }, request);
+    client.setSession({ accessToken: "access" });
+
+    const result = await new UsageSyncService(client).listUsageEvents();
+
+    expect(result).toHaveLength(1001);
+    expect(new Headers((request.mock.calls[0][1] as RequestInit).headers).get("Range")).toBe("0-999");
+    expect(new Headers((request.mock.calls[1][1] as RequestInit).headers).get("Range")).toBe("1000-1999");
+  });
+
+  it("계정 기기를 최근 접속 순서로 요청하고 앱 형식으로 변환한다", async () => {
+    const request = vi.fn().mockResolvedValue(new Response(JSON.stringify([{
+      id: "device-2", name: "노트북", platform: "windows", app_version: "0.2.0", last_seen_at: "2026-07-11T02:00:00Z",
+    }]), { status: 200 }));
+    const client = new SupabaseRestClient({ url: "https://example.supabase.co", anonKey: "anon" }, request);
+    client.setSession({ accessToken: "access" });
+
+    await expect(new UsageSyncService(client).listDevices()).resolves.toEqual([{
+      id: "device-2", name: "노트북", platform: "windows", appVersion: "0.2.0", lastSeenAt: "2026-07-11T02:00:00Z",
+    }]);
+    expect(request.mock.calls[0][0]).toContain("order=last_seen_at.desc");
+  });
 });
 
 function event() {
