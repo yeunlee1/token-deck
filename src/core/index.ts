@@ -5,4 +5,5 @@ export * from "./collect";
 export * from "./codex";
 export * from "./gemini";
 export * from "./project-identity";
+export * from "./project-display";
 export * from "./types";

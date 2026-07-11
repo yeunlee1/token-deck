@@ -3,6 +3,7 @@ import { useEffect, useMemo, useState } from "react";
 import { buildUsageChart, type ChartPeriod } from "./components/chart-data";
 import { Icon, type IconName } from "./components/Icon";
 import { MiniDashboard } from "./components/MiniDashboard";
+import { ProjectNameEditor } from "./components/ProjectNameEditor";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { UsageChart } from "./components/UsageChart";
 import { quotaStatusLabel, remainingLabel, remainingTone } from "./components/quota-display";
@@ -11,14 +12,14 @@ import { useAppRuntime } from "./hooks/useAppRuntime";
 import { getOrCreateDeviceId } from "./hooks/useLocalUsage";
 import { useNativeSettings } from "./hooks/useNativeSettings";
 import { useProviderQuotas } from "./hooks/useProviderQuotas";
-import { applyWindowMode } from "./platform/window-mode";
+import { applyWindowMode, setWindowPinned } from "./platform/window-mode";
 import "./styles.css";
 
 type Period = ChartPeriod;
 type ActiveView = "overview" | "projects" | "devices";
 const MINI_MODE_KEY = "token-deck-mini-mode";
 const MINI_PROVIDERS_KEY = "token-deck-mini-providers";
-const MINI_OPACITY_KEY = "token-deck-mini-opacity";
+const MINI_PINNED_KEY = "token-deck-mini-pinned";
 const DISPLAY_PROVIDERS_KEY = "token-deck-display-providers";
 const ALL_PROVIDERS: Provider[] = ["codex", "claude", "gemini"];
 
@@ -61,7 +62,9 @@ export default function App() {
   const [miniMode, setMiniMode] = useState(() => window.localStorage.getItem(MINI_MODE_KEY) === "true");
   const [displayProviders, setDisplayProviders] = useState<Provider[]>(() => readProviderList(DISPLAY_PROVIDERS_KEY, ALL_PROVIDERS));
   const [miniProviders, setMiniProviders] = useState<Provider[]>(() => readProviderList(MINI_PROVIDERS_KEY, ["codex", "claude"]));
-  const [miniOpacity, setMiniOpacity] = useState(() => readOpacity());
+  const [miniPinned, setMiniPinned] = useState(() => window.localStorage.getItem(MINI_PINNED_KEY) === "true");
+  const [editingProjectId, setEditingProjectId] = useState<string>();
+  const [projectNameDraft, setProjectNameDraft] = useState("");
   const [windowModeError, setWindowModeError] = useState("");
   const [privacy, setPrivacy] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -80,7 +83,7 @@ export default function App() {
 
   useEffect(() => {
     if (!miniMode) return;
-    void applyWindowMode(true).catch((cause) => {
+    void applyWindowMode(true, miniPinned).catch((cause) => {
       setMiniMode(false);
       window.localStorage.removeItem(MINI_MODE_KEY);
       setWindowModeError(cause instanceof Error ? cause.message : "미니 창으로 전환하지 못했습니다.");
@@ -108,14 +111,14 @@ export default function App() {
     const max = Math.max(...totals.map((project) => project.value), 1);
     return totals.sort((a, b) => b.value - a.value).map(({ id, events, value }, index) => ({
       id,
-      name: `프로젝트 ${id.slice(-6).toUpperCase()}`,
-      path: id.startsWith("git_") ? "Git 원격으로 기기 간 통합" : "익명 로컬 식별자",
+      name: runtime.projectNames[id] ?? `프로젝트 ${id.slice(-6).toUpperCase()}`,
+      source: runtime.projectNameOverrides[id] ? "사용자 지정 이름" : id.startsWith("git_") ? "Git 저장소 이름" : "프로젝트 폴더 이름",
       value: formatTokens(value), rawValue: value, share: Math.round(value / max * 100), color: (["ink", "violet", "lime", "blue"] as const)[index % 4],
       events: events.length,
       devices: new Set(events.map((event) => event.deviceId)).size,
       providers: new Set(events.map((event) => event.provider)).size,
     }));
-  }, [periodEvents]);
+  }, [periodEvents, runtime.projectNameOverrides, runtime.projectNames]);
 
   const deviceUsage = useMemo(() => runtime.devices.map((device) => {
     const events = periodEvents.filter((event) => event.deviceId === device.id);
@@ -156,7 +159,7 @@ export default function App() {
   const runSync = () => void Promise.all([runtime.syncNow(), providerQuotas.refresh()]);
   const changeWindowMode = async (enabled: boolean) => {
     try {
-      await applyWindowMode(enabled);
+      await applyWindowMode(enabled, enabled && miniPinned);
       setMiniMode(enabled);
       window.localStorage.setItem(MINI_MODE_KEY, String(enabled));
       setWindowModeError("");
@@ -170,13 +173,22 @@ export default function App() {
     setCurrent(next);
     window.localStorage.setItem(storageKey, JSON.stringify(next));
   };
-  const changeMiniOpacity = (opacity: number) => {
-    const next = Math.max(0, Math.min(100, opacity));
-    setMiniOpacity(next);
-    window.localStorage.setItem(MINI_OPACITY_KEY, String(next));
+  const toggleMiniPinned = async () => {
+    const next = !miniPinned;
+    try {
+      await setWindowPinned(next);
+      setMiniPinned(next);
+      window.localStorage.setItem(MINI_PINNED_KEY, String(next));
+      setWindowModeError("");
+    } catch (cause) {
+      setWindowModeError(cause instanceof Error ? cause.message : "창 고정 상태를 바꾸지 못했습니다.");
+    }
   };
+  const startProjectNameEdit = (id: string, name: string) => { setEditingProjectId(id); setProjectNameDraft(name); };
+  const cancelProjectNameEdit = () => { setEditingProjectId(undefined); setProjectNameDraft(""); };
+  const saveProjectName = async (id: string) => { await runtime.updateProjectName(id, projectNameDraft); cancelProjectNameEdit(); };
 
-  if (miniMode) return <MiniDashboard quotas={Object.values(providerQuotas.quotas)} providers={miniProviders} opacity={miniOpacity} updatedAt={providerQuotas.updatedAt} syncing={providerQuotas.loading || providerQuotas.busy} error={providerQuotas.error} onToggleProvider={(provider) => toggleProvider(provider, miniProviders, setMiniProviders, MINI_PROVIDERS_KEY)} onOpacityChange={changeMiniOpacity} onExit={() => void changeWindowMode(false)} onRefresh={runSync} />;
+  if (miniMode) return <MiniDashboard quotas={Object.values(providerQuotas.quotas)} providers={miniProviders} updatedAt={providerQuotas.updatedAt} syncing={providerQuotas.loading || providerQuotas.busy} error={providerQuotas.error} pinned={miniPinned} onToggleProvider={(provider) => toggleProvider(provider, miniProviders, setMiniProviders, MINI_PROVIDERS_KEY)} onTogglePinned={() => void toggleMiniPinned()} onExit={() => void changeWindowMode(false)} />;
 
   return (
     <div className="app-shell">
@@ -237,7 +249,7 @@ export default function App() {
           </article>
           <article id="projects" className="panel project-panel">
             <SectionTitle eyebrow="PROJECTS" title="프로젝트 순위" />
-            {projects.length ? <ol className="project-list">{projects.map((project, index) => <li key={project.name}><span className="rank">0{index + 1}</span><div className="project-main"><div className="project-info"><span className={`project-dot ${project.color}`} /><div><strong>{project.name}</strong><small>{project.path}</small></div><b>{project.value}</b></div><div className="project-bar"><i className={project.color} style={{ width: `${project.share}%` }} /></div></div></li>)}</ol> : <div className="panel-empty"><Icon name="folder" /><strong>아직 프로젝트 사용량이 없습니다.</strong><p>지원되는 AI 도구에서 작업하면 자동으로 분류됩니다.</p></div>}
+            {projects.length ? <ol className="project-list">{projects.map((project, index) => <li key={project.id}><span className="rank">0{index + 1}</span><div className="project-main"><div className="project-info"><span className={`project-dot ${project.color}`} /><ProjectNameEditor name={project.name} source={project.source} editing={editingProjectId === project.id} draft={projectNameDraft} onStart={() => startProjectNameEdit(project.id, project.name)} onDraftChange={setProjectNameDraft} onSave={() => void saveProjectName(project.id)} onCancel={cancelProjectNameEdit} /><b>{project.value}</b></div><div className="project-bar"><i className={project.color} style={{ width: `${project.share}%` }} /></div></div></li>)}</ol> : <div className="panel-empty"><Icon name="folder" /><strong>아직 프로젝트 사용량이 없습니다.</strong><p>지원되는 AI 도구에서 작업하면 자동으로 분류됩니다.</p></div>}
           </article>
         </section>
 
@@ -257,7 +269,7 @@ export default function App() {
             <SectionTitle eyebrow="ALL PROJECTS" title={`${projects.length}개 프로젝트`} action={<div className="segmented" aria-label="프로젝트 조회 기간">{(["오늘", "7일", "30일"] as Period[]).map((item) => <button key={item} className={period === item ? "selected" : ""} aria-pressed={period === item} onClick={() => setPeriod(item)}>{item}</button>)}</div>} />
             {projects.length ? <div className="detail-list">{projects.map((project, index) => <article className="detail-row" key={project.id}>
               <span className="detail-rank">{String(index + 1).padStart(2, "0")}</span>
-              <div className="detail-main"><div className="detail-name"><span className={`project-dot ${project.color}`} /><div><strong>{project.name}</strong><small>{project.path}</small></div></div><div className="detail-meter"><i className={project.color} style={{ width: `${project.share}%` }} /></div></div>
+              <div className="detail-main"><div className="detail-name"><span className={`project-dot ${project.color}`} /><ProjectNameEditor name={project.name} source={project.source} editing={editingProjectId === project.id} draft={projectNameDraft} onStart={() => startProjectNameEdit(project.id, project.name)} onDraftChange={setProjectNameDraft} onSave={() => void saveProjectName(project.id)} onCancel={cancelProjectNameEdit} /></div><div className="detail-meter"><i className={project.color} style={{ width: `${project.share}%` }} /></div></div>
               <div className="detail-metrics primary"><strong>{project.value}</strong><small>토큰</small></div>
               <div className="detail-metrics"><strong>{project.events.toLocaleString("ko-KR")}</strong><small>이벤트</small></div>
               <div className="detail-metrics"><strong>{project.devices}</strong><small>기기</small></div>
@@ -328,9 +340,4 @@ function readProviderList(key: string, fallback: Provider[]): Provider[] {
     }
   }
   return fallback;
-}
-
-function readOpacity(): number {
-  const value = Number(window.localStorage.getItem(MINI_OPACITY_KEY) ?? "90");
-  return Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : 90;
 }

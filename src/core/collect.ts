@@ -4,6 +4,7 @@ import { parseCodexJsonl } from "./codex";
 import { parseGeminiOtel } from "./gemini";
 import { firstString, isObject, parseJsonLines, valueAt } from "./parse-utils";
 import { identifyProject } from "./project-identity";
+import { inferProjectDisplayName, type ProjectNameMap } from "./project-display";
 import type { CollectorState, Provider, UsageEvent } from "./types";
 
 export interface CollectorDocument {
@@ -71,4 +72,19 @@ export function collectUsageDocuments(
         return parseGeminiOtel(document.content, context, state);
     }
   });
+}
+
+export function collectProjectDisplayNames(documents: CollectorDocument[]): ProjectNameMap {
+  const names: ProjectNameMap = {};
+  for (const document of documents) {
+    const metadata = metadataFromDocument(document);
+    const name = inferProjectDisplayName({ gitRemote: document.gitRemote, cwd: metadata.cwd });
+    if (!name) continue;
+    const projectId = identifyProject({
+      gitRemote: document.gitRemote,
+      localPath: metadata.cwd ?? `log:${document.path}`,
+    }).id;
+    names[projectId] = name;
+  }
+  return names;
 }
