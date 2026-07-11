@@ -2,10 +2,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { buildUsageChart, type ChartPeriod } from "./components/chart-data";
 import { Icon, type IconName } from "./components/Icon";
-import { MiniDashboard, type MiniSelection } from "./components/MiniDashboard";
+import { MiniDashboard } from "./components/MiniDashboard";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { UsageChart } from "./components/UsageChart";
-import { tokenTotal, type UsageEvent } from "./core";
+import { buildProviderWindowUsage, tokenTotal, type Provider, type UsageEvent } from "./core";
 import { useAppRuntime } from "./hooks/useAppRuntime";
 import { getOrCreateDeviceId } from "./hooks/useLocalUsage";
 import { useNativeSettings } from "./hooks/useNativeSettings";
@@ -15,7 +15,10 @@ import "./styles.css";
 type Period = ChartPeriod;
 type ActiveView = "overview" | "projects" | "devices";
 const MINI_MODE_KEY = "token-deck-mini-mode";
-const MINI_SELECTION_KEY = "token-deck-mini-selection";
+const MINI_PROVIDERS_KEY = "token-deck-mini-providers";
+const MINI_OPACITY_KEY = "token-deck-mini-opacity";
+const DISPLAY_PROVIDERS_KEY = "token-deck-display-providers";
+const ALL_PROVIDERS: Provider[] = ["codex", "claude", "gemini"];
 
 const providerInfo = {
   codex: { name: "Codex", model: "앱 + CLI", tone: "ink", monogram: "CX" },
@@ -53,14 +56,18 @@ export default function App() {
   const [period, setPeriod] = useState<Period>("7일");
   const [activeView, setActiveView] = useState<ActiveView>("overview");
   const [miniMode, setMiniMode] = useState(() => window.localStorage.getItem(MINI_MODE_KEY) === "true");
-  const [miniSelection, setMiniSelection] = useState<MiniSelection>(() => readMiniSelection());
+  const [displayProviders, setDisplayProviders] = useState<Provider[]>(() => readProviderList(DISPLAY_PROVIDERS_KEY, ALL_PROVIDERS));
+  const [miniProviders, setMiniProviders] = useState<Provider[]>(() => readProviderList(MINI_PROVIDERS_KEY, ["codex", "claude"]));
+  const [miniOpacity, setMiniOpacity] = useState(() => readOpacity());
   const [windowModeError, setWindowModeError] = useState("");
   const [privacy, setPrivacy] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const usageEvents = runtime.combinedEvents;
-  const periodEvents = useMemo(() => usageInPeriod(usageEvents, period), [usageEvents, period]);
+  const visibleEvents = useMemo(() => usageEvents.filter((event) => displayProviders.includes(event.provider)), [displayProviders, usageEvents]);
+  const periodEvents = useMemo(() => usageInPeriod(visibleEvents, period), [visibleEvents, period]);
   const actualTotal = useMemo(() => periodEvents.reduce((sum, event) => sum + tokenTotal(event.tokens), 0), [periodEvents]);
-  const chartData = useMemo(() => buildUsageChart(usageEvents, period), [usageEvents, period]);
+  const chartData = useMemo(() => buildUsageChart(visibleEvents, period), [visibleEvents, period]);
+  const windowUsage = useMemo(() => new Map(buildProviderWindowUsage(usageEvents, ALL_PROVIDERS).map((item) => [item.provider, item])), [usageEvents]);
 
   useEffect(() => {
     if (!settingsOpen) return;
@@ -79,7 +86,7 @@ export default function App() {
   }, []);
 
   const providers = useMemo(() => {
-    const totals = (["codex", "claude", "gemini"] as const).map((provider) => ({
+    const totals = displayProviders.map((provider) => ({
       provider,
       tokens: periodEvents.filter((event) => event.provider === provider).reduce((sum, event) => sum + tokenTotal(event.tokens), 0),
     }));
@@ -88,8 +95,10 @@ export default function App() {
       value: formatTokens(tokens),
       percent: actualTotal ? Math.round(tokens / actualTotal * 100) : 0,
       status: runtime.integrations[provider] ? (tokens ? "수집됨" : "연결됨") : "미감지",
+      fiveHours: windowUsage.get(provider)?.fiveHours ?? 0,
+      week: windowUsage.get(provider)?.week ?? 0,
     }));
-  }, [actualTotal, periodEvents, runtime.integrations]);
+  }, [actualTotal, displayProviders, periodEvents, runtime.integrations, windowUsage]);
 
   const projects = useMemo(() => {
     const grouped = new Map<string, UsageEvent[]>();
@@ -109,7 +118,7 @@ export default function App() {
 
   const deviceUsage = useMemo(() => runtime.devices.map((device) => {
     const events = periodEvents.filter((event) => event.deviceId === device.id);
-    const byProvider = (["codex", "claude", "gemini"] as const).map((provider) => ({
+    const byProvider = displayProviders.map((provider) => ({
       provider,
       value: events.filter((event) => event.provider === provider).reduce((sum, event) => sum + tokenTotal(event.tokens), 0),
     }));
@@ -121,7 +130,7 @@ export default function App() {
       projectCount: new Set(events.map((event) => event.projectId)).size,
       byProvider,
     };
-  }).sort((a, b) => b.total - a.total), [currentDeviceId, periodEvents, runtime.devices]);
+  }).sort((a, b) => b.total - a.total), [currentDeviceId, displayProviders, periodEvents, runtime.devices]);
 
   const sessions = useMemo(() => {
     const latest = new Map<string, UsageEvent>();
@@ -154,12 +163,19 @@ export default function App() {
       setWindowModeError(cause instanceof Error ? cause.message : "창 모드를 변경하지 못했습니다.");
     }
   };
-  const changeMiniSelection = (selection: MiniSelection) => {
-    setMiniSelection(selection);
-    window.localStorage.setItem(MINI_SELECTION_KEY, selection);
+  const toggleProvider = (provider: Provider, current: Provider[], setCurrent: (providers: Provider[]) => void, storageKey: string) => {
+    const next = current.includes(provider) ? current.filter((item) => item !== provider) : ALL_PROVIDERS.filter((item) => current.includes(item) || item === provider);
+    if (!next.length) return;
+    setCurrent(next);
+    window.localStorage.setItem(storageKey, JSON.stringify(next));
+  };
+  const changeMiniOpacity = (opacity: number) => {
+    const next = Math.max(0, Math.min(100, opacity));
+    setMiniOpacity(next);
+    window.localStorage.setItem(MINI_OPACITY_KEY, String(next));
   };
 
-  if (miniMode) return <MiniDashboard events={usageEvents} selection={miniSelection} updatedAt={runtime.updatedAt} syncing={runtime.syncing} onSelectionChange={changeMiniSelection} onExit={() => void changeWindowMode(false)} onRefresh={runSync} />;
+  if (miniMode) return <MiniDashboard events={usageEvents} providers={miniProviders} opacity={miniOpacity} updatedAt={runtime.updatedAt} syncing={runtime.syncing} onToggleProvider={(provider) => toggleProvider(provider, miniProviders, setMiniProviders, MINI_PROVIDERS_KEY)} onOpacityChange={changeMiniOpacity} onExit={() => void changeWindowMode(false)} onRefresh={runSync} />;
 
   return (
     <div className="app-shell">
@@ -206,6 +222,7 @@ export default function App() {
             <article className={`provider-card ${provider.tone}`} key={provider.name}>
               <div className="provider-heading"><span className="provider-logo">{provider.monogram}</span><div><h3>{provider.name}</h3><p>{provider.model}</p></div><span className="provider-delta">{provider.status}</span></div>
               <strong className="provider-value">{provider.value}</strong><span className="provider-unit">tokens</span>
+              <div className="provider-windows"><div><span>최근 5시간</span><strong>{formatTokens(provider.fiveHours)}</strong></div><div><span>최근 7일</span><strong>{formatTokens(provider.week)}</strong></div></div>
               <div className="meter" aria-label={`${provider.name}의 선택 기간 내 비중 ${provider.percent}%`}><i style={{ width: `${provider.percent}%` }} /></div>
               <div className="meter-label"><span>기간 내 비중</span><strong>{provider.percent}%</strong></div>
             </article>
@@ -214,7 +231,7 @@ export default function App() {
 
         <section className="content-grid" hidden={activeView !== "overview"}>
           <article className="panel trend-panel">
-            <SectionTitle eyebrow="ACTIVITY" title="실제 사용량 추이" action={<div className="legend"><span className="codex">Codex</span><span className="claude">Claude</span><span className="gemini">Gemini</span></div>} />
+            <SectionTitle eyebrow="ACTIVITY" title="실제 사용량 추이" action={<div className="legend">{displayProviders.map((provider) => <span className={provider} key={provider}>{providerInfo[provider].name}</span>)}</div>} />
             <UsageChart data={chartData} />
           </article>
           <article id="projects" className="panel project-panel">
@@ -274,6 +291,7 @@ export default function App() {
         nativeMessage={nativeSettings.message}
         providerUsage={runtime.providerUsage}
         sessions={sessions}
+        displayProviders={displayProviders}
         onClose={() => setSettingsOpen(false)}
         onConfigureSupabase={(url, anonKey) => runtime.configureSupabase(url, anonKey)}
         onClearSupabaseConfig={() => runtime.clearSupabaseConfig()}
@@ -285,12 +303,30 @@ export default function App() {
         onUpdateSessionTitle={(sessionId, title) => runtime.updateSessionTitle(sessionId, title)}
         onSetAutostart={(enabled) => nativeSettings.toggleAutostart(enabled)}
         onConfigureGemini={() => nativeSettings.enableGeminiTelemetry()}
+        onToggleDisplayProvider={(provider) => toggleProvider(provider, displayProviders, setDisplayProviders, DISPLAY_PROVIDERS_KEY)}
       />
     </div>
   );
 }
 
-function readMiniSelection(): MiniSelection {
-  const value = window.localStorage.getItem(MINI_SELECTION_KEY);
-  return value === "codex" || value === "claude" || value === "gemini" || value === "codex_claude" ? value : "codex_claude";
+function readProviderList(key: string, fallback: Provider[]): Provider[] {
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(key) ?? "") as unknown;
+    if (Array.isArray(parsed)) {
+      const providers = ALL_PROVIDERS.filter((provider) => parsed.includes(provider));
+      if (providers.length) return providers;
+    }
+  } catch {
+    if (key === MINI_PROVIDERS_KEY) {
+      const legacy = window.localStorage.getItem("token-deck-mini-selection");
+      if (legacy === "codex_claude") return ["codex", "claude"];
+      if (legacy === "codex" || legacy === "claude" || legacy === "gemini") return [legacy];
+    }
+  }
+  return fallback;
+}
+
+function readOpacity(): number {
+  const value = Number(window.localStorage.getItem(MINI_OPACITY_KEY) ?? "90");
+  return Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : 90;
 }

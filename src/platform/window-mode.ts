@@ -2,8 +2,8 @@
 import { LogicalPosition, LogicalSize } from "@tauri-apps/api/dpi";
 import { currentMonitor, getCurrentWindow } from "@tauri-apps/api/window";
 
-const MINI_WIDTH = 390;
-const MINI_HEIGHT = 270;
+const MINI_WIDTH = 430;
+const MINI_HEIGHT = 360;
 const NORMAL_WIDTH = 1280;
 const NORMAL_HEIGHT = 820;
 const EDGE_GAP = 22;

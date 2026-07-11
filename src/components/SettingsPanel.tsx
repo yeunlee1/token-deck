@@ -31,6 +31,7 @@ interface SettingsPanelProps {
   nativeMessage: string;
   providerUsage: ProviderUsageRecord[];
   sessions: SessionOption[];
+  displayProviders: Provider[];
   onClose: () => void;
   onConfigureSupabase: (url: string, anonKey: string) => Promise<void> | void;
   onClearSupabaseConfig: () => Promise<void> | void;
@@ -42,6 +43,7 @@ interface SettingsPanelProps {
   onUpdateSessionTitle: (sessionId: string, title: string) => Promise<void>;
   onSetAutostart: (enabled: boolean) => Promise<void>;
   onConfigureGemini: () => Promise<void>;
+  onToggleDisplayProvider: (provider: Provider) => void;
 }
 
 const providerLabels: Record<CredentialProvider, string> = {
@@ -189,6 +191,12 @@ export function SettingsPanel(props: SettingsPanelProps) {
             {!props.auth.enabled || props.auth.status === "local" ? <div className="setting-notice"><Icon name="warning" /><div><strong>로컬 전용 모드</strong><p>Supabase 환경 설정을 추가하면 이메일 로그인과 기기 동기화가 활성화됩니다.</p></div></div> : props.auth.status === "authenticated" ? <div className="signed-in-card"><div><span className="avatar">TD</span><div><strong>동기화 계정 연결됨</strong><small>{props.auth.userId ?? "인증된 사용자"}</small></div></div><button className="secondary-button" onClick={() => void props.onSignOut()}>로그아웃</button></div> : <form className="login-form" onSubmit={login}><label htmlFor="sync-email">이메일 주소</label><div><input id="sync-email" type="email" required value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@example.com" /><button className="primary-button">로그인 링크 받기</button></div></form>}
             <p className="form-message" aria-live="polite">{props.auth.error ?? authMessage}</p>
             <div className="sync-summary"><span><b>{props.cloudSync.pending}</b>개 업로드 대기</span><span><b>{props.cloudSync.uploaded}</b>개 동기화됨</span><span>상태 <b>{props.cloudSync.status}</b></span></div>
+          </section>
+
+          <section className="setting-section" aria-labelledby="display-title">
+            <div className="setting-section-title"><span className="setting-icon"><Icon name="activity" /></span><div><h3 id="display-title">대시보드 표시 항목</h3><p>개요, 프로젝트와 기기 화면에서 보고 싶은 공급사를 선택합니다.</p></div></div>
+            <div className="provider-visibility" aria-label="대시보드에 표시할 공급사">{(["codex", "claude", "gemini"] as Provider[]).map((provider) => <button key={provider} type="button" aria-pressed={props.displayProviders.includes(provider)} onClick={() => props.onToggleDisplayProvider(provider)}><span className={`project-dot ${provider === "claude" ? "lime" : provider === "gemini" ? "violet" : "ink"}`} /><strong>{provider === "codex" ? "Codex" : provider === "claude" ? "Claude" : "Gemini"}</strong><small>{props.displayProviders.includes(provider) ? "표시 중" : "숨김"}</small></button>)}</div>
+            <p className="setting-hint">최소 한 개는 항상 표시됩니다. 수집과 동기화는 선택과 관계없이 계속됩니다.</p>
           </section>
 
           <section className="setting-section" aria-labelledby="providers-title">
