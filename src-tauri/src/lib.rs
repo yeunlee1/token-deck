@@ -1,6 +1,6 @@
 // 로컬 AI 도구 로그를 안전하게 읽고 트레이 창을 관리하는 Tauri 백엔드
 use serde::Serialize;
-use std::{fs, path::{Path, PathBuf}, time::UNIX_EPOCH};
+use std::{fs, io::{BufRead, BufReader}, path::{Path, PathBuf}, time::UNIX_EPOCH};
 use tauri::{menu::{Menu, MenuItem}, tray::TrayIconBuilder, Manager};
 
 fn credential_entry(provider: &str) -> Result<keyring::Entry, String> {
@@ -71,31 +71,49 @@ fn git_remote_from_cwd(cwd: Option<PathBuf>) -> Option<String> {
     }
 }
 
-fn collect_files(root: &Path, extension: &str, provider: &str, output: &mut Vec<LogDocument>) {
+fn is_usage_line(provider: &str, line: &str) -> bool {
+    match provider {
+        "codex" => line.contains("\"token_count\"") || line.contains("\"session_meta\""),
+        "claude" => line.contains("\"usage\""),
+        "gemini" => line.contains("token.usage") || line.contains("gen_ai.usage"),
+        _ => false,
+    }
+}
+
+fn collect_files(root: &Path, extension: &str, provider: &str, modified_since: u64, output: &mut Vec<LogDocument>) {
     let Ok(entries) = fs::read_dir(root) else { return };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            collect_files(&path, extension, provider, output);
+            collect_files(&path, extension, provider, modified_since, output);
             continue;
         }
         if path.extension().and_then(|value| value.to_str()) != Some(extension) { continue; }
         let Ok(metadata) = entry.metadata() else { continue };
-        if metadata.len() > 25 * 1024 * 1024 { continue; }
-        let Ok(content) = fs::read_to_string(&path) else { continue };
         let modified_at = metadata.modified().ok().and_then(|value| value.duration_since(UNIX_EPOCH).ok()).map_or(0, |value| value.as_secs());
+        if modified_at <= modified_since { continue; }
+        let Ok(file) = fs::File::open(&path) else { continue };
+        let mut content = String::new();
+        for line in BufReader::new(file).lines().map_while(Result::ok) {
+            if is_usage_line(provider, &line) {
+                content.push_str(&line);
+                content.push('\n');
+            }
+        }
+        if content.is_empty() { continue; }
         let git_remote = git_remote_from_cwd(cwd_from_content(&content));
         output.push(LogDocument { provider: provider.into(), path: path.to_string_lossy().into_owned(), modified_at, content, git_remote });
     }
 }
 
 #[tauri::command]
-fn scan_local_usage() -> Vec<LogDocument> {
+fn scan_local_usage(modified_since: Option<u64>) -> Vec<LogDocument> {
     let Some(home) = std::env::var_os("USERPROFILE").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(PathBuf::from)) else { return Vec::new() };
     let mut documents = Vec::new();
-    collect_files(&home.join(".codex").join("sessions"), "jsonl", "codex", &mut documents);
-    collect_files(&home.join(".claude").join("projects"), "jsonl", "claude", &mut documents);
-    collect_files(&home.join(".gemini"), "log", "gemini", &mut documents);
+    let since = modified_since.unwrap_or(0);
+    collect_files(&home.join(".codex").join("sessions"), "jsonl", "codex", since, &mut documents);
+    collect_files(&home.join(".claude").join("projects"), "jsonl", "claude", since, &mut documents);
+    collect_files(&home.join(".gemini"), "log", "gemini", since, &mut documents);
     documents.sort_by_key(|document| std::cmp::Reverse(document.modified_at));
     documents
 }

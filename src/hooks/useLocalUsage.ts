@@ -13,6 +13,7 @@ function deviceId(): string {
 
 export function useLocalUsage() {
   const collectorState = useRef(createCollectorState());
+  const modifiedSince = useRef<number | undefined>(undefined);
   const [events, setEvents] = useState<UsageEvent[]>([]);
   const [integrations, setIntegrations] = useState<IntegrationStatus>({ codex: false, claude: false, gemini: false });
   const [syncing, setSyncing] = useState(false);
@@ -22,7 +23,8 @@ export function useLocalUsage() {
   const refresh = useCallback(async () => {
     setSyncing(true);
     try {
-      const [documents, status] = await Promise.all([scanLocalUsage(), getIntegrationStatus()]);
+      const scanStartedAt = Math.max(0, Math.floor(Date.now() / 1000) - 1);
+      const [documents, status] = await Promise.all([scanLocalUsage(modifiedSince.current), getIntegrationStatus()]);
       const incoming = collectUsageDocuments(documents, deviceId(), collectorState.current);
       if (incoming.length) {
         setEvents((current) => {
@@ -32,6 +34,7 @@ export function useLocalUsage() {
         });
       }
       setIntegrations(status);
+      modifiedSince.current = scanStartedAt;
       setUpdatedAt(new Date());
       setError(undefined);
     } catch (cause) {

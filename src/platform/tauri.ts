@@ -19,9 +19,9 @@ function isTauriRuntime(): boolean {
   return "__TAURI_INTERNALS__" in window;
 }
 
-export async function scanLocalUsage(): Promise<LocalLogDocument[]> {
+export async function scanLocalUsage(modifiedSince?: number): Promise<LocalLogDocument[]> {
   if (!isTauriRuntime()) return [];
-  return invoke<LocalLogDocument[]>("scan_local_usage");
+  return invoke<LocalLogDocument[]>("scan_local_usage", { modifiedSince });
 }
 
 export async function getIntegrationStatus(): Promise<IntegrationStatus> {
