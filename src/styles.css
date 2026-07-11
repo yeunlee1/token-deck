@@ -1,6 +1,6 @@
 /* 밝은 관제 콘솔의 레이아웃과 시각 체계를 정의하는 전역 스타일 */
 :root {
-  font-family: "Segoe UI Variable", "Pretendard", "Segoe UI", sans-serif;
+  font-family: "Noto Sans KR", "Malgun Gothic", "Segoe UI Variable", "Segoe UI", sans-serif;
   color: #171b24;
   background: #f2f3ee;
   font-synthesis: none;
@@ -11,13 +11,13 @@
   --lime: #b8dc38;
   --violet: #6b7af7;
   --blue: #4ba3db;
-  --mono: "Cascadia Mono", Consolas, monospace;
+  --mono: "Cascadia Mono", "Noto Sans KR", Consolas, monospace;
   --radius: 18px;
 }
 
 * { box-sizing: border-box; }
 html { scroll-behavior: smooth; }
-body { margin: 0; min-width: 320px; min-height: 100vh; background: transparent; }
+body { margin: 0; min-width: 320px; min-height: 100vh; background: transparent; font-size: 14px; line-height: 1.5; text-rendering: optimizeLegibility; -webkit-font-smoothing: antialiased; }
 button, input, select { font: inherit; }
 button, a { -webkit-tap-highlight-color: transparent; }
 button { color: inherit; }
@@ -160,6 +160,80 @@ footer { display: flex; justify-content: space-between; align-items: center; mar
 .device-total { margin: 22px 0 17px; }.device-total strong { font: 28px var(--mono); letter-spacing: -.06em; }.device-total span { margin-left: 6px; color: #989ca5; font: 8px var(--mono); }
 .device-provider-list { display: grid; grid-template-columns: repeat(3,1fr); gap: 7px; }.device-provider-list div { padding: 9px; background: white; border: 1px solid #e2e3dd; border-radius: 8px; }.device-provider-list span,.device-provider-list strong { display: block; }.device-provider-list span { color: #969aa3; font-size: 7px; }.device-provider-list strong { margin-top: 5px; font: 9px var(--mono); }
 .device-foot { display: flex; gap: 15px; margin-top: 14px; color: #858a94; font-size: 8px; }
+
+/* 작은 화면에서도 정보 밀도를 유지하면서 읽을 수 있는 최소 글자 크기를 보장한다. */
+.nav-item { font-size: 14px; }
+.account-chip strong { font-size: 13px; }
+.account-chip small { font-size: 11px; line-height: 1.45; }
+.kicker, .eyebrow, .section-title span { font-size: 11px; font-weight: 600; }
+.topbar p:last-child { color: #656b77; font-size: 14px; line-height: 1.65; }
+.mini-mode-entry, .live-pill, .error-banner { font-size: 11px; }
+.segmented button, .delta, .status-row { font-size: 11px; }
+.total-number span { font-size: 12px; }
+.status-card > p { color: #737985; font-size: 11px; }
+.section-title h2 { font-size: 19px; }
+.text-button { font-size: 11px; }
+.provider-heading h3 { font-size: 15px; }
+.provider-heading p { color: #747a86; font-size: 11px; }
+.provider-delta { font-size: 10px; line-height: 1.4; }
+.provider-value { font-size: 32px; }
+.provider-unit { font-size: 11px; }
+.provider-windows span { color: #676e79; font-size: 11px; line-height: 1.4; }
+.provider-windows strong { font-size: 22px; }
+.meter-label { color: #777d88; font-size: 10px; }
+.chart-label { font-size: 10px; }
+.rank { font-size: 10px; }
+.project-info strong { font-size: 13px; }
+.project-info small { color: #777e89; font-size: 10px; line-height: 1.45; }
+.project-info b { font-size: 12px; }
+.panel-empty strong { font-size: 13px; }
+.panel-empty p { font-size: 11px; line-height: 1.55; }
+.device-row strong { font-size: 12px; }
+.device-row small { color: #747b86; font-size: 10px; line-height: 1.45; }
+.device-status { font-size: 10px; }
+.privacy-copy h2 { font-size: 16px; }
+.privacy-copy p { color: #c0c5ce; font-size: 11px; }
+.privacy-meta { font-size: 10px; }
+footer { color: #777d87; font-size: 10px; }
+.settings-header p { color: #c2c7d0; font-size: 12px; line-height: 1.55; }
+.setting-section-title h3 { font-size: 15px; }
+.setting-section-title p { color: #747b86; font-size: 11px; line-height: 1.5; }
+.setting-notice strong, .provider-visibility strong, .signed-in-card strong { font-size: 12px; }
+.setting-notice p, .provider-visibility small, .setting-hint, .signed-in-card small { font-size: 10px; line-height: 1.5; }
+.setting-notice code, .connection-badge, .form-message, .sync-summary { font-size: 10px; }
+.login-form > label, .credential-fields label, .session-title-form label, .supabase-config label { font-size: 11px; }
+.login-form input, .credential-fields input, .session-title-form input, .session-title-form select, .supabase-config input { font-size: 12px; }
+.primary-button, .secondary-button, .danger-button { min-height: 38px; font-size: 11px; }
+.supabase-config summary { font-size: 11px; }
+.setting-row-heading strong { font-size: 13px; }
+.setting-row-heading small, .supabase-config > p, .empty-state { font-size: 10px; line-height: 1.5; }
+.detail-rank { font-size: 11px; }
+.detail-name strong, .device-usage-head strong { font-size: 13px; }
+.detail-name small, .detail-metrics small, .device-usage-head small, .device-provider-list span, .device-foot { font-size: 10px; line-height: 1.45; }
+.detail-metrics strong, .device-provider-list strong { font-size: 12px; }
+.device-total span { font-size: 11px; }
+
+/* 미니모드는 창 크기를 늘리지 않고 공급사와 잔여 퍼센트의 시인성을 우선한다. */
+.mini-dashboard { padding: 15px 16px 11px; }
+.mini-brand { padding: 4px 7px; background: rgba(17,21,28,.72); border: 1px solid rgba(255,255,255,.1); border-radius: 9px; }
+.mini-brand strong { font-size: 12px; }
+.mini-brand small { color: #b1b7c1; font-size: 9px; }
+.mini-actions button { color: #d2d6dc; background: rgba(17,21,28,.72); border-color: rgba(255,255,255,.14); }
+.mini-selector { background: rgba(17,21,28,.72); border: 1px solid rgba(255,255,255,.1); }
+.mini-selector button { height: 30px; color: #c4c9d1; font-size: 10px; }
+.mini-columns { margin-top: 7px; padding: 6px 12px; color: #d0d4db; background: rgba(17,21,28,.62); border-radius: 7px; font-size: 9px; font-weight: 600; }
+.mini-provider-rows { gap: 7px; }
+.mini-provider-rows article { min-height: 54px; padding: 9px 12px; background: rgba(24,29,38,.76); border-color: rgba(255,255,255,.14); }
+.mini-provider-rows article > div { min-width: 0; }
+.mini-provider-rows article strong { font-size: 13px; }
+.mini-provider-rows article small { color: #aab1bc; font-size: 8px; line-height: 1.35; }
+.mini-provider-rows article > div small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mini-provider-rows article b { font-size: 18px; font-weight: 700; }
+.mini-provider-rows article b small { color: #a2a9b5; font-size: 8px; font-weight: 600; }
+.mini-error { font-size: 10px; }
+.mini-footer { min-height: 34px; color: #a9b0ba; font-size: 9px; }
+.mini-footer label span { color: #c0c5cd; }
+.mini-footer output { color: #f0f2f5; }
 
 @keyframes pulse { 50% { opacity: .5; transform: scale(.8); } }
 @keyframes spin { to { transform: rotate(360deg); } }.spin { animation: spin .7s linear infinite; }
