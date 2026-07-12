@@ -72,11 +72,14 @@ describe("SupabaseAuthService", () => {
     const client = new SupabaseRestClient({ url: "https://example.supabase.co", anonKey: "publishable" }, request);
     const auth = new SupabaseAuthService(client);
     auth.acceptSession({ accessToken: "active-access", refreshToken: "active-refresh" });
+    const controller = new AbortController();
 
-    await auth.signOutRemotely();
+    await auth.signOutRemotely(controller.signal);
 
-    expect(request.mock.calls[0][0]).toBe("https://example.supabase.co/auth/v1/logout");
-    const headers = new Headers((request.mock.calls[0][1] as RequestInit).headers);
+    expect(request.mock.calls[0][0]).toBe("https://example.supabase.co/auth/v1/logout?scope=local");
+    const requestInit = request.mock.calls[0][1] as RequestInit;
+    const headers = new Headers(requestInit.headers);
     expect(headers.get("Authorization")).toBe("Bearer active-access");
+    expect(requestInit.signal).toBe(controller.signal);
   });
 });

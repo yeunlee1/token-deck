@@ -5,6 +5,7 @@ import { decodeOwnedProviderSecret, encodeOwnedProviderSecret } from "../service
 import {
   commitSession,
   claimAccountLocalEvents,
+  clearProductionSupabaseOverride,
   createSerialTaskRunner,
   createUsageSyncCache,
   filterAccountLocalEvents,
@@ -21,6 +22,7 @@ import {
   resolveSupabaseConfig,
   selectChangedUsageEvents,
   selectRemoteInventoryItems,
+  settleWithin,
   shouldFullyReconcile,
   writeInventorySyncPreference,
 } from "./useAppRuntime";
@@ -320,11 +322,58 @@ describe("로그아웃과 콜백 방어", () => {
       .toThrow("일회용 인증 코드");
   });
 
-  it("저장 설정이 없을 때 빌드 기본 Supabase 설정을 그대로 사용한다", () => {
+  it("운영 모드에서는 저장된 서버보다 빌드 기본 Supabase 설정을 우선한다", () => {
     const buildDefault = { url: "https://build.supabase.co", anonKey: "sb_publishable_build" };
     expect(resolveSupabaseConfig(null, buildDefault)).toEqual(buildDefault);
     expect(resolveSupabaseConfig({ url: "https://saved.supabase.co", anonKey: "sb_publishable_saved" }, buildDefault))
+      .toEqual(buildDefault);
+    expect(resolveSupabaseConfig({ url: "https://saved.supabase.co", anonKey: "sb_publishable_saved" }, buildDefault, true))
       .toEqual({ url: "https://saved.supabase.co", anonKey: "sb_publishable_saved" });
+  });
+
+  it("운영 서버 전환 시 이전 서버의 레거시 인증 상태를 함께 제거한다", () => {
+    const storage = {
+      getItem: vi.fn((key: string) => key === "token-deck-supabase-config" ? "{}" : null),
+      removeItem: vi.fn(),
+    };
+
+    expect(clearProductionSupabaseOverride(storage, false)).toBe(true);
+
+    expect(storage.removeItem.mock.calls.map(([key]) => key)).toEqual([
+      "token-deck-supabase-session",
+      "token-deck-auth-state",
+      "token-deck-auth-pkce-verifier",
+      "token-deck-supabase-config",
+    ]);
+  });
+
+  it("원격 요청이 멈추면 제한 시간 뒤 로컬 정리를 계속할 수 있다", async () => {
+    vi.useFakeTimers();
+    try {
+      const abort = vi.fn();
+      const pending = settleWithin(new Promise<void>(() => undefined), 2_000, abort);
+      await vi.advanceTimersByTimeAsync(2_000);
+      await expect(pending).resolves.toEqual({ status: "timed_out" });
+      expect(abort).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("레거시 인증 정리가 중단되면 설정 표식을 남겨 다음 시작에 재시도한다", () => {
+    const removed: string[] = [];
+    const storage = {
+      getItem: vi.fn(() => "{}"),
+      removeItem: vi.fn((key: string) => {
+        if (key === "token-deck-auth-state") throw new Error("storage unavailable");
+        removed.push(key);
+      }),
+    };
+
+    expect(clearProductionSupabaseOverride(storage, false)).toBe(false);
+
+    expect(removed).toEqual(["token-deck-supabase-session"]);
+    expect(storage.removeItem).not.toHaveBeenCalledWith("token-deck-supabase-config");
   });
 });
 

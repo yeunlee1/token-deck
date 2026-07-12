@@ -2,14 +2,14 @@
 
 ## Supabase 설정
 
-앱의 설정 화면에는 공개 가능한 프로젝트 URL과 publishable key만 입력합니다. 빌드 기본값은 다음 환경 변수로도 지정할 수 있습니다.
+공식 설치 파일은 공개 가능한 프로젝트 URL과 publishable key를 빌드 기본값으로 포함합니다. 일반 사용자는 서버 정보를 입력하지 않으며 다음 환경 변수로 운영 서버를 지정합니다.
 
 ```env
 VITE_SUPABASE_URL=https://YOUR_PROJECT.supabase.co
 VITE_SUPABASE_PUBLISHABLE_KEY=sb_publishable_YOUR_KEY
 ```
 
-레거시 프로젝트는 `VITE_SUPABASE_ANON_KEY`도 계속 사용할 수 있지만 새 배포는 publishable key를 사용합니다. `sb_secret_` key, `service_role` key, 데이터베이스 비밀번호와 Google Client Secret은 앱이나 저장소에 넣지 않습니다. URL과 공개 키 중 하나라도 없으면 클라이언트는 동기화를 비활성화하고 로컬 기능만 유지합니다. 설정 화면의 값은 이 PC에만 저장됩니다. `supabase/migrations/202607110001_initial_usage_sync.sql`은 검토용이며 자동 적용되지 않습니다. 적용 시 `devices`, `projects`, `sessions`, `usage_events`, `sync_checkpoints` 테이블과 각 테이블의 RLS 정책이 새로 생성됩니다.
+레거시 프로젝트는 `VITE_SUPABASE_ANON_KEY`도 계속 사용할 수 있지만 새 배포는 publishable key를 사용합니다. `sb_secret_` key, `service_role` key, 데이터베이스 비밀번호와 Google Client Secret은 앱이나 저장소에 넣지 않습니다. URL과 공개 키 중 하나라도 없으면 클라이언트는 동기화를 비활성화하고 로컬 기능만 유지합니다. 서버 덮어쓰기는 개발 모드에서만 노출되며 운영 모드는 과거에 저장된 덮어쓰기 값도 제거하고 빌드 기본값만 사용합니다. `supabase/migrations/202607110001_initial_usage_sync.sql`은 검토용이며 자동 적용되지 않습니다. 적용 시 `devices`, `projects`, `sessions`, `usage_events`, `sync_checkpoints` 테이블과 각 테이블의 RLS 정책이 새로 생성됩니다.
 
 Token Deck 계정 인증은 이메일 매직링크와 Google 로그인을 사용합니다. Supabase Auth의 Redirect URLs에 `token-deck://auth`를 등록하고 Google 공급자를 활성화합니다. Google Cloud OAuth의 승인된 리디렉션 URI에는 Supabase 대시보드가 안내하는 `https://YOUR_PROJECT.supabase.co/auth/v1/callback`을 등록합니다. Google Client ID와 Client Secret은 Supabase의 Google 공급자 설정에만 저장하며 데스크톱 앱에는 포함하지 않습니다.
 

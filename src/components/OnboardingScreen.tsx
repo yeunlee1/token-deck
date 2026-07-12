@@ -66,7 +66,7 @@ export function OnboardingScreen(props: OnboardingScreenProps) {
         <h2 id="onboarding-auth-title">사용 방식을 선택하세요.</h2>
         <p>로그인하면 이 PC와 다른 기기의 사용량을 한곳에서 확인할 수 있습니다.</p>
 
-        {!props.authEnabled && <div className="onboarding-notice" role="status"><Icon name="warning" /><span>운영 동기화 서버가 연결되면 Google과 이메일 로그인이 활성화됩니다.</span></div>}
+        {!props.authEnabled && <div className="onboarding-notice" role="status"><Icon name="warning" /><span>운영 동기화 서버 설정이 없는 빌드입니다. 공식 배포본을 다시 설치하거나 관리자에게 문의해 주세요.</span></div>}
 
         <button className="google-login-button" type="button" disabled={!props.authEnabled || Boolean(pending)} onClick={() => void signInWithGoogle()}>
           <span aria-hidden="true">G</span>{pending === "google" ? "브라우저 여는 중…" : "Google로 계속하기"}

@@ -63,8 +63,10 @@ interface CredentialStatus { configured: boolean; checking: boolean; error?: str
 export function useAppRuntime() {
   const local = useLocalUsage();
   const [runtimeConfig, setRuntimeConfig] = useState<SupabaseConfig | null>(() => {
-    const saved = readJson<SupabaseConfig | null>(CONFIG_KEY, null);
-    return resolveSupabaseConfig(saved);
+    const allowOverride = import.meta.env.DEV;
+    const saved = allowOverride ? readJson<SupabaseConfig | null>(CONFIG_KEY, null) : null;
+    const legacyStateCleared = clearProductionSupabaseOverride(window.localStorage, allowOverride);
+    return legacyStateCleared ? resolveSupabaseConfig(saved, readSupabaseConfig(), allowOverride) : null;
   });
   const client = useMemo(() => new SupabaseRestClient(runtimeConfig), [runtimeConfig]);
   const authService = useMemo(() => new SupabaseAuthService(client), [client]);
@@ -297,7 +299,12 @@ export function useAppRuntime() {
     const scope = sessionScope(client.config);
     const localErrors: string[] = [];
     try { markSessionTombstone(scope); } catch (cause) { localErrors.push(`로그아웃 표시 저장 실패: ${message(cause)}`); }
-    const remoteLogout = authService.signOutRemotely();
+    const remoteLogoutController = new AbortController();
+    const remoteLogout = settleWithin(
+      authService.signOutRemotely(remoteLogoutController.signal),
+      2_000,
+      () => remoteLogoutController.abort(),
+    );
     const generation = ++accountGenerationRef.current;
     authService.signOutLocally();
     accountOwnerRef.current = undefined;
@@ -313,12 +320,13 @@ export function useAppRuntime() {
     setDevices([currentDevice()]);
     setSessionTitles(readSessionTitles(undefined));
     setCloudSync({ status: client.enabled ? "signed_out" : "disabled", uploaded: 0, pending: 0 });
-    const outcomes = await Promise.allSettled([remoteLogout, removeProviderSecret("supabase")]);
+    const credentialRemoval = Promise.allSettled([removeProviderSecret("supabase")]).then(([outcome]) => outcome);
+    const [remoteOutcome, credentialOutcome] = await Promise.all([remoteLogout, credentialRemoval]);
     const errors = [
       ...localErrors,
-      ...outcomes.flatMap((outcome, index) => outcome.status === "rejected"
-        ? [`${index === 0 ? "원격 로그아웃" : "저장된 세션 삭제"} 실패: ${message(outcome.reason)}`]
-        : []),
+      ...(remoteOutcome.status === "rejected" ? [`원격 로그아웃 실패: ${message(remoteOutcome.reason)}`] : []),
+      ...(remoteOutcome.status === "timed_out" ? ["원격 로그아웃 응답이 지연되어 로컬 로그아웃만 완료했습니다."] : []),
+      ...(credentialOutcome.status === "rejected" ? [`저장된 세션 삭제 실패: ${message(credentialOutcome.reason)}`] : []),
     ];
     if (errors.length && generation === accountGenerationRef.current) {
       setAuth({ enabled: client.enabled, status: client.enabled ? "signed_out" : "local", error: errors.join(" ") });
@@ -605,6 +613,7 @@ export function useAppRuntime() {
   }, [auth.status, sessionTitles]);
 
   const configureSupabase = useCallback(async (url: string, publishableKey: string) => {
+    if (!import.meta.env.DEV) throw new Error("Supabase 서버 변경은 개발 모드에서만 가능합니다.");
     const normalizedUrl = url.trim().replace(/\/+$/, "");
     const normalizedKey = publishableKey.trim();
     if (!isSecureSupabaseUrl(normalizedUrl) || !isSupabasePublicKey(normalizedKey)) throw new Error("HTTPS Supabase URL과 publishable key가 필요합니다. secret 또는 service_role key는 저장할 수 없습니다.");
@@ -635,6 +644,7 @@ export function useAppRuntime() {
   }, [authService, clearAccountInventoryState, clearAccountProviderState, client.config]);
 
   const clearSupabaseConfig = useCallback(async () => {
+    if (!import.meta.env.DEV) throw new Error("Supabase 서버 변경은 개발 모드에서만 가능합니다.");
     const cleanupErrors: string[] = [];
     try { markSessionTombstone(sessionScope(client.config)); } catch (cause) { cleanupErrors.push(`로그아웃 표시 저장 실패: ${message(cause)}`); }
     const generation = ++accountGenerationRef.current;
@@ -826,6 +836,29 @@ export function createSerialTaskRunner(): <T>(task: () => Promise<T>) => Promise
   };
 }
 
+export async function settleWithin<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  onTimeout?: () => void,
+): Promise<PromiseSettledResult<T> | { status: "timed_out" }> {
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const settled: Promise<PromiseSettledResult<T>> = promise.then(
+    (value): PromiseFulfilledResult<T> => ({ status: "fulfilled", value }),
+    (reason: unknown): PromiseRejectedResult => ({ status: "rejected", reason }),
+  );
+  const result = await Promise.race([
+    settled,
+    new Promise<{ status: "timed_out" }>((resolve) => {
+      timeoutId = setTimeout(() => {
+        onTimeout?.();
+        resolve({ status: "timed_out" });
+      }, timeoutMs);
+    }),
+  ]);
+  if (timeoutId !== undefined) clearTimeout(timeoutId);
+  return result;
+}
+
 export interface UsageSyncCache {
   owner?: string;
   initialized: boolean;
@@ -912,8 +945,22 @@ export function providerEventsForOwner(
 export function resolveSupabaseConfig(
   saved: SupabaseConfig | null,
   buildDefault: SupabaseConfig | null = readSupabaseConfig(),
+  allowOverride = false,
 ): SupabaseConfig | null {
-  return saved && isSecureSupabaseUrl(saved.url) && isSupabasePublicKey(saved.anonKey) ? saved : buildDefault;
+  return allowOverride && saved && isSecureSupabaseUrl(saved.url) && isSupabasePublicKey(saved.anonKey) ? saved : buildDefault;
+}
+
+export function clearProductionSupabaseOverride(
+  storage: Pick<Storage, "getItem" | "removeItem">,
+  allowOverride: boolean,
+): boolean {
+  let hasStoredOverride: boolean;
+  try { hasStoredOverride = storage.getItem(CONFIG_KEY) !== null; } catch { return false; }
+  if (allowOverride || !hasStoredOverride) return true;
+  for (const key of [SESSION_KEY, AUTH_STATE_KEY, AUTH_PKCE_VERIFIER_KEY, CONFIG_KEY]) {
+    try { storage.removeItem(key); } catch { return false; }
+  }
+  return true;
 }
 
 function accountOwner(scope: string | undefined, session: SupabaseSession | null): string | undefined {

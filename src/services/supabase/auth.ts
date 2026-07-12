@@ -87,9 +87,9 @@ export class SupabaseAuthService {
     return toSession(response);
   }
 
-  async signOutRemotely(): Promise<void> {
+  async signOutRemotely(signal?: AbortSignal): Promise<void> {
     if (!this.client.currentSession) return;
-    await this.client.call<void>("/auth/v1/logout", { method: "POST" });
+    await this.client.call<void>("/auth/v1/logout?scope=local", { method: "POST", signal });
   }
 
   signOutLocally(): void {

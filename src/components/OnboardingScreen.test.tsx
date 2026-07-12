@@ -11,13 +11,13 @@ describe("OnboardingScreen", () => {
     expect(markup).toContain("로그인 링크 받기");
     expect(markup).toContain("로그인 없이 로컬 전용으로 시작");
     expect(markup).toContain('aria-live="polite"');
-    expect(markup).not.toContain("운영 동기화 서버가 연결되면");
+    expect(markup).not.toContain("운영 동기화 서버 설정이 없는 빌드입니다");
   });
 
   it("동기화 서버가 없으면 원격 로그인만 비활성화한다", () => {
     const markup = renderToStaticMarkup(<OnboardingScreen authEnabled={false} onSignInWithGoogle={vi.fn()} onSendMagicLink={vi.fn()} onContinueLocal={vi.fn()} />);
 
-    expect(markup).toContain("운영 동기화 서버가 연결되면");
+    expect(markup).toContain("운영 동기화 서버 설정이 없는 빌드입니다");
     expect(markup).toMatch(/google-login-button[^>]*disabled/);
     expect(markup).toContain("로그인 없이 로컬 전용으로 시작");
   });

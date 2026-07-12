@@ -6,6 +6,7 @@ import { DeviceInventoryPanel } from "./components/DeviceInventoryPanel";
 import { Icon, type IconName } from "./components/Icon";
 import { MiniDashboard } from "./components/MiniDashboard";
 import { OnboardingScreen } from "./components/OnboardingScreen";
+import { ONBOARDING_COMPLETE_KEY, prepareLoginScreen } from "./components/onboarding-state";
 import { ProjectNameEditor } from "./components/ProjectNameEditor";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { UsageChart } from "./components/UsageChart";
@@ -26,7 +27,6 @@ const MINI_PROVIDERS_KEY = "token-deck-mini-providers";
 const MINI_PINNED_KEY = "token-deck-mini-pinned";
 const MINI_TOTAL_VISIBLE_KEY = "token-deck-mini-total-visible";
 const DASHBOARD_PERIOD_KEY = "token-deck-dashboard-period";
-const ONBOARDING_COMPLETE_KEY = "token-deck-onboarding-complete";
 const DISPLAY_PROVIDERS_KEY = "token-deck-display-providers";
 const ALL_PROVIDERS: Provider[] = ["codex", "claude", "gemini"];
 const EMPTY_DEVICE_INVENTORY = { schemaVersion: 1 as const, capturedAt: 0, items: [], warnings: [] };
@@ -176,7 +176,7 @@ export default function App() {
   const connectedCount = Object.values(runtime.integrations).filter(Boolean).length;
   const authenticated = runtime.auth.status === "authenticated";
   const accountName = authenticated ? "동기화 계정" : "로컬 사용자";
-  const accountMeta = authenticated ? "여러 기기 동기화 활성" : runtime.auth.enabled ? "로그인 필요" : "Supabase 연결 대기";
+  const accountMeta = authenticated ? "여러 기기 동기화 활성" : runtime.auth.enabled ? "로그인 필요" : "운영 서버 연결 오류";
   const syncLabel = runtime.cloudSync.status === "syncing" || runtime.syncing ? "동기화 중" : runtime.cloudSync.status === "error" || runtime.error ? "수집 오류" : "실시간 수집 중";
 
   const runSync = () => void Promise.all([runtime.syncNow(), providerQuotas.refresh()]);
@@ -215,6 +215,11 @@ export default function App() {
   const continueLocally = () => {
     window.localStorage.setItem(ONBOARDING_COMPLETE_KEY, "true");
     setOnboardingComplete(true);
+  };
+  const returnToLogin = async () => {
+    await prepareLoginScreen(runtime.auth.status, runtime.signOut, window.localStorage);
+    setSettingsOpen(false);
+    setOnboardingComplete(false);
   };
   const startProjectNameEdit = (id: string, name: string) => { setEditingProjectId(id); setProjectNameDraft(name); };
   const cancelProjectNameEdit = () => { setEditingProjectId(undefined); setProjectNameDraft(""); };
@@ -357,12 +362,11 @@ export default function App() {
         inventorySyncBusy={runtime.inventorySync.loading}
         claudeQuotaCapture={providerQuotas.claudeCapture}
         quotaBusy={providerQuotas.busy}
+        allowSupabaseOverride={import.meta.env.DEV}
         onClose={() => setSettingsOpen(false)}
         onConfigureSupabase={(url, anonKey) => runtime.configureSupabase(url, anonKey)}
         onClearSupabaseConfig={() => runtime.clearSupabaseConfig()}
-        onSendMagicLink={(email) => runtime.sendMagicLink(email)}
-        onSignInWithGoogle={() => runtime.signInWithGoogle()}
-        onSignOut={() => runtime.signOut()}
+        onReturnToLogin={returnToLogin}
         onSaveCredential={(provider, credentials) => runtime.saveProviderCredential(provider, credentials)}
         onRemoveCredential={(provider) => runtime.removeProviderCredential(provider)}
         onRefreshProvider={(provider) => runtime.refreshProviderUsage(provider)}

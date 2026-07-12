@@ -39,12 +39,11 @@ interface SettingsPanelProps {
   inventorySyncBusy: boolean;
   claudeQuotaCapture: { configured: boolean; hasData: boolean; existingStatusLine: boolean };
   quotaBusy: boolean;
+  allowSupabaseOverride: boolean;
   onClose: () => void;
   onConfigureSupabase: (url: string, anonKey: string) => Promise<void> | void;
   onClearSupabaseConfig: () => Promise<void> | void;
-  onSendMagicLink: (email: string) => Promise<void>;
-  onSignInWithGoogle: () => Promise<void> | void;
-  onSignOut: () => Promise<void> | void;
+  onReturnToLogin: () => Promise<void> | void;
   onSaveCredential: (provider: CredentialProvider, credentials: Record<string, string>) => Promise<void>;
   onRemoveCredential: (provider: CredentialProvider) => Promise<void>;
   onRefreshProvider: (provider: CredentialProvider) => Promise<void>;
@@ -137,9 +136,8 @@ function CredentialForm({ provider, state, onSave, onRemove, onRefresh }: {
 }
 
 export function SettingsPanel(props: SettingsPanelProps) {
-  const [email, setEmail] = useState("");
   const [authMessage, setAuthMessage] = useState("");
-  const [authBusy, setAuthBusy] = useState<"google" | "email">();
+  const [returningToLogin, setReturningToLogin] = useState(false);
   const [supabaseUrl, setSupabaseUrl] = useState("");
   const [supabaseAnonKey, setSupabaseAnonKey] = useState("");
   const [sessionId, setSessionId] = useState(props.sessions[0]?.id ?? "");
@@ -154,30 +152,15 @@ export function SettingsPanel(props: SettingsPanelProps) {
 
   if (!props.open) return null;
 
-  async function login(event: FormEvent) {
-    event.preventDefault();
+  async function returnToLogin() {
     setAuthMessage("");
-    setAuthBusy("email");
+    setReturningToLogin(true);
     try {
-      await props.onSendMagicLink(email);
-      setAuthMessage("로그인 링크를 이메일로 보냈습니다.");
+      await props.onReturnToLogin();
     } catch (cause) {
-      setAuthMessage(cause instanceof Error ? cause.message : "로그인 링크를 보내지 못했습니다.");
+      setAuthMessage(cause instanceof Error ? cause.message : "로그인 화면으로 돌아가지 못했습니다.");
     } finally {
-      setAuthBusy(undefined);
-    }
-  }
-
-  async function loginWithGoogle() {
-    setAuthMessage("");
-    setAuthBusy("google");
-    try {
-      await props.onSignInWithGoogle();
-      setAuthMessage("브라우저에서 Google 로그인을 완료해 주세요.");
-    } catch (cause) {
-      setAuthMessage(cause instanceof Error ? cause.message : "Google 로그인을 시작하지 못했습니다.");
-    } finally {
-      setAuthBusy(undefined);
+      setReturningToLogin(false);
     }
   }
 
@@ -217,16 +200,16 @@ export function SettingsPanel(props: SettingsPanelProps) {
         <div className="settings-scroll">
           <section className="setting-section" aria-labelledby="account-title">
             <div className="setting-section-title"><span className="setting-icon"><Icon name="cloud" /></span><div><h3 id="account-title">기기 간 계정 동기화</h3><p>같은 이메일로 로그인한 Windows 기기의 사용량을 합칩니다.</p></div></div>
-            <details className="supabase-config" open={!props.auth.enabled}>
+            {props.allowSupabaseOverride && <details className="supabase-config" open={!props.auth.enabled}>
               <summary>Supabase 서버 연결 {props.auth.enabled && <span>설정됨</span>}</summary>
               <form onSubmit={configureSupabase}>
                 <label>Project URL<input type="url" required value={supabaseUrl} onChange={(event) => setSupabaseUrl(event.target.value)} placeholder="https://project.supabase.co" /></label>
                 <label>Publishable key<input type="password" required value={supabaseAnonKey} onChange={(event) => setSupabaseAnonKey(event.target.value)} autoComplete="off" placeholder="sb_publishable_…" /></label>
                 <div className="setting-actions"><button className="primary-button">연결 정보 저장</button>{props.auth.enabled && <button type="button" className="danger-button" onClick={() => void props.onClearSupabaseConfig()}>설정 지우기</button>}</div>
               </form>
-              <p>프로젝트 URL과 공개 publishable key만 저장합니다. Secret 또는 service role key는 입력하지 마세요.</p>
-            </details>
-            {!props.auth.enabled || props.auth.status === "local" ? <div className="setting-notice"><Icon name="warning" /><div><strong>로컬 전용 모드</strong><p>Supabase 환경 설정을 추가하면 Google·이메일 로그인과 기기 동기화가 활성화됩니다.</p></div></div> : props.auth.status === "authenticated" ? <div className="signed-in-card"><div><span className="avatar">TD</span><div><strong>동기화 계정 연결됨</strong><small>{props.auth.userId ?? "인증된 사용자"}</small></div></div><button className="secondary-button" onClick={() => void props.onSignOut()}>로그아웃</button></div> : <div className="settings-auth-options"><button className="google-login-button compact" type="button" disabled={Boolean(authBusy)} onClick={() => void loginWithGoogle()}><span aria-hidden="true">G</span>{authBusy === "google" ? "브라우저 여는 중…" : "Google로 로그인"}</button><span className="settings-auth-divider">또는</span><form className="login-form" onSubmit={login}><label htmlFor="sync-email">이메일 주소</label><div><input id="sync-email" type="email" autoComplete="email" required disabled={Boolean(authBusy)} value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@example.com" /><button className="primary-button" disabled={Boolean(authBusy)}>{authBusy === "email" ? "전송 중…" : "로그인 링크 받기"}</button></div></form></div>}
+              <p>개발 모드에서만 공개 프로젝트 URL과 publishable key를 변경할 수 있습니다.</p>
+            </details>}
+            {props.auth.status === "authenticated" ? <div className="signed-in-card account-route-card"><div><span className="avatar">TD</span><div><strong>동기화 계정 연결됨</strong><small>{props.auth.userId ?? "인증된 사용자"} · 이동하면 현재 계정에서 로그아웃됩니다.</small></div></div><button type="button" className="secondary-button" disabled={returningToLogin} onClick={() => void returnToLogin()}>{returningToLogin ? "로그아웃 중…" : "로그아웃하고 로그인 화면으로"}</button></div> : <div className={`signed-in-card account-route-card ${!props.auth.enabled || props.auth.status === "local" ? "server-error" : ""}`}><div><span className="avatar">{props.auth.enabled ? "TD" : "!"}</span><div><strong>{props.auth.enabled ? "로그인 준비됨" : "운영 서버 연결 오류"}</strong><small>{props.auth.enabled ? "로그인 화면에서 Google 또는 이메일 계정을 선택하세요." : "공식 배포본의 운영 서버 설정을 확인해 주세요."}</small></div></div><button type="button" className="primary-button" disabled={returningToLogin} onClick={() => void returnToLogin()}>{returningToLogin ? "이동 중…" : "로그인 화면으로 돌아가기"}</button></div>}
             <p className="form-message" aria-live="polite">{props.auth.error ?? authMessage}</p>
             <div className="sync-summary"><span><b>{props.cloudSync.pending}</b>개 업로드 대기</span><span><b>{props.cloudSync.uploaded}</b>개 동기화됨</span><span>상태 <b>{props.cloudSync.status}</b></span></div>
             <div className="setting-toggle-row"><div><strong>이 기기의 도구 목록 자동 갱신</strong><small>기기 식별자, 목록 스키마 버전, 수집·갱신 시각, 내용 비교용 해시와 도구의 종류, 공급사, 항목 ID·이름, 버전, 설치·활성 상태, 수집 출처 분류, 마켓플레이스, MCP 전송 방식, 비밀 설정 필요 여부, 자동 가져오기 가능 여부와 제한 사유 분류만 공유합니다. 비밀값, 명령, 제한 사유의 원문과 전체 경로는 제외됩니다. 갱신을 꺼도 마지막 스냅샷은 계정 비교용으로 유지됩니다.</small></div><button className={`toggle setting-switch ${props.inventorySyncEnabled ? "on" : ""}`} type="button" role="switch" aria-checked={props.inventorySyncEnabled} aria-label="이 기기의 도구 목록 자동 갱신" disabled={props.auth.status !== "authenticated" || props.inventorySyncBusy} onClick={() => void toggleInventorySync()}><span /></button></div>
