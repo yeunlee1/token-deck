@@ -4578,7 +4578,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "token-deck"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "keyring",
  "serde",
@@ -4591,6 +4591,7 @@ dependencies = [
  "tauri-plugin-process",
  "tauri-plugin-single-instance",
  "tauri-plugin-updater",
+ "toml 0.9.12+spec-1.1.0",
  "winreg",
 ]
 

@@ -14,6 +14,7 @@ use tauri::{
     Manager,
 };
 
+mod device_inventory;
 mod native_integration;
 
 const MAX_SCAN_DEPTH: usize = 32;
@@ -1757,6 +1758,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             scan_local_usage,
             integration_status,
+            device_inventory::collect_device_inventory,
+            device_inventory::apply_device_inventory_items,
             store_provider_secret,
             load_provider_secret,
             remove_provider_secret,

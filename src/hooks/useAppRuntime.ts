@@ -1,6 +1,7 @@
 // 로컬 수집, 계정 동기화, 공급사 사용량 조회를 하나의 앱 런타임으로 연결하는 훅
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { UsageEvent as LocalUsageEvent } from "../core";
+import { stableId } from "../core/parse-utils";
 import { AUTH_PKCE_VERIFIER_KEY, AUTH_REDIRECT_URL, AUTH_STATE_KEY, authRedirectCode, authRedirectWithState, createPkcePair, listenForAuthDeepLinks, verifyAuthRedirectState } from "../platform/deep-link";
 import { openExternalBrowser } from "../platform/external-browser";
 import {
@@ -29,10 +30,19 @@ import {
   type SupabaseConfig,
   type UsageEvent as SyncUsageEvent,
   type DeviceRegistration,
+  type DeviceInventory,
+  type DeviceInventoryItem,
+  type DeviceInventorySnapshot,
   type UsageQuery,
+  createDeviceInventorySnapshot,
   isSupabasePublicKey,
   readSupabaseConfig,
 } from "../services";
+import {
+  applyDeviceInventoryItems as applyNativeDeviceInventoryItems,
+  collectDeviceInventory,
+  type DeviceInventoryApplyResult,
+} from "../platform/device-inventory";
 import { getOrCreateDeviceId, useLocalUsage } from "./useLocalUsage";
 
 const SESSION_KEY = "token-deck-supabase-session";
@@ -41,10 +51,12 @@ const TITLES_BY_OWNER_KEY = "token-deck-session-titles-by-owner";
 const LOCAL_OWNERSHIP_KEY = "token-deck-local-session-owners";
 const CONFIG_KEY = "token-deck-supabase-config";
 const SESSION_TOMBSTONES_KEY = "token-deck-supabase-session-tombstones";
+const INVENTORY_SYNC_KEY = "token-deck-device-inventory-sync";
 const FULL_RECONCILE_INTERVAL_MS = 6 * 60 * 60 * 1_000;
 
 type AuthStatus = "local" | "signed_out" | "authenticated";
 type CloudSyncStatus = "disabled" | "signed_out" | "idle" | "syncing" | "offline" | "error";
+type InventorySyncStatus = "disabled" | "signed_out" | "idle" | "syncing" | "error";
 
 interface CredentialStatus { configured: boolean; checking: boolean; error?: string }
 
@@ -71,6 +83,13 @@ export function useAppRuntime() {
   const [remoteEvents, setRemoteEvents] = useState<LocalUsageEvent[]>([]);
   const [remoteAccountEvents, setRemoteAccountEvents] = useState<SyncUsageEvent[]>([]);
   const [devices, setDevices] = useState<DeviceRegistration[]>(() => [currentDevice()]);
+  const [localInventory, setLocalInventory] = useState<DeviceInventory>();
+  const [deviceInventories, setDeviceInventories] = useState<DeviceInventorySnapshot[]>([]);
+  const [inventorySyncEnabled, setInventorySyncEnabledState] = useState(false);
+  const [inventorySync, setInventorySync] = useState<{ status: InventorySyncStatus; loading: boolean; error?: string }>({
+    status: "disabled",
+    loading: true,
+  });
   const [providerEvents, setProviderEvents] = useState<SyncUsageEvent[]>([]);
   const [sessionTitles, setSessionTitles] = useState<Record<string, string>>(() => readSessionTitles(undefined));
   const [localOwnership, setLocalOwnership] = useState<Record<string, string>>(() => readJson(LOCAL_OWNERSHIP_KEY, {}));
@@ -78,6 +97,11 @@ export function useAppRuntime() {
   const authAttemptGenerationRef = useRef(0);
   const accountOwnerRef = useRef<string | undefined>(undefined);
   const providerEventsOwnerRef = useRef<string | undefined>(undefined);
+  const localInventoryRef = useRef<DeviceInventory | undefined>(undefined);
+  const inventorySyncEnabledRef = useRef(false);
+  const inventorySyncRevisionRef = useRef(0);
+  const inventorySyncCompletedRevisionRef = useRef(-1);
+  const inventorySyncErrorRef = useRef<string | undefined>(undefined);
   const serializeSyncRef = useRef(createSerialTaskRunner());
   const syncCacheRef = useRef(createUsageSyncCache());
   const credentialOwner = providerCredentialOwner(auth.status, auth.userId, client.config, getOrCreateDeviceId());
@@ -91,6 +115,35 @@ export function useAppRuntime() {
     setCredentials(emptyCredentialStatus());
     syncCacheRef.current = createUsageSyncCache();
   }, []);
+
+  const clearAccountInventoryState = useCallback(() => {
+    setDeviceInventories([]);
+    inventorySyncRevisionRef.current += 1;
+    inventorySyncCompletedRevisionRef.current = -1;
+    inventorySyncErrorRef.current = undefined;
+    inventorySyncEnabledRef.current = false;
+    setInventorySyncEnabledState(false);
+    setInventorySync({ status: client.enabled ? "signed_out" : "disabled", loading: false });
+  }, [client.enabled]);
+
+  const refreshDeviceInventory = useCallback(async (): Promise<DeviceInventory | undefined> => {
+    inventorySyncErrorRef.current = undefined;
+    setInventorySync((current) => ({ ...current, loading: true, error: undefined }));
+    try {
+      const inventory = await collectDeviceInventory();
+      localInventoryRef.current = inventory;
+      setLocalInventory(inventory);
+      setInventorySync((current) => ({ ...current, loading: false }));
+      return inventory;
+    } catch (cause) {
+      const error = message(cause);
+      inventorySyncErrorRef.current = error;
+      setInventorySync((current) => ({ ...current, status: "error", loading: false, error }));
+      throw cause;
+    }
+  }, []);
+
+  useEffect(() => { void refreshDeviceInventory().catch(() => undefined); }, [refreshDeviceInventory]);
 
   const activateSession = useCallback(async (
     session: SupabaseSession,
@@ -113,6 +166,11 @@ export function useAppRuntime() {
           setRemoteAccountEvents([]);
           setDevices([currentDevice()]);
           setSessionTitles(readSessionTitles(nextOwner));
+          clearAccountInventoryState();
+          const enabled = readInventorySyncPreference(nextOwner);
+          inventorySyncEnabledRef.current = enabled;
+          setInventorySyncEnabledState(enabled);
+          setInventorySync({ status: enabled ? "idle" : "disabled", loading: false });
         }
         clearSessionTombstone(scope);
         accountOwnerRef.current = nextOwner;
@@ -122,7 +180,7 @@ export function useAppRuntime() {
         setCloudSync((current) => ({ ...current, status: "idle", error: undefined }));
       },
     });
-  }, [authService, clearAccountProviderState, client.config]);
+  }, [authService, clearAccountInventoryState, clearAccountProviderState, client.config]);
 
   const refreshCredentialStatus = useCallback(async () => {
     const providers: CredentialProvider[] = ["openai", "anthropic", "google"];
@@ -245,6 +303,7 @@ export function useAppRuntime() {
     accountOwnerRef.current = undefined;
     credentialOwnerRef.current = localProviderCredentialOwner(getOrCreateDeviceId());
     clearAccountProviderState();
+    clearAccountInventoryState();
     window.localStorage.removeItem(SESSION_KEY);
     window.localStorage.removeItem(AUTH_STATE_KEY);
     window.localStorage.removeItem(AUTH_PKCE_VERIFIER_KEY);
@@ -264,7 +323,7 @@ export function useAppRuntime() {
     if (errors.length && generation === accountGenerationRef.current) {
       setAuth({ enabled: client.enabled, status: client.enabled ? "signed_out" : "local", error: errors.join(" ") });
     }
-  }, [authService, clearAccountProviderState, client.config, client.enabled]);
+  }, [authService, clearAccountInventoryState, clearAccountProviderState, client.config, client.enabled]);
 
   const syncNow = useCallback(() => serializeSyncRef.current(async () => {
     const generation = accountGenerationRef.current;
@@ -333,7 +392,7 @@ export function useAppRuntime() {
         id: currentPhysicalDeviceId,
         name: typeof navigator !== "undefined" ? navigator.platform || "Windows 기기" : "Windows 기기",
         platform: "windows",
-        appVersion: "0.3.0",
+        appVersion: "0.4.0",
         lastSeenAt: new Date().toISOString(),
       });
       if (deviceResult.error) throw new Error(deviceResult.error);
@@ -342,7 +401,7 @@ export function useAppRuntime() {
           id: ACCOUNT_PROVIDER_DEVICE_ID,
           name: "계정 API 집계",
           platform: "account",
-          appVersion: "0.3.0",
+          appVersion: "0.4.0",
           lastSeenAt: new Date().toISOString(),
         });
         if (accountDeviceResult.error) throw new Error(accountDeviceResult.error);
@@ -361,12 +420,61 @@ export function useAppRuntime() {
       const physicalDevices = accountDevices.filter((device) => device.id !== ACCOUNT_PROVIDER_DEVICE_ID);
       setDevices(physicalDevices.length ? physicalDevices : [currentDevice()]);
       setCloudSync({ status: "idle", uploaded: result.uploaded, pending: 0, lastSyncedAt: new Date() });
+      if (inventorySyncEnabledRef.current) {
+        const inventoryRevision = inventorySyncRevisionRef.current;
+        inventorySyncCompletedRevisionRef.current = -1;
+        inventorySyncErrorRef.current = undefined;
+        setInventorySync((current) => ({ ...current, status: "syncing", loading: true, error: undefined }));
+        inventoryUpdate: try {
+          const cachedInventory = localInventoryRef.current;
+          const inventory = !cachedInventory || Date.now() - cachedInventory.capturedAt > 5 * 60 * 1_000
+            ? await refreshDeviceInventory()
+            : cachedInventory;
+          if (generation !== accountGenerationRef.current || activeOwner !== accountOwnerRef.current) return;
+          if (inventoryRevision !== inventorySyncRevisionRef.current || !inventorySyncEnabledRef.current) {
+            setInventorySync({ status: "disabled", loading: false });
+            break inventoryUpdate;
+          }
+          if (!inventory) throw new Error("현재 기기의 설정 목록을 수집하지 못했습니다.");
+          const inventoryResult = await syncService.upsertDeviceInventorySnapshot(
+            createDeviceInventorySnapshot(currentPhysicalDeviceId, inventory),
+          );
+          if (inventoryResult.error) throw new Error(inventoryResult.error);
+          if (generation !== accountGenerationRef.current || activeOwner !== accountOwnerRef.current) return;
+          if (inventoryRevision !== inventorySyncRevisionRef.current || !inventorySyncEnabledRef.current) {
+            setInventorySync({ status: "disabled", loading: false });
+            break inventoryUpdate;
+          }
+          const snapshots = await syncService.listDeviceInventorySnapshots();
+          if (generation !== accountGenerationRef.current || activeOwner !== accountOwnerRef.current) return;
+          if (inventoryRevision !== inventorySyncRevisionRef.current || !inventorySyncEnabledRef.current) {
+            setInventorySync({ status: "disabled", loading: false });
+            break inventoryUpdate;
+          }
+          setDeviceInventories(snapshots);
+          inventorySyncCompletedRevisionRef.current = inventoryRevision;
+          setInventorySync({ status: "idle", loading: false });
+        } catch (cause) {
+          if (generation === accountGenerationRef.current && activeOwner === accountOwnerRef.current) {
+            const error = inventorySyncErrorMessage(cause);
+            inventorySyncErrorRef.current = error;
+            setInventorySync({ status: "error", loading: false, error });
+          }
+        }
+      } else {
+        setInventorySync({ status: "disabled", loading: false });
+      }
     } catch (cause) {
       if (generation !== accountGenerationRef.current) return;
       const offline = typeof navigator !== "undefined" && navigator.onLine === false;
       setCloudSync((current) => ({ ...current, status: offline ? "offline" : "error", pending: outgoing.length, error: message(cause) }));
+      if (inventorySyncEnabledRef.current && activeOwner === accountOwnerRef.current) {
+        const error = offline ? "오프라인 상태라 기기 설정 목록을 동기화하지 못했습니다." : "기존 계정 동기화 오류로 기기 설정 목록 갱신을 완료하지 못했습니다.";
+        inventorySyncErrorRef.current = error;
+        setInventorySync({ status: "error", loading: false, error });
+      }
     }
-  }), [activateSession, auth.status, authService, client, local.events, local.refresh, localOwnership, providerEvents, sessionTitles, signOut, syncService]);
+  }), [activateSession, auth.status, authService, client, local.events, local.refresh, localOwnership, providerEvents, refreshDeviceInventory, sessionTitles, signOut, syncService]);
 
   const syncNowRef = useRef(syncNow);
   syncNowRef.current = syncNow;
@@ -378,6 +486,73 @@ export function useAppRuntime() {
     void syncNowRef.current();
     return () => { window.removeEventListener("online", retry); window.clearInterval(timer); };
   }, [auth.status]);
+
+  const refreshAndSyncDeviceInventory = useCallback(async (): Promise<void> => {
+    if (auth.status !== "authenticated" || !accountOwnerRef.current) {
+      throw new Error("기기 설정 목록을 동기화하려면 먼저 계정에 로그인해 주세요.");
+    }
+    if (!inventorySyncEnabledRef.current) throw new Error("이 기기의 도구 목록 자동 갱신을 먼저 켜 주세요.");
+    if (typeof navigator !== "undefined" && navigator.onLine === false) {
+      const error = "오프라인 상태라 기기 설정 목록을 동기화하지 못했습니다.";
+      inventorySyncErrorRef.current = error;
+      setInventorySync({ status: "error", loading: false, error });
+      throw new Error(error);
+    }
+    const generation = accountGenerationRef.current;
+    const owner = accountOwnerRef.current;
+    const revision = inventorySyncRevisionRef.current;
+    inventorySyncCompletedRevisionRef.current = -1;
+    await refreshDeviceInventory();
+    await syncNowRef.current();
+    if (generation !== accountGenerationRef.current || owner !== accountOwnerRef.current) {
+      throw new Error("로그인 계정이 변경되어 기기 설정 목록 동기화를 중단했습니다.");
+    }
+    if (inventorySyncErrorRef.current) throw new Error(inventorySyncErrorRef.current);
+    if (inventorySyncCompletedRevisionRef.current !== revision) {
+      throw new Error("기기 설정 목록 동기화를 완료하지 못했습니다. 잠시 후 다시 시도해 주세요.");
+    }
+  }, [auth.status, refreshDeviceInventory]);
+
+  const setInventorySyncEnabled = useCallback(async (enabled: boolean) => {
+    if (auth.status !== "authenticated" || !accountOwnerRef.current) {
+      throw new Error("기기 설정 목록을 동기화하려면 먼저 계정에 로그인해 주세요.");
+    }
+    writeInventorySyncPreference(accountOwnerRef.current, enabled);
+    inventorySyncRevisionRef.current += 1;
+    inventorySyncEnabledRef.current = enabled;
+    setInventorySyncEnabledState(enabled);
+    if (!enabled) {
+      inventorySyncErrorRef.current = undefined;
+      setInventorySync({ status: "disabled", loading: false });
+      return;
+    }
+    setInventorySync({ status: "syncing", loading: true });
+    await refreshAndSyncDeviceInventory();
+  }, [auth.status, refreshAndSyncDeviceInventory]);
+
+  const applyDeviceInventoryItems = useCallback(async (
+    sourceDeviceId: string,
+    requestedItems: DeviceInventoryItem[],
+  ): Promise<DeviceInventoryApplyResult[]> => {
+    const currentDeviceId = getOrCreateDeviceId();
+    const selected = selectRemoteInventoryItems(
+      deviceInventories,
+      currentDeviceId,
+      sourceDeviceId,
+      requestedItems,
+      localInventoryRef.current?.items ?? [],
+    );
+    if (!selected.length) throw new Error("현재 기기로 가져올 수 있는 원격 설정 항목이 없습니다.");
+    const generation = accountGenerationRef.current;
+    const owner = accountOwnerRef.current;
+    const results = await applyNativeDeviceInventoryItems(selected);
+    if (generation !== accountGenerationRef.current || owner !== accountOwnerRef.current) {
+      throw new Error("로그인 계정이 변경되어 설정 목록 갱신을 중단했습니다.");
+    }
+    await refreshDeviceInventory();
+    if (inventorySyncEnabledRef.current) await syncNowRef.current();
+    return results;
+  }, [deviceInventories, refreshDeviceInventory]);
 
   const saveProviderCredential = useCallback((provider: CredentialProvider, value: ProviderCredentials | Record<string, string>) => serializeSyncRef.current(async () => {
     if (!credentialOwner || credentialOwnerRef.current !== credentialOwner) throw new Error("로그인 계정이 변경되었습니다. 자격 증명을 다시 저장해 주세요.");
@@ -441,6 +616,7 @@ export function useAppRuntime() {
     accountOwnerRef.current = undefined;
     credentialOwnerRef.current = localProviderCredentialOwner(getOrCreateDeviceId());
     clearAccountProviderState();
+    clearAccountInventoryState();
     window.localStorage.setItem(CONFIG_KEY, JSON.stringify(config));
     window.localStorage.removeItem(SESSION_KEY);
     window.localStorage.removeItem(AUTH_STATE_KEY);
@@ -456,7 +632,7 @@ export function useAppRuntime() {
     if (cleanupErrors.length && generation === accountGenerationRef.current) {
       setAuth({ enabled: true, status: "signed_out", error: cleanupErrors.join(" ") });
     }
-  }, [authService, clearAccountProviderState, client.config]);
+  }, [authService, clearAccountInventoryState, clearAccountProviderState, client.config]);
 
   const clearSupabaseConfig = useCallback(async () => {
     const cleanupErrors: string[] = [];
@@ -466,6 +642,7 @@ export function useAppRuntime() {
     accountOwnerRef.current = undefined;
     credentialOwnerRef.current = localProviderCredentialOwner(getOrCreateDeviceId());
     clearAccountProviderState();
+    clearAccountInventoryState();
     window.localStorage.removeItem(CONFIG_KEY);
     window.localStorage.removeItem(SESSION_KEY);
     window.localStorage.removeItem(AUTH_STATE_KEY);
@@ -482,7 +659,7 @@ export function useAppRuntime() {
     if (cleanupErrors.length && generation === accountGenerationRef.current) {
       setAuth({ enabled: Boolean(defaultConfig), status: defaultConfig ? "signed_out" : "local", error: cleanupErrors.join(" ") });
     }
-  }, [authService, clearAccountProviderState, client.config]);
+  }, [authService, clearAccountInventoryState, clearAccountProviderState, client.config]);
 
   const usageViews = useMemo(() => {
     const activeOwner = auth.status === "authenticated" ? accountOwnerRef.current : undefined;
@@ -507,12 +684,20 @@ export function useAppRuntime() {
     credentials,
     providerUsage: accountProviderUsage,
     devices,
+    localInventory,
+    deviceInventories,
+    inventorySyncEnabled,
+    inventorySync,
     sessionTitles,
     sendMagicLink,
     signInWithGoogle,
     acceptAuthRedirect,
     signOut,
     syncNow,
+    refreshDeviceInventory,
+    refreshAndSyncDeviceInventory,
+    setInventorySyncEnabled,
+    applyDeviceInventoryItems,
     saveProviderCredential,
     removeProviderCredential,
     refreshCredentialStatus,
@@ -531,7 +716,7 @@ function currentDevice(): DeviceRegistration {
     id: getOrCreateDeviceId(),
     name: typeof navigator !== "undefined" ? navigator.platform || "Windows 기기" : "Windows 기기",
     platform: "windows",
-    appVersion: "0.3.0",
+    appVersion: "0.4.0",
     lastSeenAt: new Date().toISOString(),
   };
 }
@@ -802,6 +987,81 @@ export function localEventsToTitledSyncEvents(
     ...toSyncUsageEvents([event])[0],
     sessionTitle: event.sessionId ? sessionTitles[event.sessionId] : undefined,
   }));
+}
+
+export function selectRemoteInventoryItems(
+  snapshots: DeviceInventorySnapshot[],
+  currentDeviceId: string,
+  sourceDeviceId: string,
+  requestedItems: DeviceInventoryItem[],
+  localItems: DeviceInventoryItem[] = [],
+): DeviceInventoryItem[] {
+  if (!sourceDeviceId || sourceDeviceId === currentDeviceId) return [];
+  const source = snapshots.find((snapshot) => snapshot.deviceId === sourceDeviceId);
+  if (!source) return [];
+  const allowed = new Map<string, DeviceInventoryItem>();
+  source.items
+    .filter((item) => isSafeRemoteMarketplacePlugin(item) || canReactivateLocalGeminiItem(item, localItems))
+    .forEach((item) => allowed.set(inventoryItemFingerprint(item), item));
+  return requestedItems.flatMap((item) => {
+    const canonical = allowed.get(inventoryItemFingerprint(item));
+    return canonical ? [canonical] : [];
+  }).filter((item, index, items) => items.findIndex((candidate) => inventoryItemFingerprint(candidate) === inventoryItemFingerprint(item)) === index);
+}
+
+function isSafeRemoteMarketplacePlugin(item: DeviceInventoryItem): boolean {
+  if (item.provider === "gemini" || item.kind !== "plugin" || !item.installed || !item.enabled || !item.transferable) return false;
+  if (item.hasSecrets || item.blockedReason || !item.marketplace || !["marketplace", "bundled"].includes(item.source)) return false;
+  if (item.key.length > 128) return false;
+  const parts = item.key.split("@");
+  const validPart = (value: string) => /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value);
+  return parts.length === 2 && validPart(parts[0]) && validPart(parts[1]) && parts[1] === item.marketplace;
+}
+
+function canReactivateLocalGeminiItem(item: DeviceInventoryItem, localItems: DeviceInventoryItem[]): boolean {
+  return item.provider === "gemini"
+    && item.kind === "plugin"
+    && item.enabled
+    && localItems.some((local) => local.provider === "gemini" && local.kind === "plugin" && local.key === item.key && local.installed);
+}
+
+export function readInventorySyncPreference(owner?: string, storage: Storage = window.localStorage): boolean {
+  return Boolean(owner) && storage.getItem(inventoryPreferenceKey(owner)) === "true";
+}
+
+export function writeInventorySyncPreference(owner: string, enabled: boolean, storage: Storage = window.localStorage): void {
+  storage.setItem(inventoryPreferenceKey(owner), String(enabled));
+}
+
+function inventoryPreferenceKey(owner?: string): string {
+  return `${INVENTORY_SYNC_KEY}:${stableId(owner)}`;
+}
+
+function inventoryItemFingerprint(item: DeviceInventoryItem): string {
+  return JSON.stringify([
+    item.provider,
+    item.kind,
+    item.key,
+    item.displayName,
+    item.version ?? null,
+    item.enabled,
+    item.installed,
+    item.source,
+    item.marketplace ?? null,
+    item.transport ?? null,
+    item.hasSecrets,
+    item.transferable,
+    item.blockedReason ?? null,
+  ]);
+}
+
+function inventorySyncErrorMessage(cause: unknown): string {
+  const detail = message(cause);
+  const normalized = detail.toLowerCase();
+  if (normalized.includes("pgrst205") || (normalized.includes("device_setting_snapshots") && normalized.includes("404"))) {
+    return "기기 설정 동기화용 서버 테이블이 아직 준비되지 않았습니다. 기존 토큰 동기화는 계속됩니다.";
+  }
+  return `기기 설정 목록을 동기화하지 못했습니다. ${detail.slice(0, 240)}`;
 }
 
 function localUsageOwnershipKey(event: LocalUsageEvent): string {

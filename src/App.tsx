@@ -2,6 +2,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { buildUsageChart, type ChartPeriod } from "./components/chart-data";
 import { selectProjectDeviceEvents } from "./components/dashboard-usage";
+import { DeviceInventoryPanel } from "./components/DeviceInventoryPanel";
 import { Icon, type IconName } from "./components/Icon";
 import { MiniDashboard } from "./components/MiniDashboard";
 import { OnboardingScreen } from "./components/OnboardingScreen";
@@ -28,6 +29,7 @@ const DASHBOARD_PERIOD_KEY = "token-deck-dashboard-period";
 const ONBOARDING_COMPLETE_KEY = "token-deck-onboarding-complete";
 const DISPLAY_PROVIDERS_KEY = "token-deck-display-providers";
 const ALL_PROVIDERS: Provider[] = ["codex", "claude", "gemini"];
+const EMPTY_DEVICE_INVENTORY = { schemaVersion: 1 as const, capturedAt: 0, items: [], warnings: [] };
 
 const providerInfo = {
   codex: { name: "Codex", model: "앱 + CLI", tone: "ink", monogram: "CX" },
@@ -240,7 +242,7 @@ export default function App() {
 
       <main id="main" className="dashboard">
         <header className="topbar">
-          <div><p className="kicker">{activeView === "overview" ? "통합 사용량 관제" : activeView === "projects" ? "프로젝트 분석" : "기기 분석"}</p><h1>{activeView === "overview" ? "토큰 흐름을 확인하세요." : activeView === "projects" ? "프로젝트별 사용량" : "기기별 사용량"}</h1><p>{activeView === "overview" ? "모든 AI 코딩 도구의 실제 사용 흐름을 한눈에 확인하세요." : activeView === "projects" ? "작업한 프로젝트마다 사용한 토큰과 참여 기기를 확인하세요." : "같은 계정으로 연결된 각 기기의 토큰 사용량을 비교하세요."}</p></div>
+          <div><p className="kicker">{activeView === "overview" ? "통합 사용량 관제" : activeView === "projects" ? "프로젝트 분석" : "기기 분석"}</p><h1>{activeView === "overview" ? "토큰 흐름을 확인하세요." : activeView === "projects" ? "프로젝트별 사용량" : "기기별 사용량과 설정"}</h1><p>{activeView === "overview" ? "모든 AI 코딩 도구의 실제 사용 흐름을 한눈에 확인하세요." : activeView === "projects" ? "작업한 프로젝트마다 사용한 토큰과 참여 기기를 확인하세요." : "같은 계정의 기기별 토큰과 스킬·MCP·플러그인 차이를 비교하세요."}</p></div>
           <div className="top-actions"><button className="mini-mode-entry" onClick={() => void changeWindowMode(true)}><Icon name="spark" /> 미니 모드</button><span className={`live-pill ${runtime.error ? "error" : ""}`}><i /> {syncLabel}</span><button className="icon-button" aria-label="지금 동기화" onClick={runSync}><Icon className={runtime.syncing ? "spin" : ""} name="refresh" /></button><button className="icon-button mobile-settings" aria-label="설정 열기" onClick={() => setSettingsOpen(true)}><Icon name="settings" /></button></div>
         </header>
 
@@ -291,7 +293,7 @@ export default function App() {
             <div className="device-list">{runtime.devices.map((device) => <div className="device-row" key={device.id}><span className={`device-icon ${device.id === currentDeviceId ? "current" : ""}`}><Icon name={"device" as IconName} /></span><div><strong>{device.name}</strong><small>{device.platform} · {new Date(device.lastSeenAt).toLocaleString("ko-KR")}</small></div><span className="device-status"><i />{device.id === currentDeviceId ? "현재 기기" : "동기화됨"}</span></div>)}</div>
           </article>
           <article className="privacy-card">
-            <div className="privacy-icon"><Icon name="lock" /></div><div className="privacy-copy"><span className="eyebrow">PRIVACY GUARD</span><h2>코드는 기기 밖으로 나가지 않아요.</h2><p>토큰 수치와 익명 프로젝트 ID만 암호화해 동기화합니다.</p><div className="privacy-meta"><Icon name="check" /> 전체 경로·프롬프트 수집 안 함</div></div>
+            <div className="privacy-icon"><Icon name="lock" /></div><div className="privacy-copy"><span className="eyebrow">PRIVACY GUARD</span><h2>코드는 기기 밖으로 나가지 않아요.</h2><p>토큰 수치와 익명 프로젝트 ID를 동기화하며, 동의를 켠 기기는 기기 식별자·수집 시각·내용 비교용 해시와 도구의 종류·공급사·ID·이름·버전·상태·출처 분류·마켓플레이스·연결 방식·자동 가져오기 가능 여부·제한 사유 분류를 추가합니다.</p><div className="privacy-meta"><Icon name="check" /> 전체 경로·프롬프트·비밀 설정·제한 사유 원문 수집 안 함</div></div>
             <button className={`toggle ${privacy ? "on" : ""}`} role="switch" aria-checked={privacy} aria-label="개인정보 보호 안내 확인" onClick={() => setPrivacy(!privacy)}><span /></button>
           </article>
         </section>
@@ -320,9 +322,21 @@ export default function App() {
               <div className="device-foot"><span>{device.projectCount}개 프로젝트</span><span>{device.eventCount.toLocaleString("ko-KR")}개 이벤트</span></div>
             </article>)}</div>
           </article>
+          <DeviceInventoryPanel
+            devices={runtime.devices}
+            currentDeviceId={currentDeviceId}
+            snapshots={runtime.deviceInventories}
+            localInventory={runtime.localInventory ?? EMPTY_DEVICE_INVENTORY}
+            syncEnabled={runtime.inventorySyncEnabled}
+            loading={runtime.inventorySync.loading}
+            error={runtime.inventorySync.error}
+            onEnableSync={() => runtime.setInventorySyncEnabled(true)}
+            onRefresh={async () => { if (runtime.inventorySyncEnabled) await runtime.refreshAndSyncDeviceInventory(); else await runtime.refreshDeviceInventory(); }}
+            onApply={(sourceDeviceId, items) => runtime.applyDeviceInventoryItems(sourceDeviceId, items)}
+          />
         </section>
 
-        <footer><span>Token Deck <b>v0.3.0</b></span><span><i /> {usageEvents.length ? "실제 사용량 연결됨" : "수집 이벤트 대기 중"}</span><span>마지막 갱신 · {runtime.syncing ? "동기화 중" : runtime.updatedAt?.toLocaleTimeString("ko-KR") ?? "대기 중"}</span></footer>
+        <footer><span>Token Deck <b>v0.4.0</b></span><span><i /> {usageEvents.length ? "실제 사용량 연결됨" : "수집 이벤트 대기 중"}</span><span>마지막 갱신 · {runtime.syncing ? "동기화 중" : runtime.updatedAt?.toLocaleTimeString("ko-KR") ?? "대기 중"}</span></footer>
       </main>
 
       <SettingsPanel
@@ -339,6 +353,8 @@ export default function App() {
         displayProviders={displayProviders}
         miniTotalVisible={miniTotalVisible}
         miniTotalPeriod={period}
+        inventorySyncEnabled={runtime.inventorySyncEnabled}
+        inventorySyncBusy={runtime.inventorySync.loading}
         claudeQuotaCapture={providerQuotas.claudeCapture}
         quotaBusy={providerQuotas.busy}
         onClose={() => setSettingsOpen(false)}
@@ -356,6 +372,7 @@ export default function App() {
         onToggleDisplayProvider={(provider) => toggleProvider(provider, displayProviders, setDisplayProviders, DISPLAY_PROVIDERS_KEY)}
         onToggleMiniTotal={toggleMiniTotal}
         onConfigureClaudeQuota={() => providerQuotas.enableClaudeCapture()}
+        onSetInventorySyncEnabled={(enabled) => runtime.setInventorySyncEnabled(enabled)}
       />
     </div>
   );

@@ -1,7 +1,14 @@
 // Supabase 사용 이벤트의 비활성화와 멱등 업서트를 검증하는 테스트
 import { describe, expect, it, vi } from "vitest";
-import { SupabaseRestClient } from "./client";
-import { UsageSyncService } from "./sync";
+import { readFileSync } from "node:fs";
+import type { DeviceInventoryItem, DeviceInventorySnapshot } from "../types";
+import { SupabaseRequestError, SupabaseRestClient } from "./client";
+import {
+  createDeviceInventorySnapshot,
+  deviceInventoryContentHash,
+  isDeviceInventoryTableMissingError,
+  UsageSyncService,
+} from "./sync";
 
 describe("UsageSyncService", () => {
   it("환경 설정이 없으면 네트워크 호출 없이 비활성 상태를 반환한다", async () => {
@@ -172,6 +179,138 @@ describe("UsageSyncService", () => {
   });
 });
 
+describe("기기 설정 인벤토리 동기화", () => {
+  it("허용 목록 밖의 경로·명령·토큰·환경 변수 값을 POST 본문에서 제거한다", async () => {
+    const request = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    const client = new SupabaseRestClient({ url: "https://example.supabase.co", anonKey: "anon" }, request);
+    client.setSession({ accessToken: "access" });
+    const unsafe = {
+      ...inventoryItem(),
+      absolutePath: "C:\\Users\\admin\\.codex\\config.toml",
+      command: "npx --token super-secret",
+      args: ["--api-key", "super-secret"],
+      token: "super-secret",
+      env: { OPENAI_API_KEY: "super-secret" },
+    } as unknown as DeviceInventoryItem;
+    const snapshot: DeviceInventorySnapshot = {
+      deviceId: "00000000-0000-0000-0000-000000000001",
+      schemaVersion: 1,
+      capturedAt: Date.parse("2026-07-12T00:00:00.000Z"),
+      contentHash: "0".repeat(64),
+      items: [unsafe],
+    };
+
+    await expect(new UsageSyncService(client).upsertDeviceInventorySnapshot(snapshot))
+      .resolves.toEqual({ uploaded: 1, disabled: false });
+
+    const body = JSON.parse(String((request.mock.calls[0][1] as RequestInit).body)) as Record<string, unknown>;
+    expect(body).not.toHaveProperty("user_id");
+    expect(body.content_hash).toMatch(/^[0-9a-f]{64}$/);
+    expect(body.items).toEqual([inventoryItem()]);
+    const serialized = JSON.stringify(body);
+    expect(serialized).not.toContain("super-secret");
+    expect(serialized).not.toContain("config.toml");
+    expect(serialized).not.toContain('"command"');
+    expect(serialized).not.toContain('"args"');
+    expect(serialized).not.toContain('"env"');
+  });
+
+  it("네이티브 인벤토리를 결정적 해시의 스냅샷으로 만들고 DB 행을 밀리초 시간으로 복원한다", async () => {
+    const capturedAt = Date.parse("2026-07-12T01:02:03.000Z");
+    const inventory = {
+      schemaVersion: 1 as const,
+      capturedAt,
+      items: [inventoryItem({ key: "plugin-z" }), inventoryItem({ key: "plugin-a" })],
+      warnings: ["codex-plugin-list-unavailable"],
+    };
+    const snapshot = createDeviceInventorySnapshot("00000000-0000-0000-0000-000000000001", inventory);
+    const reversedHash = deviceInventoryContentHash([...inventory.items].reverse());
+    let storedRow: Record<string, unknown> | undefined;
+    const request = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === "POST") {
+        storedRow = JSON.parse(String(init.body)) as Record<string, unknown>;
+        return new Response(null, { status: 204 });
+      }
+      return new Response(JSON.stringify([storedRow]), { status: 200 });
+    });
+    const client = new SupabaseRestClient({ url: "https://example.supabase.co", anonKey: "anon" }, request);
+    client.setSession({ accessToken: "access" });
+    const service = new UsageSyncService(client);
+
+    expect(snapshot.contentHash).toBe(reversedHash);
+    await expect(service.upsertDeviceInventorySnapshot(snapshot)).resolves.toEqual({ uploaded: 1, disabled: false });
+    const restored = await service.listDeviceInventorySnapshots();
+
+    expect(storedRow?.captured_at).toBe("2026-07-12T01:02:03.000Z");
+    expect(storedRow).not.toHaveProperty("warnings");
+    expect(restored).toEqual([expect.objectContaining({
+      deviceId: snapshot.deviceId,
+      schemaVersion: 1,
+      capturedAt,
+      contentHash: snapshot.contentHash,
+      items: snapshot.items,
+      updatedAt: expect.any(Number),
+    })]);
+  });
+
+  it("1000행 Range 페이지를 반복해 모든 기기 스냅샷을 내려받는다", async () => {
+    const item = inventoryItem();
+    const contentHash = deviceInventoryContentHash([item]);
+    const rowFor = (index: number) => ({
+      device_id: `device-${index}`,
+      schema_version: 1,
+      content_hash: contentHash,
+      captured_at: "2026-07-12T00:00:00.000Z",
+      items: [item],
+      updated_at: "2026-07-12T00:01:00.000Z",
+    });
+    const request = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify(Array.from({ length: 1000 }, (_, index) => rowFor(index))), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify([rowFor(1000)]), { status: 200 }));
+    const client = new SupabaseRestClient({ url: "https://example.supabase.co", anonKey: "anon" }, request);
+    client.setSession({ accessToken: "access" });
+
+    const result = await new UsageSyncService(client).listDeviceInventorySnapshots();
+
+    expect(result).toHaveLength(1001);
+    expect(new Headers((request.mock.calls[0][1] as RequestInit).headers).get("Range")).toBe("0-999");
+    expect(new Headers((request.mock.calls[1][1] as RequestInit).headers).get("Range")).toBe("1000-1999");
+  });
+
+  it("기기 스냅샷 테이블이 schema cache에 없다는 오류만 구분한다", () => {
+    const missing = new SupabaseRequestError("Supabase 요청 실패 (404)", 404, {
+      code: "PGRST205",
+      message: "Could not find the table 'public.device_setting_snapshots' in the schema cache",
+    });
+    const anotherTable = new SupabaseRequestError("Supabase 요청 실패 (404)", 404, {
+      code: "PGRST205",
+      message: "Could not find the table 'public.other_table' in the schema cache",
+    });
+
+    expect(isDeviceInventoryTableMissingError(missing)).toBe(true);
+    expect(isDeviceInventoryTableMissingError(anotherTable)).toBe(false);
+    expect(isDeviceInventoryTableMissingError("PGRST205 device_setting_snapshots schema cache"))
+      .toBe(true);
+  });
+
+  it("migration이 복합 계정 키와 RLS 및 최소 권한을 선언한다", () => {
+    const sql = readFileSync(
+      new URL("../../../supabase/migrations/202607120001_device_setting_snapshots.sql", import.meta.url),
+      "utf8",
+    ).toLowerCase();
+
+    expect(sql).toContain("primary key (user_id, device_id)");
+    expect(sql).toContain("foreign key (user_id, device_id) references public.devices(user_id, id)");
+    expect(sql).toContain("enable row level security");
+    expect(sql.match(/auth\.uid\(\) = user_id/g)).toHaveLength(4);
+    expect(sql).toContain("revoke all on public.device_setting_snapshots from anon, authenticated");
+    expect(sql).toContain("grant select, insert, update on public.device_setting_snapshots to authenticated");
+    expect(sql).not.toContain("grant select, insert, update, delete");
+    expect(sql).toContain("jsonb_array_length(items) <= 512");
+    expect(sql).toContain("octet_length(items::text) <= 524288");
+  });
+});
+
 function event() {
   return {
     eventId: "event-1",
@@ -184,6 +323,23 @@ function event() {
     outputTokens: 3,
     reasoningTokens: 1,
     toolTokens: 0,
+  };
+}
+
+function inventoryItem(overrides: Partial<DeviceInventoryItem> = {}): DeviceInventoryItem {
+  return {
+    provider: "codex",
+    kind: "plugin",
+    key: "plugin-openai-example",
+    displayName: "OpenAI Example",
+    version: "1.2.3",
+    enabled: true,
+    installed: true,
+    source: "marketplace",
+    marketplace: "openai/example",
+    hasSecrets: false,
+    transferable: true,
+    ...overrides,
   };
 }
 

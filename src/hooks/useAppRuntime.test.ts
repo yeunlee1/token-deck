@@ -1,6 +1,6 @@
 // 동기화된 계정 API 토큰과 비용이 재시작 후에도 설정 요약에 복원되는지 검증하는 테스트
 import { describe, expect, it, vi } from "vitest";
-import type { UsageEvent } from "../services";
+import type { DeviceInventoryItem, UsageEvent } from "../services";
 import { decodeOwnedProviderSecret, encodeOwnedProviderSecret } from "../services/credential-store";
 import {
   commitSession,
@@ -14,12 +14,15 @@ import {
   mergeAccountProviderUsage,
   providerEventsForOwner,
   providerCredentialOwner,
+  readInventorySyncPreference,
   reconcileDownloadedUsage,
   recordUploadedUsage,
   requireOneTimeAuthCode,
   resolveSupabaseConfig,
   selectChangedUsageEvents,
+  selectRemoteInventoryItems,
   shouldFullyReconcile,
+  writeInventorySyncPreference,
 } from "./useAppRuntime";
 
 describe("account provider usage summary", () => {
@@ -238,6 +241,60 @@ describe("계정별 로컬 사용량 격리", () => {
   });
 });
 
+describe("기기 설정 인벤토리 계정 격리", () => {
+  it("설정 목록 동기화 동의를 계정별로 분리해 저장한다", () => {
+    const storage = new MemoryStorage();
+    writeInventorySyncPreference("scope\nuser-a", true, storage);
+
+    expect(readInventorySyncPreference("scope\nuser-a", storage)).toBe(true);
+    expect(readInventorySyncPreference("scope\nuser-b", storage)).toBe(false);
+    expect(readInventorySyncPreference(undefined, storage)).toBe(false);
+  });
+
+  it("현재 기기와 수동 항목을 제외하고 원격 스냅샷의 정규 항목만 적용한다", () => {
+    const transferable = inventoryItem({ key: "formatter@market", transferable: true });
+    const manual = inventoryItem({ kind: "mcp", key: "private-mcp", transferable: false });
+    const snapshots = [
+      { deviceId: "current", schemaVersion: 1 as const, capturedAt: 1, contentHash: "a".repeat(64), items: [inventoryItem({ key: "current-only", transferable: true })] },
+      { deviceId: "remote", schemaVersion: 1 as const, capturedAt: 2, contentHash: "b".repeat(64), items: [transferable, manual] },
+    ];
+
+    const selected = selectRemoteInventoryItems(snapshots, "current", "remote", [
+      transferable,
+      manual,
+      inventoryItem({ key: "current-only", transferable: true }),
+    ]);
+
+    expect(selected).toEqual([transferable]);
+    expect(selectRemoteInventoryItems(snapshots, "current", "remote", [
+      { ...transferable, displayName: "변조된 이름", version: "999" },
+    ])).toEqual([]);
+  });
+
+  it("같은 플러그인 키가 여러 기기에 있어도 사용자가 고른 원본 기기와 버전에 묶는다", () => {
+    const versionOne = inventoryItem({ key: "shared@market", version: "1.0.0" });
+    const versionTwo = inventoryItem({ key: "shared@market", version: "2.0.0" });
+    const snapshots = [
+      { deviceId: "laptop", schemaVersion: 1 as const, capturedAt: 1, contentHash: "d".repeat(64), items: [versionOne] },
+      { deviceId: "desktop", schemaVersion: 1 as const, capturedAt: 2, contentHash: "e".repeat(64), items: [versionTwo] },
+    ];
+
+    expect(selectRemoteInventoryItems(snapshots, "current", "laptop", [versionOne])).toEqual([versionOne]);
+    expect(selectRemoteInventoryItems(snapshots, "current", "laptop", [versionTwo])).toEqual([]);
+    expect(selectRemoteInventoryItems(snapshots, "current", "current", [versionOne])).toEqual([]);
+  });
+
+  it("현재 기기에 이미 설치된 Gemini 확장만 원격 목록에서 다시 활성화할 수 있다", () => {
+    const remoteGemini = inventoryItem({ provider: "gemini", key: "gemini-extension", transferable: false });
+    const snapshot = { deviceId: "remote", schemaVersion: 1 as const, capturedAt: 2, contentHash: "c".repeat(64), items: [remoteGemini] };
+
+    expect(selectRemoteInventoryItems([snapshot], "current", "remote", [remoteGemini], [])).toEqual([]);
+    expect(selectRemoteInventoryItems([snapshot], "current", "remote", [remoteGemini], [
+      { ...remoteGemini, enabled: false, installed: true },
+    ])).toEqual([remoteGemini]);
+  });
+});
+
 describe("로그아웃과 콜백 방어", () => {
   it("Credential Manager 삭제가 실패해도 tombstone이 재시작 세션 복원을 차단한다", async () => {
     const storage = new MemoryStorage();
@@ -300,6 +357,22 @@ function localEvent(overrides: Partial<import("../core").UsageEvent>): import(".
     projectId: "project-1",
     occurredAt: "2026-07-11T00:00:00.000Z",
     tokens: { input: 1, cached: 0, output: 0, reasoning: 0, tool: 0 },
+    ...overrides,
+  };
+}
+
+function inventoryItem(overrides: Partial<DeviceInventoryItem>): DeviceInventoryItem {
+  return {
+    provider: "codex",
+    kind: "plugin",
+    key: "plugin@market",
+    displayName: "Plugin",
+    enabled: true,
+    installed: true,
+    source: "marketplace",
+    marketplace: "market",
+    hasSecrets: false,
+    transferable: true,
     ...overrides,
   };
 }

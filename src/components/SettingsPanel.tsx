@@ -35,6 +35,8 @@ interface SettingsPanelProps {
   displayProviders: Provider[];
   miniTotalVisible: boolean;
   miniTotalPeriod: ChartPeriod;
+  inventorySyncEnabled: boolean;
+  inventorySyncBusy: boolean;
   claudeQuotaCapture: { configured: boolean; hasData: boolean; existingStatusLine: boolean };
   quotaBusy: boolean;
   onClose: () => void;
@@ -52,6 +54,7 @@ interface SettingsPanelProps {
   onToggleDisplayProvider: (provider: Provider) => void;
   onToggleMiniTotal: () => void;
   onConfigureClaudeQuota: () => Promise<void>;
+  onSetInventorySyncEnabled: (enabled: boolean) => Promise<void>;
 }
 
 const providerLabels: Record<CredentialProvider, string> = {
@@ -197,6 +200,16 @@ export function SettingsPanel(props: SettingsPanelProps) {
     setSessionTitle("");
   }
 
+  async function toggleInventorySync() {
+    setAuthMessage("");
+    try {
+      await props.onSetInventorySyncEnabled(!props.inventorySyncEnabled);
+      setAuthMessage(props.inventorySyncEnabled ? "이 기기의 도구 목록 자동 갱신을 껐습니다." : "이 기기의 도구 목록 자동 갱신을 켰습니다.");
+    } catch (cause) {
+      setAuthMessage(cause instanceof Error ? cause.message : "기기 설정 목록 동기화 상태를 바꾸지 못했습니다.");
+    }
+  }
+
   return (
     <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && props.onClose()}>
       <section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
@@ -216,6 +229,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
             {!props.auth.enabled || props.auth.status === "local" ? <div className="setting-notice"><Icon name="warning" /><div><strong>로컬 전용 모드</strong><p>Supabase 환경 설정을 추가하면 Google·이메일 로그인과 기기 동기화가 활성화됩니다.</p></div></div> : props.auth.status === "authenticated" ? <div className="signed-in-card"><div><span className="avatar">TD</span><div><strong>동기화 계정 연결됨</strong><small>{props.auth.userId ?? "인증된 사용자"}</small></div></div><button className="secondary-button" onClick={() => void props.onSignOut()}>로그아웃</button></div> : <div className="settings-auth-options"><button className="google-login-button compact" type="button" disabled={Boolean(authBusy)} onClick={() => void loginWithGoogle()}><span aria-hidden="true">G</span>{authBusy === "google" ? "브라우저 여는 중…" : "Google로 로그인"}</button><span className="settings-auth-divider">또는</span><form className="login-form" onSubmit={login}><label htmlFor="sync-email">이메일 주소</label><div><input id="sync-email" type="email" autoComplete="email" required disabled={Boolean(authBusy)} value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@example.com" /><button className="primary-button" disabled={Boolean(authBusy)}>{authBusy === "email" ? "전송 중…" : "로그인 링크 받기"}</button></div></form></div>}
             <p className="form-message" aria-live="polite">{props.auth.error ?? authMessage}</p>
             <div className="sync-summary"><span><b>{props.cloudSync.pending}</b>개 업로드 대기</span><span><b>{props.cloudSync.uploaded}</b>개 동기화됨</span><span>상태 <b>{props.cloudSync.status}</b></span></div>
+            <div className="setting-toggle-row"><div><strong>이 기기의 도구 목록 자동 갱신</strong><small>기기 식별자, 목록 스키마 버전, 수집·갱신 시각, 내용 비교용 해시와 도구의 종류, 공급사, 항목 ID·이름, 버전, 설치·활성 상태, 수집 출처 분류, 마켓플레이스, MCP 전송 방식, 비밀 설정 필요 여부, 자동 가져오기 가능 여부와 제한 사유 분류만 공유합니다. 비밀값, 명령, 제한 사유의 원문과 전체 경로는 제외됩니다. 갱신을 꺼도 마지막 스냅샷은 계정 비교용으로 유지됩니다.</small></div><button className={`toggle setting-switch ${props.inventorySyncEnabled ? "on" : ""}`} type="button" role="switch" aria-checked={props.inventorySyncEnabled} aria-label="이 기기의 도구 목록 자동 갱신" disabled={props.auth.status !== "authenticated" || props.inventorySyncBusy} onClick={() => void toggleInventorySync()}><span /></button></div>
           </section>
 
           <section className="setting-section" aria-labelledby="display-title">
