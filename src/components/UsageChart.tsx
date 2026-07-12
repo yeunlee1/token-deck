@@ -1,4 +1,4 @@
-// 기간별 토큰 사용량 추이를 SVG로 시각화하는 차트
+// 기간별 토큰 사용량 추이를 SVG로 시각화하는 차트.
 import type { ChartPoint } from "./chart-data";
 
 interface UsageChartProps {
@@ -6,9 +6,9 @@ interface UsageChartProps {
 }
 
 const series = [
-  { key: "codex", color: "#171b24" },
-  { key: "claude", color: "#b5da32" },
-  { key: "gemini", color: "#6b7af7" },
+  { key: "codex", color: "var(--provider-codex)", dash: undefined },
+  { key: "claude", color: "var(--provider-claude)", dash: "9 5" },
+  { key: "gemini", color: "var(--provider-gemini)", dash: "2 5" },
 ] as const;
 
 export function UsageChart({ data }: UsageChartProps) {
@@ -33,12 +33,12 @@ export function UsageChart({ data }: UsageChartProps) {
           const y = pad.top + (line / 3) * (height - pad.top - pad.bottom);
           return <line key={line} x1={pad.left} x2={width - pad.right} y1={y} y2={y} className="chart-gridline" />;
         })}
-        {series.map(({ key, color }) => (
+        {series.map(({ key, color, dash }) => (
           <g key={key}>
-            <polyline points={pointsFor(key)} fill="none" stroke={color} strokeWidth="3" vectorEffect="non-scaling-stroke" />
+            <polyline points={pointsFor(key)} fill="none" stroke={color} strokeWidth="3" strokeDasharray={dash} strokeLinecap={key === "gemini" ? "round" : undefined} vectorEffect="non-scaling-stroke" />
             {data.map((item, index) => {
               const [x, y] = pointsFor(key).split(" ")[index].split(",");
-              return <circle key={`${key}-${item.label}`} cx={x} cy={y} r="3.5" fill="#fff" stroke={color} strokeWidth="2.5" vectorEffect="non-scaling-stroke" />;
+              return <circle key={`${key}-${item.label}`} cx={x} cy={y} r="3.5" fill="var(--chart-point)" stroke={color} strokeWidth="2.5" vectorEffect="non-scaling-stroke" />;
             })}
           </g>
         ))}

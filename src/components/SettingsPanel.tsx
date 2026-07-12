@@ -4,6 +4,7 @@ import type { ChartPeriod } from "./chart-data";
 import type { Provider } from "../core";
 import type { AutostartStatus, GeminiStatus } from "../platform/native";
 import type { ProviderUsageRecord } from "../services";
+import { THEME_OPTIONS, type ThemeId } from "../theme";
 import { Icon } from "./Icon";
 
 type CredentialProvider = "openai" | "anthropic" | "google";
@@ -39,6 +40,7 @@ interface SettingsPanelProps {
   inventorySyncBusy: boolean;
   claudeQuotaCapture: { configured: boolean; hasData: boolean; existingStatusLine: boolean };
   quotaBusy: boolean;
+  theme: ThemeId;
   allowSupabaseOverride: boolean;
   onClose: () => void;
   onConfigureSupabase: (url: string, anonKey: string) => Promise<void> | void;
@@ -52,6 +54,7 @@ interface SettingsPanelProps {
   onConfigureGemini: () => Promise<void>;
   onToggleDisplayProvider: (provider: Provider) => void;
   onToggleMiniTotal: () => void;
+  onSelectTheme: (theme: ThemeId) => void;
   onConfigureClaudeQuota: () => Promise<void>;
   onSetInventorySyncEnabled: (enabled: boolean) => Promise<void>;
 }
@@ -220,6 +223,24 @@ export function SettingsPanel(props: SettingsPanelProps) {
             <div className="provider-visibility" aria-label="대시보드에 표시할 공급사">{(["codex", "claude", "gemini"] as Provider[]).map((provider) => <button key={provider} type="button" aria-pressed={props.displayProviders.includes(provider)} onClick={() => props.onToggleDisplayProvider(provider)}><span className={`project-dot ${provider === "claude" ? "lime" : provider === "gemini" ? "violet" : "ink"}`} /><strong>{provider === "codex" ? "Codex" : provider === "claude" ? "Claude" : "Gemini"}</strong><small>{props.displayProviders.includes(provider) ? "표시 중" : "숨김"}</small></button>)}</div>
             <p className="setting-hint">최소 한 개는 항상 표시됩니다. 수집과 동기화는 선택과 관계없이 계속됩니다.</p>
             <div className="setting-toggle-row"><div><strong>미니모드 총 토큰</strong><small>미니모드에서 선택한 공급사의 {props.miniTotalPeriod} 사용량 합계를 표시합니다.</small></div><button className={`toggle setting-switch ${props.miniTotalVisible ? "on" : ""}`} type="button" role="switch" aria-checked={props.miniTotalVisible} aria-label="미니모드 총 토큰 표시" onClick={props.onToggleMiniTotal}><span /></button></div>
+          </section>
+
+          <section className="setting-section" aria-labelledby="theme-title">
+            <div className="setting-section-title"><span className="setting-icon"><Icon name="spark" /></span><div><h3 id="theme-title">화면 테마</h3><p>계절과 작업 환경에 맞는 색상으로 모든 화면을 전환합니다.</p></div></div>
+            <div className="theme-picker" role="radiogroup" aria-label="Token Deck 화면 테마">
+              {THEME_OPTIONS.map((option) => {
+                const selected = props.theme === option.id;
+                return (
+                  <label key={option.id} className={selected ? "selected" : ""} data-theme-id={option.id}>
+                    <input type="radio" name="token-deck-theme" value={option.id} checked={selected} onChange={() => props.onSelectTheme(option.id)} />
+                    <span className="theme-preview" aria-hidden="true"><i style={{ background: option.swatches[0] }} /><i style={{ background: option.swatches[1] }} /><i style={{ background: option.swatches[2] }} /></span>
+                    <span className="theme-copy"><small>{option.season}</small><strong>{option.label}</strong><em>{option.description}</em></span>
+                    <span className="theme-check" aria-hidden="true">{selected && <Icon name="check" />}</span>
+                  </label>
+                );
+              })}
+            </div>
+            <p className="setting-hint" aria-live="polite">{THEME_OPTIONS.find((option) => option.id === props.theme)?.label} 테마가 적용되어 있습니다. 선택은 이 기기에 자동 저장됩니다.</p>
           </section>
 
           <section className="setting-section" aria-labelledby="quota-title">

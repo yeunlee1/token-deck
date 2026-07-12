@@ -18,6 +18,7 @@ import { getOrCreateDeviceId } from "./hooks/useLocalUsage";
 import { useNativeSettings } from "./hooks/useNativeSettings";
 import { useProviderQuotas } from "./hooks/useProviderQuotas";
 import { applyWindowMode, setWindowPinned } from "./platform/window-mode";
+import { applyTheme, readTheme, storeTheme, type ThemeId } from "./theme";
 import "./styles.css";
 
 type Period = ChartPeriod;
@@ -79,6 +80,7 @@ export default function App() {
   const [windowModeError, setWindowModeError] = useState("");
   const [privacy, setPrivacy] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [theme, setTheme] = useState<ThemeId>(() => readTheme());
   const usageEvents = runtime.combinedEvents;
   const visibleEvents = useMemo(() => usageEvents.filter((event) => displayProviders.includes(event.provider)), [displayProviders, usageEvents]);
   const periodEvents = useMemo(() => usageInPeriod(visibleEvents, period), [visibleEvents, period]);
@@ -97,6 +99,11 @@ export default function App() {
   useEffect(() => {
     window.localStorage.setItem(DASHBOARD_PERIOD_KEY, period);
   }, [period]);
+
+  useEffect(() => {
+    applyTheme(theme);
+    storeTheme(theme);
+  }, [theme]);
 
   useEffect(() => {
     if (runtime.auth.status !== "authenticated" || onboardingComplete) return;
@@ -362,6 +369,7 @@ export default function App() {
         inventorySyncBusy={runtime.inventorySync.loading}
         claudeQuotaCapture={providerQuotas.claudeCapture}
         quotaBusy={providerQuotas.busy}
+        theme={theme}
         allowSupabaseOverride={import.meta.env.DEV}
         onClose={() => setSettingsOpen(false)}
         onConfigureSupabase={(url, anonKey) => runtime.configureSupabase(url, anonKey)}
@@ -375,6 +383,7 @@ export default function App() {
         onConfigureGemini={() => nativeSettings.enableGeminiTelemetry()}
         onToggleDisplayProvider={(provider) => toggleProvider(provider, displayProviders, setDisplayProviders, DISPLAY_PROVIDERS_KEY)}
         onToggleMiniTotal={toggleMiniTotal}
+        onSelectTheme={setTheme}
         onConfigureClaudeQuota={() => providerQuotas.enableClaudeCapture()}
         onSetInventorySyncEnabled={(enabled) => runtime.setInventorySyncEnabled(enabled)}
       />

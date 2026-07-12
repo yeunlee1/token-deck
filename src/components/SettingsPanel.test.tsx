@@ -38,6 +38,7 @@ function renderSettings(auth: SettingsProps["auth"], allowSupabaseOverride = fal
     inventorySyncBusy: false,
     claudeQuotaCapture: { configured: false, hasData: false, existingStatusLine: false },
     quotaBusy: false,
+    theme: "modern-blue",
     allowSupabaseOverride,
     onClose: vi.fn(),
     onConfigureSupabase: asyncAction,
@@ -51,6 +52,7 @@ function renderSettings(auth: SettingsProps["auth"], allowSupabaseOverride = fal
     onConfigureGemini: asyncAction,
     onToggleDisplayProvider: vi.fn(),
     onToggleMiniTotal: vi.fn(),
+    onSelectTheme: vi.fn(),
     onConfigureClaudeQuota: asyncAction,
     onSetInventorySyncEnabled: asyncAction,
   };
@@ -85,5 +87,19 @@ describe("SettingsPanel 계정 진입 경로", () => {
     expect(markup).toContain("Supabase 서버 연결");
     expect(markup).toContain("Project URL");
     expect(markup).toContain("Publishable key");
+  });
+
+  it("여섯 가지 테마와 현재 선택 상태를 접근 가능한 단일 선택으로 표시한다", () => {
+    const markup = renderSettings({ enabled: true, status: "signed_out" });
+
+    expect((markup.match(/data-theme-id=/g) ?? [])).toHaveLength(6);
+    expect(markup).toContain("다크");
+    expect(markup).toContain("봄");
+    expect(markup).toContain("여름");
+    expect(markup).toContain("가을");
+    expect(markup).toContain("겨울");
+    expect(markup).toContain("모던 블루");
+    expect((markup.match(/type="radio"/g) ?? [])).toHaveLength(6);
+    expect((markup.match(/checked=""/g) ?? [])).toHaveLength(1);
   });
 });
