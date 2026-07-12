@@ -23,12 +23,21 @@ describe("mini quota display", () => {
   });
 
   it("핀 상태를 노출하고 새로고침과 불투명도 조절은 렌더링하지 않는다", () => {
-    const markup = renderToStaticMarkup(<MiniDashboard quotas={[quota]} providers={["codex"]} updatedAt={new Date("2026-07-12T00:00:00Z")} syncing={false} pinned onToggleProvider={vi.fn()} onTogglePinned={vi.fn()} onExit={vi.fn()} />);
+    const markup = renderToStaticMarkup(<MiniDashboard quotas={[quota]} providers={["codex"]} showTotal totalTokens={12_345} totalPeriod="7일" updatedAt={new Date("2026-07-12T00:00:00Z")} syncing={false} pinned onToggleProvider={vi.fn()} onTogglePinned={vi.fn()} onExit={vi.fn()} />);
 
     expect(markup).toContain('aria-pressed="true"');
     expect(markup).toContain('aria-label="창 고정 해제"');
+    expect(markup).toContain('aria-label="7일 총 토큰 12,345"');
+    expect(markup).toContain("7일 TOTAL");
     expect(markup).not.toContain("한도 새로고침");
     expect(markup).not.toContain("불투명도");
     expect(markup).not.toContain('type="range"');
+  });
+
+  it("설정에서 총 토큰 표시를 끄면 합계 영역을 숨긴다", () => {
+    const markup = renderToStaticMarkup(<MiniDashboard quotas={[quota]} providers={["codex"]} showTotal={false} totalTokens={12_345} totalPeriod="7일" syncing={false} pinned={false} onToggleProvider={vi.fn()} onTogglePinned={vi.fn()} onExit={vi.fn()} />);
+
+    expect(markup).not.toContain("7일 TOTAL");
+    expect(markup).not.toContain("총 토큰 12,345");
   });
 });

@@ -14,4 +14,33 @@ describe("SupabaseAuthService", () => {
     expect(request.mock.calls[0][0]).toBe(`https://example.supabase.co/auth/v1/otp?redirect_to=${encodeURIComponent(AUTH_REDIRECT_URL)}`);
     expect(JSON.parse(String((request.mock.calls[0][1] as RequestInit).body))).toEqual({ email: "user@example.com", create_user: true });
   });
+
+  it("Google OAuth 주소에 딥링크와 PKCE S256 값을 포함한다", () => {
+    const client = new SupabaseRestClient({ url: "https://example.supabase.co", anonKey: "publishable" });
+    const authorize = new URL(new SupabaseAuthService(client).createGoogleOAuthUrl(
+      "token-deck://auth?state=nonce-1",
+      "a".repeat(43),
+    ));
+
+    expect(authorize.origin + authorize.pathname).toBe("https://example.supabase.co/auth/v1/authorize");
+    expect(Object.fromEntries(authorize.searchParams)).toEqual({
+      provider: "google",
+      redirect_to: "token-deck://auth?state=nonce-1",
+      code_challenge: "a".repeat(43),
+      code_challenge_method: "s256",
+    });
+  });
+
+  it("일회용 인증 코드와 같은 기기의 verifier로 세션을 교환한다", async () => {
+    const request = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      access_token: "access", refresh_token: "refresh", expires_in: 3600, user: { id: "user-1" },
+    }), { status: 200 }));
+    const client = new SupabaseRestClient({ url: "https://example.supabase.co", anonKey: "publishable" }, request);
+
+    const session = await new SupabaseAuthService(client).exchangeCodeForSession("one-time-code", "v".repeat(43));
+
+    expect(request.mock.calls[0][0]).toBe("https://example.supabase.co/auth/v1/token?grant_type=pkce");
+    expect(JSON.parse(String((request.mock.calls[0][1] as RequestInit).body))).toEqual({ auth_code: "one-time-code", code_verifier: "v".repeat(43) });
+    expect(session).toEqual(expect.objectContaining({ accessToken: "access", refreshToken: "refresh", userId: "user-1" }));
+  });
 });

@@ -13,6 +13,17 @@
     "core:window:allow-set-position",
     "core:window:allow-set-size",
     "deep-link:default",
+    "process:allow-restart",
+    "updater:allow-check",
+    "updater:allow-download-and-install",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        { "url": "https://*/auth/v1/authorize*" },
+        { "url": "http://localhost:*/auth/v1/authorize*" },
+        { "url": "http://127.0.0.1:*/auth/v1/authorize*" }
+      ]
+    },
     {
       "identifier": "http:default",
       "allow": [

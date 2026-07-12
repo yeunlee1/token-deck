@@ -7,6 +7,9 @@ import { quotaStatusLabel, remainingLabel, remainingTone, type ProviderQuotaStat
 interface MiniDashboardProps {
   quotas: ProviderQuotaStatus[];
   providers: Provider[];
+  showTotal: boolean;
+  totalTokens: number;
+  totalPeriod: string;
   updatedAt?: Date;
   syncing: boolean;
   error?: string;
@@ -21,10 +24,12 @@ const names: Record<Provider, string> = { codex: "Codex", claude: "Claude", gemi
 
 export function MiniDashboard(props: MiniDashboardProps) {
   const quotaByProvider = useMemo(() => new Map(props.quotas.map((quota) => [quota.provider, quota])), [props.quotas]);
+  const compactTotal = new Intl.NumberFormat("ko-KR", { notation: props.totalTokens > 9999 ? "compact" : "standard", maximumFractionDigits: 1 }).format(props.totalTokens);
 
   return <main className="mini-dashboard" aria-label="Token Deck 미니 모드">
     <header className="mini-header" data-tauri-drag-region>
       <div className="mini-brand" data-tauri-drag-region><span><Icon name="activity" /></span><div data-tauri-drag-region><strong data-tauri-drag-region>TOKEN DECK</strong><small data-tauri-drag-region>정액제 잔여 한도</small></div></div>
+      {props.showTotal && <div className="mini-total" aria-label={`${props.totalPeriod} 총 토큰 ${props.totalTokens.toLocaleString("ko-KR")}`} aria-live="polite" data-tauri-drag-region><span data-tauri-drag-region>{props.totalPeriod} TOTAL</span><div data-tauri-drag-region><strong data-tauri-drag-region>{compactTotal}</strong><small data-tauri-drag-region>tokens</small></div></div>}
       <div className="mini-actions"><button className={props.pinned ? "pinned" : ""} aria-label={props.pinned ? "창 고정 해제" : "창 항상 위에 고정"} aria-pressed={Boolean(props.pinned)} onClick={props.onTogglePinned}><Icon name={props.pinned ? "pin" : "pinOff"} /></button><button aria-label="일반 모드로 전환" onClick={props.onExit}>↗</button></div>
     </header>
     <div className="mini-selector" aria-label="표시할 공급사">{options.map((option) => <button key={option.value} aria-pressed={props.providers.includes(option.value)} onClick={() => props.onToggleProvider(option.value)}>{option.label}</button>)}</div>

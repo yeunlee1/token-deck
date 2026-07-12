@@ -1,7 +1,8 @@
 // 로컬 수집, 계정 동기화, 공급사 사용량 조회를 하나의 앱 런타임으로 연결하는 훅
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { UsageEvent as LocalUsageEvent } from "../core";
-import { AUTH_REDIRECT_URL, AUTH_STATE_KEY, authRedirectWithState, listenForAuthDeepLinks, verifyAuthRedirectState } from "../platform/deep-link";
+import { AUTH_PKCE_VERIFIER_KEY, AUTH_REDIRECT_URL, AUTH_STATE_KEY, authRedirectCode, authRedirectWithState, createPkcePair, listenForAuthDeepLinks, verifyAuthRedirectState } from "../platform/deep-link";
+import { openExternalBrowser } from "../platform/external-browser";
 import {
   fetchStoredProviderUsage,
   ACCOUNT_PROVIDER_DEVICE_ID,
@@ -25,6 +26,7 @@ import {
   type UsageEvent as SyncUsageEvent,
   type DeviceRegistration,
   type UsageQuery,
+  isSupabasePublicKey,
 } from "../services";
 import { getOrCreateDeviceId, useLocalUsage } from "./useLocalUsage";
 
@@ -39,7 +41,10 @@ interface CredentialStatus { configured: boolean; checking: boolean; error?: str
 
 export function useAppRuntime() {
   const local = useLocalUsage();
-  const [runtimeConfig, setRuntimeConfig] = useState<SupabaseConfig | null>(() => readJson(CONFIG_KEY, null));
+  const [runtimeConfig, setRuntimeConfig] = useState<SupabaseConfig | null>(() => {
+    const saved = readJson<SupabaseConfig | null>(CONFIG_KEY, null);
+    return saved && isSecureSupabaseUrl(saved.url) && isSupabasePublicKey(saved.anonKey) ? saved : null;
+  });
   const client = useMemo(() => new SupabaseRestClient(runtimeConfig ?? undefined), [runtimeConfig]);
   const authService = useMemo(() => new SupabaseAuthService(client), [client]);
   const syncService = useMemo(() => new UsageSyncService(client), [client]);
@@ -116,15 +121,37 @@ export function useAppRuntime() {
     if (!client.enabled) throw new Error("Supabase 환경 설정이 없어 로컬 전용 모드입니다.");
     const state = crypto.randomUUID();
     window.localStorage.setItem(AUTH_STATE_KEY, state);
+    window.localStorage.removeItem(AUTH_PKCE_VERIFIER_KEY);
     await authService.sendMagicLink(email, authRedirectWithState(state, redirectTo ?? AUTH_REDIRECT_URL));
+  }, [authService, client.enabled]);
+
+  const signInWithGoogle = useCallback(async () => {
+    if (!client.enabled) throw new Error("Supabase 환경 설정이 없어 로컬 전용 모드입니다.");
+    const state = crypto.randomUUID();
+    const { verifier, challenge } = await createPkcePair();
+    window.localStorage.setItem(AUTH_STATE_KEY, state);
+    window.localStorage.setItem(AUTH_PKCE_VERIFIER_KEY, verifier);
+    try {
+      const redirectTo = authRedirectWithState(state, AUTH_REDIRECT_URL);
+      await openExternalBrowser(authService.createGoogleOAuthUrl(redirectTo, challenge));
+    } catch (cause) {
+      if (window.localStorage.getItem(AUTH_STATE_KEY) === state) window.localStorage.removeItem(AUTH_STATE_KEY);
+      if (window.localStorage.getItem(AUTH_PKCE_VERIFIER_KEY) === verifier) window.localStorage.removeItem(AUTH_PKCE_VERIFIER_KEY);
+      throw cause;
+    }
   }, [authService, client.enabled]);
 
   const acceptAuthRedirect = useCallback(async (url: string) => {
     const generation = accountGenerationRef.current;
     const scope = sessionScope(client.config);
     verifyAuthRedirectState(url, window.localStorage.getItem(AUTH_STATE_KEY));
+    const codeVerifier = window.localStorage.getItem(AUTH_PKCE_VERIFIER_KEY) ?? "";
     window.localStorage.removeItem(AUTH_STATE_KEY);
-    const session = authService.acceptRedirectUrl(url);
+    window.localStorage.removeItem(AUTH_PKCE_VERIFIER_KEY);
+    const code = authRedirectCode(url);
+    const session = code
+      ? await authService.exchangeCodeForSession(code, codeVerifier)
+      : authService.acceptRedirectUrl(url);
     const complete = { ...session, userId: session.userId ?? jwtSubject(session.accessToken) };
     authService.acceptSession(complete);
     if (generation !== accountGenerationRef.current || scope !== sessionScope(client.config)) return;
@@ -160,6 +187,7 @@ export function useAppRuntime() {
     authService.signOutLocally();
     window.localStorage.removeItem(SESSION_KEY);
     window.localStorage.removeItem(AUTH_STATE_KEY);
+    window.localStorage.removeItem(AUTH_PKCE_VERIFIER_KEY);
     setAuth({ enabled: client.enabled, status: client.enabled ? "signed_out" : "local" });
     setRemoteEvents([]);
     setRemoteAccountEvents([]);
@@ -217,7 +245,7 @@ export function useAppRuntime() {
         id: getOrCreateDeviceId(),
         name: typeof navigator !== "undefined" ? navigator.platform || "Windows 기기" : "Windows 기기",
         platform: "windows",
-        appVersion: "0.2.0",
+        appVersion: "0.3.0",
         lastSeenAt: new Date().toISOString(),
       });
       if (deviceResult.error) throw new Error(deviceResult.error);
@@ -226,7 +254,7 @@ export function useAppRuntime() {
           id: ACCOUNT_PROVIDER_DEVICE_ID,
           name: "계정 API 집계",
           platform: "account",
-          appVersion: "0.2.0",
+          appVersion: "0.3.0",
           lastSeenAt: new Date().toISOString(),
         });
         if (accountDeviceResult.error) throw new Error(accountDeviceResult.error);
@@ -295,10 +323,10 @@ export function useAppRuntime() {
     window.localStorage.setItem(TITLES_KEY, JSON.stringify(next));
   }, [sessionTitles]);
 
-  const configureSupabase = useCallback(async (url: string, anonKey: string) => {
+  const configureSupabase = useCallback(async (url: string, publishableKey: string) => {
     const normalizedUrl = url.trim().replace(/\/+$/, "");
-    const normalizedKey = anonKey.trim();
-    if (!isSecureSupabaseUrl(normalizedUrl) || !normalizedKey) throw new Error("HTTPS Supabase URL과 anon key가 필요합니다. 로컬 개발 주소만 HTTP를 사용할 수 있습니다.");
+    const normalizedKey = publishableKey.trim();
+    if (!isSecureSupabaseUrl(normalizedUrl) || !isSupabasePublicKey(normalizedKey)) throw new Error("HTTPS Supabase URL과 publishable key가 필요합니다. secret 또는 service_role key는 저장할 수 없습니다.");
     const config = { url: normalizedUrl, anonKey: normalizedKey };
     accountGenerationRef.current += 1;
     syncingRef.current = false;
@@ -307,6 +335,7 @@ export function useAppRuntime() {
     window.localStorage.setItem(CONFIG_KEY, JSON.stringify(config));
     window.localStorage.removeItem(SESSION_KEY);
     window.localStorage.removeItem(AUTH_STATE_KEY);
+    window.localStorage.removeItem(AUTH_PKCE_VERIFIER_KEY);
     await removeProviderSecret("supabase").catch(() => undefined);
     setRuntimeConfig(config);
     setRemoteEvents([]);
@@ -323,6 +352,7 @@ export function useAppRuntime() {
     window.localStorage.removeItem(CONFIG_KEY);
     window.localStorage.removeItem(SESSION_KEY);
     window.localStorage.removeItem(AUTH_STATE_KEY);
+    window.localStorage.removeItem(AUTH_PKCE_VERIFIER_KEY);
     await removeProviderSecret("supabase").catch(() => undefined);
     setRuntimeConfig(null);
     setRemoteEvents([]);
@@ -355,6 +385,7 @@ export function useAppRuntime() {
     devices,
     sessionTitles,
     sendMagicLink,
+    signInWithGoogle,
     acceptAuthRedirect,
     signOut,
     syncNow,
@@ -376,7 +407,7 @@ function currentDevice(): DeviceRegistration {
     id: getOrCreateDeviceId(),
     name: typeof navigator !== "undefined" ? navigator.platform || "Windows 기기" : "Windows 기기",
     platform: "windows",
-    appVersion: "0.2.0",
+    appVersion: "0.3.0",
     lastSeenAt: new Date().toISOString(),
   };
 }

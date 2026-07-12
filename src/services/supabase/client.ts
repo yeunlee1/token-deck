@@ -1,6 +1,7 @@
 // 환경 설정이 없으면 안전하게 비활성화되는 Supabase REST 클라이언트
 export interface SupabaseConfig {
   url: string;
+  // 기존 저장 형식과 호환되는 이름이며 publishable key 또는 레거시 anon key만 허용합니다.
   anonKey: string;
 }
 
@@ -32,8 +33,16 @@ export function readSupabaseConfig(
   }).env ?? {},
 ): SupabaseConfig | null {
   const url = cleanUrl(env.VITE_SUPABASE_URL);
-  const anonKey = (env.VITE_SUPABASE_ANON_KEY ?? "").trim();
-  return url && anonKey ? { url, anonKey } : null;
+  const anonKey = (env.VITE_SUPABASE_PUBLISHABLE_KEY ?? env.VITE_SUPABASE_ANON_KEY ?? "").trim();
+  return url && isSupabasePublicKey(anonKey) ? { url, anonKey } : null;
+}
+
+export function isSupabasePublicKey(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  const key = value.trim();
+  if (!key || key.startsWith("sb_secret_")) return false;
+  const role = jwtRole(key);
+  return role !== "service_role";
 }
 
 export class SupabaseRestClient {
@@ -90,5 +99,16 @@ function safeJson(value: string): unknown {
     return JSON.parse(value);
   } catch {
     return value;
+  }
+}
+
+function jwtRole(value: string): string | undefined {
+  const payload = value.split(".")[1];
+  if (!payload) return undefined;
+  try {
+    const normalized = payload.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(payload.length / 4) * 4, "=");
+    return JSON.parse(atob(normalized)).role;
+  } catch {
+    return undefined;
   }
 }

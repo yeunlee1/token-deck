@@ -32,6 +32,33 @@ export class SupabaseAuthService {
     }, { auth: false });
   }
 
+  createGoogleOAuthUrl(redirectTo: string, codeChallenge: string): string {
+    if (!this.client.config) throw new Error("Supabase 환경 설정이 없어 Google 로그인을 시작할 수 없습니다.");
+    if (!/^[A-Za-z0-9_-]{43}$/.test(codeChallenge)) throw new Error("Google 로그인 PKCE 검증값이 올바르지 않습니다.");
+    const redirect = new URL(redirectTo);
+    if (redirect.protocol !== "token-deck:" || redirect.hostname !== "auth") {
+      throw new Error("Google 로그인 콜백 주소가 올바르지 않습니다.");
+    }
+    const authorize = new URL(`${this.client.config.url}/auth/v1/authorize`);
+    authorize.searchParams.set("provider", "google");
+    authorize.searchParams.set("redirect_to", redirect.toString());
+    authorize.searchParams.set("code_challenge", codeChallenge);
+    authorize.searchParams.set("code_challenge_method", "s256");
+    return authorize.toString();
+  }
+
+  async exchangeCodeForSession(authCode: string, codeVerifier: string): Promise<SupabaseSession> {
+    if (!authCode.trim()) throw new Error("Google 로그인 콜백에 인증 코드가 없습니다.");
+    if (!/^[A-Za-z0-9._~-]{43,128}$/.test(codeVerifier)) throw new Error("Google 로그인 PKCE 검증 정보를 찾을 수 없습니다. 로그인을 다시 시작해 주세요.");
+    const response = await this.client.call<AuthResponse>("/auth/v1/token?grant_type=pkce", {
+      method: "POST",
+      body: JSON.stringify({ auth_code: authCode, code_verifier: codeVerifier }),
+    }, { auth: false });
+    const session = toSession(response);
+    this.client.setSession(session);
+    return session;
+  }
+
   acceptRedirectUrl(url: string): SupabaseSession {
     const parsed = new URL(url);
     const values = new URLSearchParams(parsed.hash.replace(/^#/, ""));

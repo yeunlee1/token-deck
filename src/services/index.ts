@@ -5,3 +5,4 @@ export * from "./providers";
 export * from "./provider-runtime";
 export * from "./supabase";
 export * from "./types";
+export * from "./updater";

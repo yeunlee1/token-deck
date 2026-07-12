@@ -4,11 +4,13 @@ import { buildUsageChart, type ChartPeriod } from "./components/chart-data";
 import { selectProjectDeviceEvents } from "./components/dashboard-usage";
 import { Icon, type IconName } from "./components/Icon";
 import { MiniDashboard } from "./components/MiniDashboard";
+import { OnboardingScreen } from "./components/OnboardingScreen";
 import { ProjectNameEditor } from "./components/ProjectNameEditor";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { UsageChart } from "./components/UsageChart";
 import { quotaStatusLabel, remainingLabel, remainingTone } from "./components/quota-display";
 import { tokenTotal, type Provider, type UsageEvent } from "./core";
+import { useAutoUpdater } from "./hooks/useAutoUpdater";
 import { useAppRuntime } from "./hooks/useAppRuntime";
 import { getOrCreateDeviceId } from "./hooks/useLocalUsage";
 import { useNativeSettings } from "./hooks/useNativeSettings";
@@ -21,6 +23,9 @@ type ActiveView = "overview" | "projects" | "devices";
 const MINI_MODE_KEY = "token-deck-mini-mode";
 const MINI_PROVIDERS_KEY = "token-deck-mini-providers";
 const MINI_PINNED_KEY = "token-deck-mini-pinned";
+const MINI_TOTAL_VISIBLE_KEY = "token-deck-mini-total-visible";
+const DASHBOARD_PERIOD_KEY = "token-deck-dashboard-period";
+const ONBOARDING_COMPLETE_KEY = "token-deck-onboarding-complete";
 const DISPLAY_PROVIDERS_KEY = "token-deck-display-providers";
 const ALL_PROVIDERS: Provider[] = ["codex", "claude", "gemini"];
 
@@ -54,16 +59,19 @@ function SectionTitle({ eyebrow, title, action }: { eyebrow: string; title: stri
 }
 
 export default function App() {
+  useAutoUpdater();
   const runtime = useAppRuntime();
   const nativeSettings = useNativeSettings();
   const providerQuotas = useProviderQuotas();
   const [currentDeviceId] = useState(() => getOrCreateDeviceId());
-  const [period, setPeriod] = useState<Period>("7일");
+  const [period, setPeriod] = useState<Period>(() => readPeriod());
   const [activeView, setActiveView] = useState<ActiveView>("overview");
-  const [miniMode, setMiniMode] = useState(() => window.localStorage.getItem(MINI_MODE_KEY) === "true");
+  const [miniMode, setMiniMode] = useState(() => window.localStorage.getItem(ONBOARDING_COMPLETE_KEY) === "true" && window.localStorage.getItem(MINI_MODE_KEY) === "true");
   const [displayProviders, setDisplayProviders] = useState<Provider[]>(() => readProviderList(DISPLAY_PROVIDERS_KEY, ALL_PROVIDERS));
   const [miniProviders, setMiniProviders] = useState<Provider[]>(() => readProviderList(MINI_PROVIDERS_KEY, ["codex", "claude"]));
   const [miniPinned, setMiniPinned] = useState(() => window.localStorage.getItem(MINI_PINNED_KEY) === "true");
+  const [miniTotalVisible, setMiniTotalVisible] = useState(() => window.localStorage.getItem(MINI_TOTAL_VISIBLE_KEY) !== "false");
+  const [onboardingComplete, setOnboardingComplete] = useState(() => window.localStorage.getItem(ONBOARDING_COMPLETE_KEY) === "true");
   const [editingProjectId, setEditingProjectId] = useState<string>();
   const [projectNameDraft, setProjectNameDraft] = useState("");
   const [windowModeError, setWindowModeError] = useState("");
@@ -74,6 +82,7 @@ export default function App() {
   const periodEvents = useMemo(() => usageInPeriod(visibleEvents, period), [visibleEvents, period]);
   const projectDeviceEvents = useMemo(() => selectProjectDeviceEvents(runtime.localSessionEvents, displayProviders, periodStart(period)), [displayProviders, period, runtime.localSessionEvents]);
   const actualTotal = useMemo(() => periodEvents.reduce((sum, event) => sum + tokenTotal(event.tokens), 0), [periodEvents]);
+  const miniTotal = useMemo(() => usageInPeriod(usageEvents.filter((event) => miniProviders.includes(event.provider)), period).reduce((sum, event) => sum + tokenTotal(event.tokens), 0), [miniProviders, period, usageEvents]);
   const chartData = useMemo(() => buildUsageChart(visibleEvents, period), [visibleEvents, period]);
 
   useEffect(() => {
@@ -82,6 +91,16 @@ export default function App() {
     window.addEventListener("keydown", close);
     return () => window.removeEventListener("keydown", close);
   }, [settingsOpen]);
+
+  useEffect(() => {
+    window.localStorage.setItem(DASHBOARD_PERIOD_KEY, period);
+  }, [period]);
+
+  useEffect(() => {
+    if (runtime.auth.status !== "authenticated" || onboardingComplete) return;
+    window.localStorage.setItem(ONBOARDING_COMPLETE_KEY, "true");
+    setOnboardingComplete(true);
+  }, [onboardingComplete, runtime.auth.status]);
 
   useEffect(() => {
     if (!miniMode) return;
@@ -186,11 +205,22 @@ export default function App() {
       setWindowModeError(cause instanceof Error ? cause.message : "창 고정 상태를 바꾸지 못했습니다.");
     }
   };
+  const toggleMiniTotal = () => {
+    const next = !miniTotalVisible;
+    setMiniTotalVisible(next);
+    window.localStorage.setItem(MINI_TOTAL_VISIBLE_KEY, String(next));
+  };
+  const continueLocally = () => {
+    window.localStorage.setItem(ONBOARDING_COMPLETE_KEY, "true");
+    setOnboardingComplete(true);
+  };
   const startProjectNameEdit = (id: string, name: string) => { setEditingProjectId(id); setProjectNameDraft(name); };
   const cancelProjectNameEdit = () => { setEditingProjectId(undefined); setProjectNameDraft(""); };
   const saveProjectName = async (id: string) => { await runtime.updateProjectName(id, projectNameDraft); cancelProjectNameEdit(); };
 
-  if (miniMode) return <MiniDashboard quotas={Object.values(providerQuotas.quotas)} providers={miniProviders} updatedAt={providerQuotas.updatedAt} syncing={providerQuotas.loading || providerQuotas.busy} error={providerQuotas.error} pinned={miniPinned} onToggleProvider={(provider) => toggleProvider(provider, miniProviders, setMiniProviders, MINI_PROVIDERS_KEY)} onTogglePinned={() => void toggleMiniPinned()} onExit={() => void changeWindowMode(false)} />;
+  if (!onboardingComplete && runtime.auth.status !== "authenticated") return <OnboardingScreen authEnabled={runtime.auth.enabled} onSignInWithGoogle={() => runtime.signInWithGoogle()} onSendMagicLink={(email) => runtime.sendMagicLink(email)} onContinueLocal={continueLocally} />;
+
+  if (miniMode) return <MiniDashboard quotas={Object.values(providerQuotas.quotas)} providers={miniProviders} showTotal={miniTotalVisible} totalTokens={miniTotal} totalPeriod={period} updatedAt={providerQuotas.updatedAt} syncing={providerQuotas.loading || providerQuotas.busy} error={providerQuotas.error} pinned={miniPinned} onToggleProvider={(provider) => toggleProvider(provider, miniProviders, setMiniProviders, MINI_PROVIDERS_KEY)} onTogglePinned={() => void toggleMiniPinned()} onExit={() => void changeWindowMode(false)} />;
 
   return (
     <div className="app-shell">
@@ -292,7 +322,7 @@ export default function App() {
           </article>
         </section>
 
-        <footer><span>Token Deck <b>v0.2.0</b></span><span><i /> {usageEvents.length ? "실제 사용량 연결됨" : "수집 이벤트 대기 중"}</span><span>마지막 갱신 · {runtime.syncing ? "동기화 중" : runtime.updatedAt?.toLocaleTimeString("ko-KR") ?? "대기 중"}</span></footer>
+        <footer><span>Token Deck <b>v0.3.0</b></span><span><i /> {usageEvents.length ? "실제 사용량 연결됨" : "수집 이벤트 대기 중"}</span><span>마지막 갱신 · {runtime.syncing ? "동기화 중" : runtime.updatedAt?.toLocaleTimeString("ko-KR") ?? "대기 중"}</span></footer>
       </main>
 
       <SettingsPanel
@@ -307,12 +337,15 @@ export default function App() {
         providerUsage={runtime.providerUsage}
         sessions={sessions}
         displayProviders={displayProviders}
+        miniTotalVisible={miniTotalVisible}
+        miniTotalPeriod={period}
         claudeQuotaCapture={providerQuotas.claudeCapture}
         quotaBusy={providerQuotas.busy}
         onClose={() => setSettingsOpen(false)}
         onConfigureSupabase={(url, anonKey) => runtime.configureSupabase(url, anonKey)}
         onClearSupabaseConfig={() => runtime.clearSupabaseConfig()}
         onSendMagicLink={(email) => runtime.sendMagicLink(email)}
+        onSignInWithGoogle={() => runtime.signInWithGoogle()}
         onSignOut={() => runtime.signOut()}
         onSaveCredential={(provider, credentials) => runtime.saveProviderCredential(provider, credentials)}
         onRemoveCredential={(provider) => runtime.removeProviderCredential(provider)}
@@ -321,6 +354,7 @@ export default function App() {
         onSetAutostart={(enabled) => nativeSettings.toggleAutostart(enabled)}
         onConfigureGemini={() => nativeSettings.enableGeminiTelemetry()}
         onToggleDisplayProvider={(provider) => toggleProvider(provider, displayProviders, setDisplayProviders, DISPLAY_PROVIDERS_KEY)}
+        onToggleMiniTotal={toggleMiniTotal}
         onConfigureClaudeQuota={() => providerQuotas.enableClaudeCapture()}
       />
     </div>
@@ -342,4 +376,9 @@ function readProviderList(key: string, fallback: Provider[]): Provider[] {
     }
   }
   return fallback;
+}
+
+function readPeriod(): Period {
+  const stored = window.localStorage.getItem(DASHBOARD_PERIOD_KEY);
+  return stored === "오늘" || stored === "30일" ? stored : "7일";
 }

@@ -1,6 +1,6 @@
 [package]
 name = "token-deck"
-version = "0.2.0"
+version = "0.3.0"
 description = "Codex, Claude, Gemini 토큰 사용량 통합 대시보드"
 authors = ["Token Deck"]
 edition = "2021"
@@ -19,7 +19,10 @@ tauri = { version = "2", features = ["tray-icon"] }
 keyring = "4.1.4"
 tauri-plugin-deep-link = "2"
 tauri-plugin-http = "2"
+tauri-plugin-opener = "2.5.4"
+tauri-plugin-process = "2.3.1"
 tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
+tauri-plugin-updater = "2.10.1"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"

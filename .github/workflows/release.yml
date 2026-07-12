@@ -1,0 +1,58 @@
+# 서명된 윈도우 설치 파일과 자동 업데이트 메타데이터를 배포하는 작업
+name: 윈도우 설치 파일 배포
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: 윈도우-설치-파일-배포
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: 설치 파일 빌드와 판올림 초안 생성
+    if: github.ref == 'refs/heads/main'
+    environment: 판올림-서명
+    runs-on: windows-latest
+    steps:
+      - name: 소스 코드 받기
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: 러스트 도구 설치
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      - name: 노드 환경 설치
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: 자바스크립트 의존성 설치
+        run: npm ci
+
+      - name: 자동 테스트 실행
+        run: npm test
+
+      - name: 프론트엔드 빌드 검증
+        run: npm run build
+
+      - name: 서명된 설치 파일과 판올림 초안 만들기
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          VITE_SUPABASE_URL: ${{ vars.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_PUBLISHABLE_KEY: ${{ vars.VITE_SUPABASE_PUBLISHABLE_KEY }}
+        with:
+          tagName: 판올림-__VERSION__
+          releaseName: Token Deck __VERSION__ 판올림
+          releaseBody: |
+            새 버전 설치 파일과 자동 업데이트 파일입니다.
+            검증을 마친 뒤 이 초안을 게시하면 설치된 앱이 새 버전을 감지합니다.
+          releaseDraft: true
+          prerelease: false
+          includeUpdaterJson: true
