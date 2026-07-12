@@ -1,5 +1,5 @@
 // 저장된 공급사 자격 증명으로 사용량을 조회하고 동기화 이벤트로 변환하는 서비스
-import { loadProviderSecret, type CredentialProvider } from "./credential-store";
+import { loadOwnedProviderSecret, type CredentialProvider } from "./credential-store";
 import { stableId } from "../core/parse-utils";
 import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
 import { AnthropicUsageAdapter, type AnthropicCredentials } from "./providers/anthropic";
@@ -23,11 +23,12 @@ export function parseProviderCredentials(provider: CredentialProvider, value: st
 
 export async function fetchStoredProviderUsage(
   provider: CredentialProvider,
+  owner: string,
   query: UsageQuery,
-  secretLoader: typeof loadProviderSecret = loadProviderSecret,
+  secretLoader: typeof loadOwnedProviderSecret = loadOwnedProviderSecret,
   request: typeof fetch = providerFetch(),
 ): Promise<ProviderUsageRecord[]> {
-  const secret = await secretLoader(provider);
+  const secret = await secretLoader(provider, owner);
   if (!secret) throw new Error(`${provider} 자격 증명이 저장되어 있지 않습니다.`);
   const credentials = parseProviderCredentials(provider, secret);
   if (provider === "openai") return new OpenAIUsageAdapter(request).fetchUsage(credentials as OpenAICredentials, query);
@@ -41,7 +42,7 @@ export function providerRecordsToUsageEvents(records: ProviderUsageRecord[], _de
     provider: record.provider,
     source: record.kind === "cost" ? "cloud_billing" : "provider_api",
     deviceId: ACCOUNT_PROVIDER_DEVICE_ID,
-    projectId: record.projectRef,
+    projectId: record.projectRef ? `provider_${stableId(record.provider, record.projectRef)}` : undefined,
     model: record.model,
     occurredAt: record.occurredAt,
     inputTokens: record.inputTokens ?? 0,

@@ -12,6 +12,7 @@ export interface UsageEvent {
   projectId?: string;
   model?: string;
   occurredAt: string;
+  createdAt?: string;
   inputTokens: number;
   cachedTokens: number;
   outputTokens: number;

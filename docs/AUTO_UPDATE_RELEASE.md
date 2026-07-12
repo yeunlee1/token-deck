@@ -21,6 +21,8 @@ https://github.com/yeunlee1/token-deck/releases/latest/download/latest.json
 - `VITE_SUPABASE_URL`에는 운영 Supabase 프로젝트 URL을 넣습니다.
 - `VITE_SUPABASE_PUBLISHABLE_KEY`에는 운영 프로젝트의 publishable key를 넣습니다.
 
+워크플로는 공개키가 `sb_publishable_` 형식이거나 JWT payload의 `role`이 정확히 `anon`인 레거시 키일 때만 빌드를 계속합니다. `sb_secret_`, `service_role`, 손상된 JWT, 임의 문자열은 설치 파일에 포함되기 전에 차단합니다.
+
 Google Client Secret, Supabase secret key, service role key, 데이터베이스 비밀번호는 설치 파일이나 Actions variables에 넣지 않습니다.
 
 비공개키와 암호는 저장소, 설치 파일, 로그, 문서에 커밋하지 않습니다. 비공개키를 잃어버리면 이미 설치된 앱에 같은 업데이트 채널로 새 버전을 전달할 수 없으므로 별도 보안 저장소에 백업합니다.
@@ -35,9 +37,19 @@ Google Client Secret, Supabase secret key, service role key, 데이터베이스 
 2. 테스트와 데스크톱 빌드를 통과시킨 뒤 기본 브랜치에 푸시합니다.
 3. GitHub 저장소의 `Actions > 윈도우 설치 파일 배포 > Run workflow`를 실행합니다.
 4. 작업이 끝나면 GitHub Releases에 생성된 판올림 초안의 설치 파일, 서명 파일, `latest.json`을 확인합니다.
-5. 판올림 초안을 게시합니다. 게시된 시점부터 기존 설치본이 새 버전을 감지합니다.
+5. 판올림 초안을 게시할 때 사전 판올림으로 표시하지 않고 `Set as the latest release`를 선택합니다. 이미 게시했다면 해당 판올림의 편집 화면에서 최신 판올림 지정을 확인합니다.
+6. 게시 직후 PowerShell에서 아래 검증 명령을 실행합니다. HTTP 상태가 `200`이고 출력된 `version`이 방금 게시한 버전과 같아야 합니다.
 
-워크플로는 실수로 검증 전 업데이트가 배포되지 않도록 초안만 만듭니다. GitHub의 `latest` 주소는 초안 판올림을 제공하지 않으므로 게시 전에는 사용자에게 노출되지 않습니다.
+```powershell
+$uri = "https://github.com/yeunlee1/token-deck/releases/latest/download/latest.json"
+$response = Invoke-WebRequest -Uri $uri -MaximumRedirection 10
+if ($response.StatusCode -ne 200) { throw "latest.json HTTP 상태가 $($response.StatusCode)입니다." }
+($response.Content | ConvertFrom-Json).version
+```
+
+`404`가 나오면 초안만 만들어졌거나, 판올림이 아직 게시되지 않았거나, 게시한 판올림이 최신 판올림으로 지정되지 않은 상태입니다. `latest.json`의 자산 이름도 정확한지 함께 확인합니다.
+
+워크플로는 실수로 검증 전 업데이트가 배포되지 않도록 초안만 만듭니다. GitHub의 `latest` 주소는 초안 판올림을 제공하지 않으므로 게시 전에는 사용자에게 노출되지 않습니다. 앱은 업데이트 확인 오류에 HTTP 404가 명시된 경우에만 메타데이터 부재로 처리하고 다음 장주기 확인이나 네트워크 온라인 복구 때 다시 확인합니다. 상태 코드를 확인할 수 없는 범용 오류는 403·429·500 같은 장애일 수도 있으므로 404로 추정하지 않습니다.
 
 `0.3.0`은 자동 업데이트 코드와 공개키가 처음 포함된 기준 버전이므로 사용자가 설치 파일로 한 번 설치해야 합니다. 그 뒤 `0.3.1`처럼 더 높은 버전의 판올림을 게시하면 설치된 앱이 이를 감지합니다.
 

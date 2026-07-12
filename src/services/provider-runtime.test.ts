@@ -13,7 +13,9 @@ describe("provider runtime", () => {
     const first = providerRecordsToUsageEvents([record], "device-1")[0];
     const second = providerRecordsToUsageEvents([record], "device-1")[0];
     expect(first.eventId).toBe(second.eventId);
-    expect(first).toEqual(expect.objectContaining({ source: "provider_api", deviceId: ACCOUNT_PROVIDER_DEVICE_ID, projectId: "project-1", inputTokens: 10, outputTokens: 3 }));
+    expect(first).toEqual(expect.objectContaining({ source: "provider_api", deviceId: ACCOUNT_PROVIDER_DEVICE_ID, inputTokens: 10, outputTokens: 3 }));
+    expect(first.projectId).toMatch(/^provider_[0-9a-f]{64}$/);
+    expect(first.projectId).not.toContain("project-1");
   });
 
   it("같은 일별 버킷의 누적값이 바뀌어도 기존 이벤트를 갱신한다", () => {
@@ -31,10 +33,12 @@ describe("provider runtime", () => {
 
   it("저장된 자격 증명과 주입된 HTTP 클라이언트로 공급사 사용량을 조회한다", async () => {
     const request = async () => new Response(JSON.stringify({ data: [{ start_time: 1783728000, results: [{ project_id: "p1", input_tokens: 7, output_tokens: 2 }] }] }), { status: 200 });
+    const secretLoader = async (_provider: "openai" | "anthropic" | "google", owner: string) => owner === "scope\nuser-a" ? JSON.stringify({ adminApiKey: "secret" }) : undefined;
     const records = await fetchStoredProviderUsage(
       "openai",
+      "scope\nuser-a",
       { startTime: new Date("2026-07-10T00:00:00Z"), endTime: new Date("2026-07-11T00:00:00Z") },
-      async () => JSON.stringify({ adminApiKey: "secret" }),
+      secretLoader,
       request as typeof fetch,
     );
     expect(records).toEqual([expect.objectContaining({ provider: "openai", projectRef: "p1", inputTokens: 7, outputTokens: 2 })]);

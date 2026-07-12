@@ -41,8 +41,9 @@ export function isSupabasePublicKey(value: unknown): boolean {
   if (typeof value !== "string") return false;
   const key = value.trim();
   if (!key || key.startsWith("sb_secret_")) return false;
+  if (key.startsWith("sb_publishable_")) return true;
   const role = jwtRole(key);
-  return role !== "service_role";
+  return role === "anon";
 }
 
 export class SupabaseRestClient {

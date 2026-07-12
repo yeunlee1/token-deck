@@ -2,7 +2,9 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   executeUpdateFlow,
+  isMissingUpdateMetadataError,
   runAppUpdateFlow,
+  UpdateCheckError,
   type AppUpdatePhase,
   type UpdateAdapter,
   type UpdateHandle,
@@ -25,6 +27,26 @@ function updateHandle(): UpdateHandle {
 }
 
 describe("app updater flow", () => {
+  it("확인 오류에 명시된 실제 HTTP 404만 업데이트 메타데이터 부재로 구분한다", () => {
+    expect(isMissingUpdateMetadataError(new UpdateCheckError("요청 상태 코드 404"))).toBe(true);
+    expect(isMissingUpdateMetadataError(new UpdateCheckError(Object.assign(new Error("릴리스 없음"), { status: 404 })))).toBe(true);
+    expect(isMissingUpdateMetadataError(new UpdateCheckError("Could not fetch a valid release JSON from the remote"))).toBe(false);
+    expect(isMissingUpdateMetadataError(new UpdateCheckError("요청 상태 코드 500"))).toBe(false);
+    expect(isMissingUpdateMetadataError(new UpdateCheckError("404번째 확인에서 실패"))).toBe(false);
+    expect(isMissingUpdateMetadataError(new Error("다운로드 파일 HTTP 404 Not Found"))).toBe(false);
+    expect(isMissingUpdateMetadataError(new Error("네트워크 연결 실패"))).toBe(false);
+  });
+
+  it("업데이트 확인 단계의 오류를 설치 오류와 구분해 전달한다", async () => {
+    const adapter: UpdateAdapter = {
+      check: vi.fn(async () => { throw new Error("요청 상태 코드 404"); }),
+      relaunch: vi.fn(),
+    };
+
+    await expect(executeUpdateFlow(adapter, { confirmUpdate: () => true }))
+      .rejects.toBeInstanceOf(UpdateCheckError);
+  });
+
   it("일반 브라우저에서는 네이티브 업데이트를 시도하지 않는다", async () => {
     await expect(runAppUpdateFlow({ confirmUpdate: () => true })).resolves.toMatchObject({ phase: "unsupported" });
   });

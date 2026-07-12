@@ -1,5 +1,6 @@
 // 로컬 수집기 이벤트를 클라우드 동기화 이벤트로 변환하는 어댑터
 import type { UsageEvent as CollectorUsageEvent } from "../core/types";
+import { stableId } from "../core/parse-utils";
 import type { UsageEvent as SyncUsageEvent, UsageSource } from "./types";
 
 const SOURCE_MAP: Record<CollectorUsageEvent["source"], UsageSource> = {
@@ -14,8 +15,8 @@ export function toSyncUsageEvent(event: CollectorUsageEvent): SyncUsageEvent {
     provider: event.provider,
     source: SOURCE_MAP[event.source],
     deviceId: event.deviceId,
-    sessionId: event.sessionId,
-    projectId: event.projectId,
+    sessionId: event.sessionId ? stableId("sync-session", event.deviceId, event.provider, event.sessionId) : undefined,
+    projectId: event.projectId ? `project_${stableId("sync-project", event.provider, event.projectId)}` : undefined,
     model: event.model,
     occurredAt: event.occurredAt,
     inputTokens: event.tokens.input,
@@ -23,7 +24,6 @@ export function toSyncUsageEvent(event: CollectorUsageEvent): SyncUsageEvent {
     outputTokens: event.tokens.output,
     reasoningTokens: event.tokens.reasoning,
     toolTokens: event.tokens.tool,
-    ...(event.requestId ? { metadata: { requestId: event.requestId } } : {}),
   };
 }
 

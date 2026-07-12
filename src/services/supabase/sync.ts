@@ -1,6 +1,7 @@
 // 기기 등록과 사용 이벤트 멱등 업서트를 담당하는 동기화 서비스
 import type { DeviceRegistration, SyncResult, UsageEvent } from "../types";
 import { SupabaseRequestError, SupabaseRestClient } from "./client";
+import { stableId } from "../../core/parse-utils";
 
 const BATCH_SIZE = 500;
 
@@ -69,34 +70,38 @@ export class UsageSyncService {
           device_id: event.deviceId,
           project_id: event.projectId ?? null,
           provider: event.provider,
-          external_id: event.sessionId,
+          external_id: id,
           started_at: current && current.started_at < event.occurredAt ? current.started_at : event.occurredAt,
           title: event.sessionTitle ?? current?.title ?? null,
         });
       }
     }
-    if (projects.size) {
+    const projectRows = [...projects.values()];
+    for (let index = 0; index < projectRows.length; index += BATCH_SIZE) {
       await this.client.call("/rest/v1/projects?on_conflict=user_id,id", {
         method: "POST",
         headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
-        body: JSON.stringify([...projects.values()]),
+        body: JSON.stringify(projectRows.slice(index, index + BATCH_SIZE)),
       });
     }
-    if (sessions.size) {
+    const sessionRows = [...sessions.values()];
+    for (let index = 0; index < sessionRows.length; index += BATCH_SIZE) {
       await this.client.call("/rest/v1/sessions?on_conflict=user_id,id", {
         method: "POST",
         headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
-        body: JSON.stringify([...sessions.values()]),
+        body: JSON.stringify(sessionRows.slice(index, index + BATCH_SIZE)),
       });
     }
   }
 
-  async listUsageEvents(): Promise<UsageEvent[]> {
+  async listUsageEvents(createdAtOrAfter?: string, excludedDeviceId?: string): Promise<UsageEvent[]> {
     if (!this.client.enabled) return [];
     const events: UsageEvent[] = [];
+    const createdAtFilter = createdAtOrAfter ? `&created_at=gte.${encodeURIComponent(createdAtOrAfter)}` : "";
+    const deviceFilter = excludedDeviceId ? `&device_id=neq.${encodeURIComponent(excludedDeviceId)}` : "";
     for (let offset = 0; ; offset += 1000) {
       const rows = await this.client.call<Array<Record<string, unknown>>>(
-        "/rest/v1/usage_events?select=event_id,provider,source,device_id,session_id,project_id,model,occurred_at,input_tokens,cached_tokens,output_tokens,reasoning_tokens,tool_tokens,session_title,metadata&order=occurred_at.asc",
+        `/rest/v1/usage_events?select=event_id,provider,source,device_id,session_id,project_id,model,occurred_at,input_tokens,cached_tokens,output_tokens,reasoning_tokens,tool_tokens,session_title,metadata,created_at${createdAtFilter}${deviceFilter}&order=created_at.asc,event_id.asc`,
         { headers: { Range: `${offset}-${offset + 999}` } },
       );
       events.push(...rows.map(fromRow));
@@ -121,11 +126,6 @@ export class UsageSyncService {
 }
 
 function toRow(event: UsageEvent): Record<string, unknown> {
-  const metadata = {
-    ...(event.metadata ?? {}),
-    ...(event.sessionId ? { externalSessionId: event.sessionId } : {}),
-    ...(event.projectId ? { externalProjectId: event.projectId } : {}),
-  };
   return {
     event_id: event.eventId,
     provider: event.provider,
@@ -141,7 +141,7 @@ function toRow(event: UsageEvent): Record<string, unknown> {
     reasoning_tokens: event.reasoningTokens,
     tool_tokens: event.toolTokens,
     session_title: event.sessionTitle ?? null,
-    metadata,
+    metadata: event.metadata ?? {},
   };
 }
 
@@ -152,10 +152,11 @@ function fromRow(row: Record<string, unknown>): UsageEvent {
     provider: row.provider as UsageEvent["provider"],
     source: row.source as UsageEvent["source"],
     deviceId: String(row.device_id),
-    sessionId: stringValue(metadata.externalSessionId) ?? stringValue(row.session_id),
-    projectId: stringValue(metadata.externalProjectId) ?? stringValue(row.project_id),
+    sessionId: stringValue(row.session_id),
+    projectId: stringValue(row.project_id),
     model: stringValue(row.model),
     occurredAt: String(row.occurred_at),
+    createdAt: stringValue(row.created_at),
     inputTokens: numberValue(row.input_tokens),
     cachedTokens: numberValue(row.cached_tokens),
     outputTokens: numberValue(row.output_tokens),
@@ -172,7 +173,7 @@ function objectValue(value: unknown): Record<string, string | number | boolean |
 function stringValue(value: unknown): string | undefined { return typeof value === "string" ? value : undefined; }
 function numberValue(value: unknown): number { return typeof value === "number" ? value : Number(value ?? 0); }
 function sessionRowId(event: Pick<UsageEvent, "deviceId" | "provider" | "sessionId">): string {
-  return `${event.deviceId}:${event.provider}:${event.sessionId}`;
+  return `session_${stableId(event.deviceId, event.provider, event.sessionId)}`;
 }
 
 function failed(error: unknown): SyncResult {

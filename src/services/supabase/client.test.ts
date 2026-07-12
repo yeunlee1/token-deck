@@ -13,8 +13,11 @@ describe("Supabase public configuration", () => {
 
   it("secret key와 service_role JWT를 클라이언트 설정에서 차단한다", () => {
     const serviceRole = jwtWithRole("service_role");
+    const anon = jwtWithRole("anon");
     expect(isSupabasePublicKey("sb_secret_server_only")).toBe(false);
+    expect(isSupabasePublicKey("plain-publishable")).toBe(false);
     expect(isSupabasePublicKey(serviceRole)).toBe(false);
+    expect(isSupabasePublicKey(anon)).toBe(true);
     expect(isSupabasePublicKey("sb_publishable_browser_safe")).toBe(true);
     expect(readSupabaseConfig({ VITE_SUPABASE_URL: "https://project.supabase.co", VITE_SUPABASE_PUBLISHABLE_KEY: serviceRole })).toBeNull();
   });

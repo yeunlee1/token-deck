@@ -14,6 +14,7 @@ export type AppUpdatePhase =
   | "unsupported"
   | "checking"
   | "current"
+  | "metadata-missing"
   | "available"
   | "declined"
   | "downloading"
@@ -55,6 +56,32 @@ export const INITIAL_APP_UPDATE_STATE: AppUpdateState = {
   totalBytes: null,
   error: null,
 };
+
+export class UpdateCheckError extends Error {
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+    this.name = "UpdateCheckError";
+  }
+}
+
+function explicitHttpStatus(error: unknown): number | null {
+  if (typeof error === "object" && error !== null) {
+    const candidate = error as { status?: unknown; statusCode?: unknown; message?: unknown };
+    for (const value of [candidate.status, candidate.statusCode]) {
+      if (typeof value === "number" && Number.isInteger(value)) return value;
+      if (typeof value === "string" && /^\d{3}$/.test(value.trim())) return Number(value);
+    }
+    if (typeof candidate.message === "string") return explicitHttpStatus(candidate.message);
+  }
+  if (typeof error !== "string") return null;
+  const match = error.match(/(?:http(?:\s+status)?|status(?:\s+code)?|상태(?:\s+코드)?)\s*[:=]?\s*(\d{3})\b/i);
+  return match ? Number(match[1]) : null;
+}
+
+export function isMissingUpdateMetadataError(error: unknown): boolean {
+  if (!(error instanceof UpdateCheckError)) return false;
+  return explicitHttpStatus(error.cause) === 404 || explicitHttpStatus(error.message) === 404;
+}
 
 const tauriAdapter: UpdateAdapter = {
   check: () => check({ timeout: 15_000 }) as Promise<Update | null>,
@@ -101,7 +128,12 @@ export async function executeUpdateFlow(
   };
 
   publish(state("checking", null));
-  const update = await adapter.check();
+  let update: UpdateHandle | null;
+  try {
+    update = await adapter.check();
+  } catch (error) {
+    throw new UpdateCheckError(error);
+  }
   if (!update) return publish(state("current", null));
 
   const info = updateInfo(update);

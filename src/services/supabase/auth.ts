@@ -16,9 +16,10 @@ export class SupabaseAuthService {
     return this.client.enabled;
   }
 
-  async sendMagicLink(email: string, redirectTo?: string): Promise<void> {
+  async sendMagicLink(email: string, redirectTo: string | undefined, codeChallenge: string): Promise<void> {
     const normalized = email.trim().toLowerCase();
     if (!normalized || !normalized.includes("@")) throw new Error("유효한 이메일 주소가 필요합니다.");
+    if (!/^[A-Za-z0-9_-]{43}$/.test(codeChallenge)) throw new Error("이메일 로그인 PKCE 검증값이 올바르지 않습니다.");
 
     const path = redirectTo
       ? `/auth/v1/otp?redirect_to=${encodeURIComponent(redirectTo)}`
@@ -28,6 +29,8 @@ export class SupabaseAuthService {
       body: JSON.stringify({
         email: normalized,
         create_user: true,
+        code_challenge: codeChallenge,
+        code_challenge_method: "s256",
       }),
     }, { auth: false });
   }
@@ -48,17 +51,16 @@ export class SupabaseAuthService {
   }
 
   async exchangeCodeForSession(authCode: string, codeVerifier: string): Promise<SupabaseSession> {
-    if (!authCode.trim()) throw new Error("Google 로그인 콜백에 인증 코드가 없습니다.");
-    if (!/^[A-Za-z0-9._~-]{43,128}$/.test(codeVerifier)) throw new Error("Google 로그인 PKCE 검증 정보를 찾을 수 없습니다. 로그인을 다시 시작해 주세요.");
+    if (!authCode.trim()) throw new Error("로그인 콜백에 인증 코드가 없습니다.");
+    if (!/^[A-Za-z0-9._~-]{43,128}$/.test(codeVerifier)) throw new Error("로그인 PKCE 검증 정보를 찾을 수 없습니다. 로그인을 다시 시작해 주세요.");
     const response = await this.client.call<AuthResponse>("/auth/v1/token?grant_type=pkce", {
       method: "POST",
       body: JSON.stringify({ auth_code: authCode, code_verifier: codeVerifier }),
     }, { auth: false });
-    const session = toSession(response);
-    this.client.setSession(session);
-    return session;
+    return toSession(response);
   }
 
+  // 기존 implicit 콜백을 해석해야 하는 호환 경로이며 클라이언트 세션은 절대 변경하지 않습니다.
   acceptRedirectUrl(url: string): SupabaseSession {
     const parsed = new URL(url);
     const values = new URLSearchParams(parsed.hash.replace(/^#/, ""));
@@ -70,7 +72,6 @@ export class SupabaseAuthService {
       refreshToken: values.get("refresh_token") ?? parsed.searchParams.get("refresh_token") ?? undefined,
       expiresAt: Number.isFinite(expiresIn) ? Math.floor(Date.now() / 1000) + expiresIn : undefined,
     };
-    this.client.setSession(session);
     return session;
   }
 
@@ -83,9 +84,12 @@ export class SupabaseAuthService {
       method: "POST",
       body: JSON.stringify({ refresh_token: refreshToken }),
     }, { auth: false });
-    const session = toSession(response);
-    this.client.setSession(session);
-    return session;
+    return toSession(response);
+  }
+
+  async signOutRemotely(): Promise<void> {
+    if (!this.client.currentSession) return;
+    await this.client.call<void>("/auth/v1/logout", { method: "POST" });
   }
 
   signOutLocally(): void {

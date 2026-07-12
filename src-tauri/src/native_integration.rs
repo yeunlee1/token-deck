@@ -6,6 +6,7 @@ use std::{
     io::{ErrorKind, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     process::Command,
+    sync::{Mutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -13,6 +14,7 @@ const AUTOSTART_VALUE_NAME: &str = "Token Deck";
 const MAX_QUOTA_SCAN_DEPTH: usize = 32;
 const MAX_QUOTA_FILES: usize = 10_000;
 const MAX_QUOTA_TAIL_BYTES: u64 = 2 * 1024 * 1024;
+static QUOTA_SCAN_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -586,8 +588,11 @@ fn claude_quota_from_file(path: &Path) -> Option<ProviderQuotaStatus> {
         .and_then(|content| serde_json::from_str(&content).ok())
 }
 
-#[tauri::command]
-pub fn quota_statuses() -> Result<Vec<ProviderQuotaStatus>, String> {
+fn quota_statuses_blocking() -> Result<Vec<ProviderQuotaStatus>, String> {
+    let _scan_guard = QUOTA_SCAN_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let home = user_home()?;
     let codex = newest_codex_quota(&home.join(".codex").join("sessions")).unwrap_or_else(|| {
         ProviderQuotaStatus {
@@ -623,6 +628,13 @@ pub fn quota_statuses() -> Result<Vec<ProviderQuotaStatus>, String> {
         updated_at: None,
     };
     Ok(vec![codex, claude, gemini])
+}
+
+#[tauri::command]
+pub async fn quota_statuses() -> Result<Vec<ProviderQuotaStatus>, String> {
+    tauri::async_runtime::spawn_blocking(quota_statuses_blocking)
+        .await
+        .map_err(|error| format!("한도 상태 수집 작업을 완료하지 못했습니다. {error}"))?
 }
 
 pub fn run_claude_statusline_capture() -> Result<(), String> {

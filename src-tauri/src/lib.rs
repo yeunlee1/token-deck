@@ -24,11 +24,15 @@ const MAX_TOTAL_SANITIZED_BYTES: usize = 64 * 1024 * 1024;
 static CREDENTIAL_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static SCAN_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+type BoundedLine = (Option<Vec<u8>>, usize, bool);
+
 #[derive(Clone, Copy, Default, Deserialize, Serialize)]
 struct ScanCursor {
     offset: u64,
     prefix_fingerprint: u64,
     created_at_nanos: u64,
+    #[serde(default)]
+    gemini_discard_offset: Option<u64>,
 }
 
 #[cfg(windows)]
@@ -47,10 +51,22 @@ pub fn run_claude_statusline_capture() -> Result<(), String> {
 }
 
 fn credential_entry(provider: &str) -> Result<keyring::Entry, String> {
-    if !matches!(provider, "openai" | "anthropic" | "google" | "supabase") {
+    if !is_supported_credential_provider(provider) {
         return Err("지원하지 않는 공급사입니다".into());
     }
     keyring::Entry::new("app.tokendeck.desktop", provider).map_err(|error| error.to_string())
+}
+
+fn is_supported_credential_provider(provider: &str) -> bool {
+    if matches!(provider, "openai" | "anthropic" | "google" | "supabase") {
+        return true;
+    }
+    let Some((base, owner_hash)) = provider.split_once(':') else {
+        return false;
+    };
+    matches!(base, "openai" | "anthropic" | "google")
+        && owner_hash.len() == 16
+        && owner_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn credential_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -182,13 +198,14 @@ fn git_config_path(directory: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_files, file_prefix_fingerprint, git_remote_from_cwd, read_log_chunk,
-        safe_git_remote, sanitized_log_records, secret_has_marker, stable_local_identifier,
-        ScanCursor, MAX_SCAN_DEPTH,
+        collect_files, file_prefix_fingerprint, git_remote_from_cwd, read_json_value_chunk,
+        read_log_chunk, safe_git_remote, sanitized_log_records, secret_has_marker,
+        stable_local_identifier, ScanCursor, MAX_RAW_BYTES_PER_FILE_PER_SCAN, MAX_SCAN_DEPTH,
     };
     use std::{
         collections::HashMap,
         fs,
+        path::Path,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -253,6 +270,223 @@ mod tests {
         assert!(!records[0].line.contains("private prompt"));
         assert!(!records[0].line.contains("gen_ai.prompt"));
         assert!(records[0].line.contains("gen_ai.usage.input_tokens"));
+    }
+
+    #[test]
+    fn gemini_wrapped_attributes_keep_only_the_expected_scalar() {
+        let line = r#"{"attributes":[{"key":"gen_ai.usage.input_tokens","value":{"intValue":"8","secret":"private prompt"}},{"key":"user.email","value":{"stringValue":"private@example.com"}},{"key":"gen_ai.input.messages","value":{"stringValue":"private source"}},{"key":"session.id","value":{"stringValue":"session-1"}}]}"#;
+        let records = sanitized_log_records("gemini", line);
+
+        assert_eq!(records.len(), 1);
+        assert!(records[0]
+            .line
+            .contains("\"gen_ai.usage.input_tokens\":\"8\""));
+        assert!(records[0].line.contains("\"session.id\":\"session-1\""));
+        for private in [
+            "private prompt",
+            "private@example.com",
+            "private source",
+            "user.email",
+        ] {
+            assert!(!records[0].line.contains(private), "leaked {private}");
+        }
+    }
+
+    fn gemini_file_exporter_records(project_dir: &Path) -> (String, String) {
+        // google-gemini/gemini-cli f354eeb의 FileLogExporter 출력 형태를 재현합니다.
+        let classic = serde_json::json!({
+            "hrTime": [1_783_728_123_u64, 456_000_000_u64],
+            "hrTimeObserved": [1_783_728_123_u64, 457_000_000_u64],
+            "body": "private response body",
+            "attributes": {
+                "event.name": "gemini_cli.api_response",
+                "event.timestamp": "2026-07-11T12:02:03.456Z",
+                "session.id": "gemini-session",
+                "prompt_id": "prompt-1",
+                "model": "gemini-2.5-pro",
+                "project_dir": project_dir.to_string_lossy(),
+                "input_token_count": 20,
+                "cached_content_token_count": 5,
+                "output_token_count": 7,
+                "thoughts_token_count": 3,
+                "tool_token_count": 2,
+                "user.email": "private@example.com",
+                "response_text": "private response"
+            },
+            "resource": { "attributes": { "user.email": "private@example.com" } }
+        });
+        let semantic = serde_json::json!({
+            "hrTime": [1_783_728_123_u64, 456_000_000_u64],
+            "body": "semantic private response",
+            "attributes": {
+                "event.name": "gen_ai.client.inference.operation.details",
+                "event.timestamp": "2026-07-11T12:02:03.456Z",
+                "session.id": "gemini-session",
+                "gen_ai.response.id": "response-1",
+                "gen_ai.request.model": "gemini-2.5-pro",
+                "project_dir": project_dir.to_string_lossy(),
+                "gen_ai.usage.input_tokens": 20,
+                "gen_ai.usage.output_tokens": 7,
+                "gen_ai.input.messages": "private prompt",
+                "gen_ai.output.messages": "private response"
+            }
+        });
+        (
+            serde_json::to_string_pretty(&classic).unwrap(),
+            serde_json::to_string_pretty(&semantic).unwrap(),
+        )
+    }
+
+    #[test]
+    fn gemini_pretty_json_cursor_stays_at_the_last_complete_value() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("token-deck-gemini-stream-{unique}.log"));
+        let (classic, semantic) = gemini_file_exporter_records(Path::new("C:\\work\\repo"));
+        let partial_length = semantic.len() / 2;
+        fs::write(&path, format!("{classic}\n{}", &semantic[..partial_length])).unwrap();
+
+        let (first, first_cursor) = read_json_value_chunk(&path, 0).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first_cursor, classic.len() as u64);
+
+        let complete = format!("{classic}\n{semantic}\n");
+        fs::write(&path, &complete).unwrap();
+        let (second, second_cursor) = read_json_value_chunk(&path, first_cursor).unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second_cursor, complete.len() as u64);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn oversized_gemini_record_is_discarded_with_bounded_progress() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("token-deck-gemini-large-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("telemetry.log");
+        let oversized = serde_json::json!({
+            "body": format!(
+                "private-prompt-{}",
+                "x".repeat(MAX_RAW_BYTES_PER_FILE_PER_SCAN as usize + 1_024)
+            ),
+            "attributes": {
+                "event.name": "gemini_cli.api_response",
+                "event.timestamp": "2026-07-11T12:02:03.456Z",
+                "session.id": "oversized-session",
+                "prompt_id": "oversized-prompt",
+                "model": "gemini-2.5-pro",
+                "input_token_count": 99
+            }
+        });
+        let normal = serde_json::json!({
+            "attributes": {
+                "event.name": "gemini_cli.api_response",
+                "event.timestamp": "2026-07-11T12:02:04.456Z",
+                "session.id": "normal-session",
+                "prompt_id": "normal-prompt",
+                "model": "gemini-2.5-pro",
+                "input_token_count": 7
+            }
+        });
+        fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string_pretty(&oversized).unwrap(),
+                serde_json::to_string_pretty(&normal).unwrap()
+            ),
+        )
+        .unwrap();
+        let cursor_key = stable_local_identifier(&path.to_string_lossy());
+        let mut cursors = HashMap::new();
+        let mut output = Vec::new();
+
+        for pass in 0..3 {
+            let mut files_seen = 0;
+            let mut output_bytes = 0;
+            collect_files(
+                &root,
+                "log",
+                "gemini",
+                0,
+                &mut output,
+                0,
+                &mut files_seen,
+                &mut output_bytes,
+                &mut cursors,
+            );
+            let cursor = cursors.get(&cursor_key).unwrap();
+            if pass == 0 {
+                assert_eq!(cursor.offset, 0);
+                assert!(cursor.gemini_discard_offset.is_some());
+            } else if pass == 1 {
+                assert!(cursor.offset > 0);
+                assert!(cursor.gemini_discard_offset.is_none());
+            }
+        }
+
+        assert_eq!(output.len(), 1);
+        assert!(output[0].content.contains("normal-prompt"));
+        assert!(!output[0].content.contains("private-prompt"));
+        assert!(!output[0].content.contains("oversized-prompt"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn gemini_file_exporter_records_are_sanitized_without_private_payloads() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("token-deck-gemini-pretty-{unique}"));
+        let project = root.join("private-project");
+        fs::create_dir_all(&root).unwrap();
+        let (classic, semantic) = gemini_file_exporter_records(&project);
+        fs::write(
+            root.join("telemetry.log"),
+            format!("{classic}\n{semantic}\n"),
+        )
+        .unwrap();
+        let mut output = Vec::new();
+        let mut files_seen = 0;
+        let mut output_bytes = 0;
+        let mut cursors = HashMap::new();
+
+        collect_files(
+            &root,
+            "log",
+            "gemini",
+            0,
+            &mut output,
+            0,
+            &mut files_seen,
+            &mut output_bytes,
+            &mut cursors,
+        );
+
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].content.lines().count(), 2);
+        assert!(output[0].content.contains("input_token_count"));
+        assert!(output[0].content.contains("gen_ai.response.id"));
+        assert!(output[0].content.contains("hrTime"));
+        for private in [
+            "private@example.com",
+            "private response",
+            "private prompt",
+            "user.email",
+            "response_text",
+            "gen_ai.input.messages",
+            "gen_ai.output.messages",
+            "project_dir",
+        ] {
+            assert!(!output[0].content.contains(private), "leaked {private}");
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -385,6 +619,7 @@ mod tests {
                 offset: session_meta.len() as u64,
                 prefix_fingerprint: file_prefix_fingerprint(&path).unwrap(),
                 created_at_nanos: 0,
+                gemini_discard_offset: None,
             },
         )]);
 
@@ -428,6 +663,7 @@ mod tests {
                 offset: old.len() as u64,
                 prefix_fingerprint: file_prefix_fingerprint(&path).unwrap(),
                 created_at_nanos: 0,
+                gemini_discard_offset: None,
             },
         )]);
         let replacement = "{\"cwd\":\"C:\\\\work\\\\new-project\",\"sessionId\":\"new\",\"requestId\":\"new-request\",\"padding\":\"replacement-is-longer-than-the-old-file\",\"message\":{\"usage\":{\"input_tokens\":9}}}\n";
@@ -483,13 +719,38 @@ mod tests {
         assert!(!secret_has_marker(secret, "session-1"));
         assert!(!secret_has_marker("not-json", "session-2"));
     }
+
+    #[test]
+    fn credential_provider_allows_owned_slots_only_for_account_providers() {
+        assert!(crate::is_supported_credential_provider("openai"));
+        assert!(crate::is_supported_credential_provider(
+            "openai:0123456789abcdef"
+        ));
+        assert!(crate::is_supported_credential_provider(
+            "anthropic:abcdef0123456789"
+        ));
+        assert!(crate::is_supported_credential_provider(
+            "google:0123456789abcdef"
+        ));
+        assert!(!crate::is_supported_credential_provider(
+            "supabase:0123456789abcdef"
+        ));
+        assert!(!crate::is_supported_credential_provider("openai:not-safe"));
+        assert!(!crate::is_supported_credential_provider(
+            "openai:0123456789abcdeg"
+        ));
+    }
 }
 
 fn is_usage_line(provider: &str, line: &str) -> bool {
     match provider {
         "codex" => line.contains("\"token_count\"") || line.contains("\"session_meta\""),
         "claude" => line.contains("\"usage\""),
-        "gemini" => line.contains("token.usage") || line.contains("gen_ai.usage"),
+        "gemini" => {
+            line.contains("gen_ai.usage")
+                || line.contains("gemini_cli.api_response")
+                || line.contains("\"input_token_count\"")
+        }
         _ => false,
     }
 }
@@ -658,45 +919,147 @@ fn gemini_attribute_allowed(key: &str) -> bool {
                 | "session_id"
                 | "gemini.session_id"
                 | "gen_ai.request.id"
+                | "gen_ai.response.id"
                 | "request_id"
                 | "event.id"
+                | "prompt_id"
                 | "gen_ai.request.model"
                 | "model"
                 | "model_name"
+                | "event.name"
+                | "event.timestamp"
         )
+}
+
+fn gemini_numeric_attribute(key: &str) -> bool {
+    key.starts_with("gen_ai.usage.")
+        || matches!(
+            key,
+            "input_token_count"
+                | "input_tokens"
+                | "cached_token_count"
+                | "cached_content_token_count"
+                | "cached_tokens"
+                | "output_token_count"
+                | "output_tokens"
+                | "thoughts_token_count"
+                | "reasoning_tokens"
+                | "tool_token_count"
+                | "tool_tokens"
+        )
+}
+
+fn gemini_scalar_value(value: &serde_json::Value, numeric: bool) -> Option<&serde_json::Value> {
+    if value.is_number() || value.is_string() {
+        return Some(value);
+    }
+    let wrapped = value.as_object()?;
+    let keys: &[&str] = if numeric {
+        &["intValue", "doubleValue", "stringValue"]
+    } else {
+        &["stringValue"]
+    };
+    keys.iter().find_map(|key| wrapped.get(*key))
+}
+
+fn safe_gemini_attribute_value(key: &str, value: &serde_json::Value) -> Option<serde_json::Value> {
+    let numeric = gemini_numeric_attribute(key);
+    let value = gemini_scalar_value(value, numeric)?;
+    if numeric {
+        if value.is_number()
+            || value.as_str().is_some_and(|text| {
+                text.len() <= 32
+                    && text
+                        .parse::<f64>()
+                        .is_ok_and(|number| number.is_finite() && number >= 0.0)
+            })
+        {
+            return Some(value.clone());
+        }
+        return None;
+    }
+    value
+        .as_str()
+        .filter(|text| text.len() <= 1_024)
+        .map(|_| value.clone())
+}
+
+fn sanitized_gemini_attributes(
+    attributes: &serde_json::Value,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let mut safe = serde_json::Map::new();
+    if let Some(items) = attributes.as_array() {
+        for item in items {
+            let Some(key) = item.get("key").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if !gemini_attribute_allowed(key) {
+                continue;
+            }
+            if let Some(value) = item
+                .get("value")
+                .and_then(|value| safe_gemini_attribute_value(key, value))
+            {
+                safe.insert(key.to_owned(), value);
+            }
+        }
+    } else {
+        for (key, value) in attributes.as_object()? {
+            if !gemini_attribute_allowed(key) {
+                continue;
+            }
+            if let Some(value) = safe_gemini_attribute_value(key, value) {
+                safe.insert(key.clone(), value);
+            }
+        }
+    }
+    Some(safe)
+}
+
+fn safe_hr_time(value: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+    let parts = value?.as_array()?;
+    if parts.len() != 2
+        || parts.iter().any(|part| {
+            !part.is_number()
+                && !part
+                    .as_str()
+                    .is_some_and(|text| text.bytes().all(|byte| byte.is_ascii_digit()))
+        })
+    {
+        return None;
+    }
+    Some(serde_json::Value::Array(parts.clone()))
+}
+
+fn safe_timestamp_value(value: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+    match value? {
+        serde_json::Value::Number(number) => Some(serde_json::Value::Number(number.clone())),
+        serde_json::Value::String(text)
+            if text.len() <= 64
+                && text.bytes().all(|byte| {
+                    byte.is_ascii_digit() || matches!(byte, b'-' | b':' | b'.' | b'+' | b'T' | b'Z')
+                }) =>
+        {
+            Some(serde_json::Value::String(text.clone()))
+        }
+        _ => None,
+    }
 }
 
 fn sanitized_gemini_record(record: &serde_json::Value) -> Option<serde_json::Value> {
     let attributes = record
         .get("attributes")
         .or_else(|| record.get("attribute"))?;
-    let safe_attributes = if let Some(items) = attributes.as_array() {
-        serde_json::Value::Array(
-            items
-                .iter()
-                .filter(|item| {
-                    item.get("key")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(gemini_attribute_allowed)
-                })
-                .cloned()
-                .collect(),
-        )
-    } else {
-        serde_json::Value::Object(
-            attributes
-                .as_object()?
-                .iter()
-                .filter(|(key, _)| gemini_attribute_allowed(key))
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect(),
-        )
-    };
+    let safe_attributes = sanitized_gemini_attributes(attributes)?;
+    let timestamp = safe_timestamp_value(record.get("timestamp"))
+        .or_else(|| safe_timestamp_value(safe_attributes.get("event.timestamp")));
     Some(serde_json::json!({
-        "timeUnixNano": record.get("timeUnixNano"),
-        "observedTimeUnixNano": record.get("observedTimeUnixNano"),
-        "timestamp": record.get("timestamp"),
-        "attributes": safe_attributes
+        "timeUnixNano": safe_timestamp_value(record.get("timeUnixNano")),
+        "observedTimeUnixNano": safe_timestamp_value(record.get("observedTimeUnixNano")),
+        "hrTime": safe_hr_time(record.get("hrTime")),
+        "hrTimeObserved": safe_hr_time(record.get("hrTimeObserved")),
+        "timestamp": timestamp,
+        "attributes": safe_attributes,
     }))
 }
 
@@ -871,9 +1234,7 @@ fn save_scan_cursors(home: &Path, cursors: &HashMap<String, ScanCursor>) {
     }
 }
 
-fn read_bounded_line(
-    reader: &mut BufReader<fs::File>,
-) -> std::io::Result<Option<(Option<Vec<u8>>, usize, bool)>> {
+fn read_bounded_line(reader: &mut BufReader<fs::File>) -> std::io::Result<Option<BoundedLine>> {
     let mut bytes = Vec::new();
     let mut bytes_read = 0usize;
     let mut overflowed = false;
@@ -938,6 +1299,137 @@ fn read_log_chunk(path: &Path, requested_offset: u64) -> Option<(Vec<String>, u6
         }
     }
     Some((lines, position))
+}
+
+fn read_json_value_chunk(path: &Path, requested_offset: u64) -> Option<(Vec<String>, u64)> {
+    let mut file = fs::File::open(path).ok()?;
+    let length = file.metadata().ok()?.len();
+    let offset = requested_offset.min(length);
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    let read_limit = length
+        .saturating_sub(offset)
+        .min(MAX_RAW_BYTES_PER_FILE_PER_SCAN);
+    let mut bytes = Vec::with_capacity(read_limit as usize);
+    file.take(read_limit).read_to_end(&mut bytes).ok()?;
+
+    let mut values = serde_json::Deserializer::from_slice(&bytes).into_iter::<serde_json::Value>();
+    let mut records = Vec::new();
+    let mut complete_offset = 0usize;
+    while let Some(result) = values.next() {
+        let Ok(value) = result else {
+            break;
+        };
+        complete_offset = values.byte_offset();
+        if let Ok(serialized) = serde_json::to_string(&value) {
+            records.push(serialized);
+        }
+    }
+
+    if offset + bytes.len() as u64 == length
+        && bytes[complete_offset..].iter().all(u8::is_ascii_whitespace)
+    {
+        complete_offset = bytes.len();
+    }
+    Some((records, offset + complete_offset as u64))
+}
+
+struct ProviderChunk {
+    lines: Vec<String>,
+    next_offset: u64,
+    gemini_discard_offset: Option<u64>,
+}
+
+fn scan_gemini_discard_boundary(path: &Path, start_offset: u64) -> Option<(Option<u64>, u64)> {
+    const READ_BUFFER_BYTES: usize = 64 * 1024;
+    const BOUNDARY_OVERLAP_BYTES: u64 = 16;
+
+    let mut file = fs::File::open(path).ok()?;
+    let length = file.metadata().ok()?.len();
+    let start = start_offset.min(length);
+    let mut at_line_start = start == 0;
+    if start > 0 {
+        file.seek(SeekFrom::Start(start - 1)).ok()?;
+        let mut previous = [0_u8; 1];
+        file.read_exact(&mut previous).ok()?;
+        at_line_start = previous[0] == b'\n';
+    }
+    file.seek(SeekFrom::Start(start)).ok()?;
+
+    let mut buffer = [0_u8; READ_BUFFER_BYTES];
+    let mut scanned = 0_u64;
+    let mut closing_line = false;
+    while scanned < MAX_RAW_BYTES_PER_FILE_PER_SCAN {
+        let remaining = (MAX_RAW_BYTES_PER_FILE_PER_SCAN - scanned) as usize;
+        let read = file
+            .read(&mut buffer[..remaining.min(READ_BUFFER_BYTES)])
+            .ok()?;
+        if read == 0 {
+            break;
+        }
+        for (index, byte) in buffer[..read].iter().copied().enumerate() {
+            let absolute = start + scanned + index as u64;
+            if byte == b'\n' {
+                if closing_line {
+                    return Some((Some(absolute + 1), absolute + 1));
+                }
+                at_line_start = true;
+                closing_line = false;
+            } else if at_line_start {
+                closing_line = matches!(byte, b'}' | b']');
+                at_line_start = false;
+            } else if closing_line && !matches!(byte, b' ' | b'\t' | b'\r') {
+                closing_line = false;
+            }
+        }
+        scanned += read as u64;
+    }
+
+    let scanned_end = start + scanned;
+    if scanned_end == length && closing_line {
+        return Some((Some(length), length));
+    }
+    let next_scan = scanned_end
+        .saturating_sub(BOUNDARY_OVERLAP_BYTES)
+        .max(start);
+    Some((None, next_scan))
+}
+
+fn read_provider_chunk(
+    path: &Path,
+    requested_offset: u64,
+    provider: &str,
+    gemini_discard_offset: Option<u64>,
+) -> Option<ProviderChunk> {
+    if provider != "gemini" {
+        let (lines, next_offset) = read_log_chunk(path, requested_offset)?;
+        return Some(ProviderChunk {
+            lines,
+            next_offset,
+            gemini_discard_offset: None,
+        });
+    }
+
+    if let Some(discard_offset) = gemini_discard_offset {
+        let (boundary, next_discard_offset) = scan_gemini_discard_boundary(path, discard_offset)?;
+        return Some(ProviderChunk {
+            lines: Vec::new(),
+            next_offset: boundary.unwrap_or(requested_offset),
+            gemini_discard_offset: boundary.is_none().then_some(next_discard_offset),
+        });
+    }
+
+    let length = fs::metadata(path).ok()?.len();
+    let read_end = requested_offset
+        .saturating_add(MAX_RAW_BYTES_PER_FILE_PER_SCAN)
+        .min(length);
+    let (lines, next_offset) = read_json_value_chunk(path, requested_offset)?;
+    let oversized = lines.is_empty() && next_offset == requested_offset && read_end < length;
+    Some(ProviderChunk {
+        lines,
+        next_offset,
+        gemini_discard_offset: oversized
+            .then_some(read_end.saturating_sub(16).max(requested_offset)),
+    })
 }
 
 fn initial_log_cwd(path: &Path, provider: &str) -> Option<PathBuf> {
@@ -1066,16 +1558,22 @@ fn collect_files(
         } else {
             0
         };
+        let previous_discard_offset = (same_file && previous_offset == stored.offset)
+            .then_some(stored.gemini_discard_offset)
+            .flatten()
+            .filter(|offset| *offset <= metadata.len());
         if modified_at <= modified_since && previous_offset >= metadata.len() {
             continue;
         }
         *files_seen += 1;
-        let Some((lines, next_offset)) = read_log_chunk(&path, previous_offset) else {
+        let Some(chunk) =
+            read_provider_chunk(&path, previous_offset, provider, previous_discard_offset)
+        else {
             continue;
         };
         let default_cwd = initial_log_cwd(&path, provider);
         let mut grouped: HashMap<String, PendingLogDocument> = HashMap::new();
-        for line in lines {
+        for line in chunk.lines {
             if is_usage_line(provider, &line) {
                 for record in sanitized_log_records(provider, &line) {
                     let cwd = if provider == "gemini" {
@@ -1099,9 +1597,10 @@ fn collect_files(
         cursors.insert(
             cursor_key.clone(),
             ScanCursor {
-                offset: next_offset,
+                offset: chunk.next_offset,
                 prefix_fingerprint,
                 created_at_nanos,
+                gemini_discard_offset: chunk.gemini_discard_offset,
             },
         );
         for (project_id, pending) in grouped {
@@ -1115,6 +1614,7 @@ fn collect_files(
                         offset: previous_offset,
                         prefix_fingerprint,
                         created_at_nanos,
+                        gemini_discard_offset: previous_discard_offset,
                     },
                 );
                 return;
@@ -1133,8 +1633,7 @@ fn collect_files(
     }
 }
 
-#[tauri::command]
-fn scan_local_usage(modified_since: Option<u64>) -> Vec<LogDocument> {
+fn scan_local_usage_blocking(modified_since: Option<u64>) -> Vec<LogDocument> {
     let _scan_guard = SCAN_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -1188,6 +1687,13 @@ fn scan_local_usage(modified_since: Option<u64>) -> Vec<LogDocument> {
     save_scan_cursors(&home, &cursors);
     documents.sort_by_key(|document| std::cmp::Reverse(document.modified_at));
     documents
+}
+
+#[tauri::command]
+async fn scan_local_usage(modified_since: Option<u64>) -> Result<Vec<LogDocument>, String> {
+    tauri::async_runtime::spawn_blocking(move || scan_local_usage_blocking(modified_since))
+        .await
+        .map_err(|error| format!("로컬 사용량 수집 작업을 완료하지 못했습니다. {error}"))
 }
 
 #[tauri::command]

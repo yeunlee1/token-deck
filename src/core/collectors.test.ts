@@ -109,4 +109,135 @@ describe("Gemini OTel collector", () => {
     expect(parseGeminiOtel(payload, context, state)).toEqual([]);
     expect(JSON.stringify(events)).not.toContain("private prompt");
   });
+
+  it("reads the classic FileLogExporter record as the complete token authority", () => {
+    const classic = {
+      hrTime: [1_783_771_323, 456_000_000],
+      body: "private response body",
+      attributes: {
+        "event.name": "gemini_cli.api_response",
+        "event.timestamp": "2026-07-11T12:02:03.456Z",
+        "session.id": "gemini-file-session",
+        prompt_id: "prompt-1",
+        model: "gemini-2.5-pro",
+        input_token_count: 20,
+        cached_content_token_count: 5,
+        output_token_count: 7,
+        thoughts_token_count: 3,
+        tool_token_count: 2,
+        "user.email": "private@example.com",
+        response_text: "private response",
+      },
+    };
+
+    const [event] = parseGeminiOtel(JSON.stringify(classic), context, createCollectorState());
+    expect(event).toMatchObject({
+      requestId: "prompt-1",
+      occurredAt: "2026-07-11T12:02:03.456Z",
+      tokens: { input: 15, cached: 5, output: 7, reasoning: 3, tool: 2 },
+    });
+    expect(JSON.stringify(event)).not.toContain("private@example.com");
+    expect(JSON.stringify(event)).not.toContain("private response");
+  });
+
+  it("uses hrTime when an event timestamp is absent and keeps the id stable across restarts", () => {
+    const record = JSON.stringify({
+      hrTime: [1_783_771_323, 456_000_000],
+      attributes: {
+        "event.name": "gemini_cli.api_response",
+        "session.id": "gemini-file-session",
+        prompt_id: "stable-prompt",
+        model: "gemini-2.5-pro",
+        input_token_count: 9,
+        output_token_count: 4,
+      },
+    });
+
+    const first = parseGeminiOtel(record, { ...context, now: () => new Date("2030-01-01T00:00:00Z") }, createCollectorState())[0];
+    const restarted = parseGeminiOtel(record, { ...context, now: () => new Date("2040-01-01T00:00:00Z") }, createCollectorState())[0];
+    expect(first.occurredAt).toBe("2026-07-11T12:02:03.456Z");
+    expect(restarted.id).toBe(first.id);
+  });
+
+  it("prefers the classic record over its semantic duplicate", () => {
+    const common = {
+      "event.timestamp": "2026-07-11T12:02:03.456Z",
+      "session.id": "gemini-file-session",
+    };
+    const classic = {
+      attributes: {
+        ...common,
+        "event.name": "gemini_cli.api_response",
+        prompt_id: "prompt-authority",
+        model: "gemini-2.5-pro",
+        input_token_count: 20,
+        cached_content_token_count: 5,
+        output_token_count: 7,
+        thoughts_token_count: 3,
+        tool_token_count: 2,
+      },
+    };
+    const semantic = {
+      attributes: {
+        ...common,
+        "event.name": "gen_ai.client.inference.operation.details",
+        "gen_ai.response.id": "response-duplicate",
+        "gen_ai.request.model": "gemini-2.5-pro",
+        "gen_ai.usage.input_tokens": 20,
+        "gen_ai.usage.output_tokens": 7,
+      },
+    };
+
+    for (const records of [[classic, semantic], [semantic, classic]]) {
+      const events = parseGeminiOtel(JSON.stringify(records), context, createCollectorState());
+      expect(events).toHaveLength(1);
+      expect(events[0].requestId).toBe("prompt-authority");
+      expect(events[0].tokens).toEqual({ input: 15, cached: 5, output: 7, reasoning: 3, tool: 2 });
+    }
+
+    const splitState = createCollectorState();
+    const [semanticFirst] = parseGeminiOtel(JSON.stringify(semantic), context, splitState);
+    const [classicLater] = parseGeminiOtel(JSON.stringify(classic), context, splitState);
+    expect(classicLater.id).toBe(semanticFirst.id);
+    expect(classicLater.tokens).toEqual({ input: 15, cached: 5, output: 7, reasoning: 3, tool: 2 });
+  });
+
+  it("does not collapse distinct responses with identical timestamps and token counts", () => {
+    const attributes = {
+      "event.name": "gemini_cli.api_response",
+      "event.timestamp": "2026-07-11T12:02:03.456Z",
+      "session.id": "gemini-file-session",
+      model: "gemini-2.5-pro",
+      input_token_count: 9,
+      output_token_count: 4,
+    };
+    const payload = JSON.stringify([
+      { attributes: { ...attributes, prompt_id: "prompt-a" } },
+      { attributes: { ...attributes, prompt_id: "prompt-b" } },
+    ]);
+
+    const events = parseGeminiOtel(payload, context, createCollectorState());
+    expect(events).toHaveLength(2);
+    expect(new Set(events.map((event) => event.id)).size).toBe(2);
+  });
+
+  it("keeps multiple API calls that share one prompt id", () => {
+    const attributes = {
+      "event.name": "gemini_cli.api_response",
+      "event.timestamp": "2026-07-11T12:02:03.456Z",
+      "session.id": "gemini-file-session",
+      prompt_id: "shared-prompt",
+      model: "gemini-2.5-pro",
+      input_token_count: 9,
+      output_token_count: 4,
+    };
+    const payload = JSON.stringify([
+      { hrTime: [1_783_771_323, 456_000_001], attributes },
+      { hrTime: [1_783_771_323, 456_000_002], attributes },
+    ]);
+
+    const events = parseGeminiOtel(payload, context, createCollectorState());
+    expect(events).toHaveLength(2);
+    expect(new Set(events.map((event) => event.id)).size).toBe(2);
+  });
 });

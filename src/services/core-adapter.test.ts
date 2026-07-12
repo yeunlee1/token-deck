@@ -1,6 +1,7 @@
 // 로컬 이벤트 변환 시 토큰 보존과 민감 정보 배제를 검증하는 테스트
 import { describe, expect, it } from "vitest";
 import type { UsageEvent as CollectorUsageEvent } from "../core/types";
+import { stableId } from "../core/parse-utils";
 import { buildUsageViews, mergeCollectorUsageEvents, mergeSessionTitles, mergeUsageWithProviderAuthority, toSyncUsageEvent } from "./core-adapter";
 
 describe("toSyncUsageEvent", () => {
@@ -16,8 +17,8 @@ describe("toSyncUsageEvent", () => {
       provider: "claude",
       source: expectedSource,
       deviceId: "device-1",
-      sessionId: "session-1",
-      projectId: "project-1",
+      sessionId: stableId("sync-session", "device-1", "claude", "session-1"),
+      projectId: `project_${stableId("sync-project", "claude", "project-1")}`,
       model: "claude-opus",
       occurredAt: "2026-07-11T00:00:00.000Z",
       inputTokens: 11,
@@ -25,11 +26,10 @@ describe("toSyncUsageEvent", () => {
       outputTokens: 5,
       reasoningTokens: 2,
       toolTokens: 1,
-      metadata: { requestId: "request-1" },
     });
   });
 
-  it("프롬프트와 로컬 경로 필드를 생성하지 않는다", () => {
+  it("프롬프트와 로컬 경로와 원본 요청 ID 필드를 생성하지 않는다", () => {
     const result = toSyncUsageEvent(localEvent("local-jsonl"));
     const serialized = JSON.stringify(result).toLowerCase();
 
@@ -37,6 +37,8 @@ describe("toSyncUsageEvent", () => {
     expect(Object.keys(result)).not.toContain("path");
     expect(serialized).not.toContain("prompt");
     expect(serialized).not.toContain("localpath");
+    expect(serialized).not.toContain("request-1");
+    expect(serialized).not.toContain("project-1");
   });
 
   it("로컬과 다른 기기 이벤트를 ID 기준으로 합치고 로컬 값을 우선한다", () => {
@@ -52,7 +54,8 @@ describe("toSyncUsageEvent", () => {
 
   it("다른 기기의 세션 제목을 기존 제목 맵에 병합한다", () => {
     const synced = toSyncUsageEvent(localEvent("local-jsonl"));
-    expect(mergeSessionTitles({ old: "기존 제목" }, [{ ...synced, sessionTitle: "원격 제목" }])).toEqual({ old: "기존 제목", "session-1": "원격 제목" });
+    expect(mergeSessionTitles({ old: "기존 제목" }, [{ ...synced, sessionTitle: "원격 제목" }]))
+      .toEqual({ old: "기존 제목", [stableId("sync-session", "device-1", "claude", "session-1")]: "원격 제목" });
   });
 
   it("공급사 API 사용량이 있으면 같은 공급사의 로컬 로그를 중복 합산하지 않는다", () => {
@@ -86,7 +89,7 @@ describe("toSyncUsageEvent", () => {
   });
 
   it("원격 세션 제목이 같으면 기존 참조를 유지해 자동 동기화 루프를 막는다", () => {
-    const current = { "session-1": "같은 제목" };
+    const current = { [stableId("sync-session", "device-1", "claude", "session-1")]: "같은 제목" };
     const synced = { ...toSyncUsageEvent(localEvent("local-jsonl")), sessionTitle: "같은 제목" };
     expect(mergeSessionTitles(current, [synced])).toBe(current);
   });
