@@ -406,7 +406,7 @@ export function useAppRuntime() {
         id: currentPhysicalDeviceId,
         name: typeof navigator !== "undefined" ? navigator.platform || "Windows 기기" : "Windows 기기",
         platform: "windows",
-        appVersion: "0.4.0",
+        appVersion: "0.4.1",
         lastSeenAt: new Date().toISOString(),
       });
       if (deviceResult.error) throw new Error(deviceResult.error);
@@ -415,7 +415,7 @@ export function useAppRuntime() {
           id: ACCOUNT_PROVIDER_DEVICE_ID,
           name: "계정 API 집계",
           platform: "account",
-          appVersion: "0.4.0",
+          appVersion: "0.4.1",
           lastSeenAt: new Date().toISOString(),
         });
         if (accountDeviceResult.error) throw new Error(accountDeviceResult.error);
@@ -732,7 +732,7 @@ function currentDevice(): DeviceRegistration {
     id: getOrCreateDeviceId(),
     name: typeof navigator !== "undefined" ? navigator.platform || "Windows 기기" : "Windows 기기",
     platform: "windows",
-    appVersion: "0.4.0",
+    appVersion: "0.4.1",
     lastSeenAt: new Date().toISOString(),
   };
 }

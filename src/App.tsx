@@ -370,7 +370,7 @@ export default function App() {
           />
         </section>
 
-        <footer><span>Token Deck <b>v0.4.0</b></span><span><i /> {usageEvents.length ? "실제 사용량 연결됨" : "수집 이벤트 대기 중"}</span><span>마지막 갱신 · {runtime.syncing ? "동기화 중" : runtime.updatedAt?.toLocaleTimeString("ko-KR") ?? "대기 중"}</span></footer>
+        <footer><span>Token Deck <b>v0.4.1</b></span><span><i /> {usageEvents.length ? "실제 사용량 연결됨" : "수집 이벤트 대기 중"}</span><span>마지막 갱신 · {runtime.syncing ? "동기화 중" : runtime.updatedAt?.toLocaleTimeString("ko-KR") ?? "대기 중"}</span></footer>
       </main>
 
       <SettingsPanel
