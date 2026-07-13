@@ -21,4 +21,11 @@ describe("OnboardingScreen", () => {
     expect(markup).toMatch(/google-login-button[^>]*disabled/);
     expect(markup).toContain("로그인 없이 로컬 전용으로 시작");
   });
+
+  it("OAuth 콜백 오류를 로그인 화면에 표시한다", () => {
+    const markup = renderToStaticMarkup(<OnboardingScreen authEnabled authError="로그인 콜백 처리에 실패했습니다." onSignInWithGoogle={vi.fn()} onSendMagicLink={vi.fn()} onContinueLocal={vi.fn()} />);
+
+    expect(markup).toContain("로그인 콜백 처리에 실패했습니다.");
+    expect(markup).toContain('onboarding-message error');
+  });
 });

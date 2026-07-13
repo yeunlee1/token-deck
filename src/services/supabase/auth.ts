@@ -23,7 +23,7 @@ export class SupabaseAuthService {
   async ensureGoogleProviderEnabled(): Promise<void> {
     const settings = await this.client.call<AuthSettingsResponse>("/auth/v1/settings", {
       method: "GET",
-    }, { auth: false });
+    }, { auth: false, includeErrorDetail: true });
     if (settings.external?.google !== true) {
       throw new Error("현재 동기화 서버에서 Google 로그인이 활성화되지 않았습니다. 이메일 로그인 또는 로컬 전용 모드를 이용해 주세요.");
     }
@@ -45,7 +45,7 @@ export class SupabaseAuthService {
         code_challenge: codeChallenge,
         code_challenge_method: "s256",
       }),
-    }, { auth: false });
+    }, { auth: false, includeErrorDetail: true });
   }
 
   createGoogleOAuthUrl(redirectTo: string, codeChallenge: string): string {
@@ -69,7 +69,7 @@ export class SupabaseAuthService {
     const response = await this.client.call<AuthResponse>("/auth/v1/token?grant_type=pkce", {
       method: "POST",
       body: JSON.stringify({ auth_code: authCode, code_verifier: codeVerifier }),
-    }, { auth: false });
+    }, { auth: false, includeErrorDetail: true });
     return toSession(response);
   }
 
@@ -96,7 +96,7 @@ export class SupabaseAuthService {
     const response = await this.client.call<AuthResponse>("/auth/v1/token?grant_type=refresh_token", {
       method: "POST",
       body: JSON.stringify({ refresh_token: refreshToken }),
-    }, { auth: false });
+    }, { auth: false, includeErrorDetail: true });
     return toSession(response);
   }
 

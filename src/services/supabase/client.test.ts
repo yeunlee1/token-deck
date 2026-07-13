@@ -31,6 +31,17 @@ describe("Supabase public configuration", () => {
 
     await expect(client.call("/auth/v1/settings", { method: "GET" }, { auth: false })).resolves.toEqual({});
   });
+
+  it("Supabase 오류 응답의 안전한 설명을 사용자 오류에 포함한다", async () => {
+    const request = vi.fn(() => Promise.resolve(new Response(JSON.stringify({
+      error_code: "bad_code_verifier",
+      msg: "PKCE code verifier does not match",
+    }), { status: 400 }))) as unknown as typeof fetch;
+    const client = new SupabaseRestClient({ url: "https://project.supabase.co", anonKey: "sb_publishable_test" }, request);
+
+    await expect(client.call("/auth/v1/token", { method: "POST" }, { auth: false, includeErrorDetail: true }))
+      .rejects.toThrow("Supabase 요청 실패 (400). PKCE code verifier does not match");
+  });
 });
 
 function jwtWithRole(role: string): string {

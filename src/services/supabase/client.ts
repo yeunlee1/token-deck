@@ -69,7 +69,7 @@ export class SupabaseRestClient {
   async call<T>(
     path: string,
     init: RequestInit = {},
-    options: { auth?: boolean } = {},
+    options: { auth?: boolean; includeErrorDetail?: boolean } = {},
   ): Promise<T> {
     if (!this.config) {
       throw new SupabaseRequestError("Supabase 동기화가 설정되지 않았습니다.", 0);
@@ -89,7 +89,9 @@ export class SupabaseRestClient {
     const text = await response.text();
     const body = text ? safeJson(text) : undefined;
     if (!response.ok) {
-      throw new SupabaseRequestError(`Supabase 요청 실패 (${response.status})`, response.status, body);
+      const detail = options.includeErrorDetail ? responseErrorDetail(body) : undefined;
+      const suffix = detail ? `. ${detail}` : "";
+      throw new SupabaseRequestError(`Supabase 요청 실패 (${response.status})${suffix}`, response.status, body);
     }
     return body as T;
   }
@@ -101,6 +103,17 @@ function safeJson(value: string): unknown {
   } catch {
     return value;
   }
+}
+
+function responseErrorDetail(body: unknown): string | undefined {
+  if (typeof body === "string") return body.trim().slice(0, 240) || undefined;
+  if (!body || typeof body !== "object") return undefined;
+  const response = body as Record<string, unknown>;
+  for (const key of ["msg", "message", "error_description", "error"]) {
+    const value = response[key];
+    if (typeof value === "string" && value.trim()) return value.trim().slice(0, 240);
+  }
+  return undefined;
 }
 
 function jwtRole(value: string): string | undefined {

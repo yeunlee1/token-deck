@@ -212,8 +212,11 @@ export function useAppRuntime() {
     const restore = async () => {
       try {
         const saved = await loadStoredSession(sessionScope(client.config));
-        if (!saved?.accessToken) return;
-        const session = saved.expiresAt && saved.expiresAt <= Math.floor(Date.now() / 1000) + 30 && saved.refreshToken
+        if (!saved?.accessToken && !saved?.refreshToken) return;
+        const session = saved.refreshToken && (
+          !saved.accessToken
+          || Boolean(saved.expiresAt && saved.expiresAt <= Math.floor(Date.now() / 1000) + 30)
+        )
           ? await authService.refresh(saved.refreshToken)
           : saved;
         if (cancelled || generation !== accountGenerationRef.current) return;
@@ -230,6 +233,7 @@ export function useAppRuntime() {
 
   const sendMagicLink = useCallback(async (email: string, redirectTo?: string) => {
     if (!client.enabled) throw new Error("Supabase 환경 설정이 없어 로컬 전용 모드입니다.");
+    setAuth((current) => ({ ...current, error: undefined }));
     authAttemptGenerationRef.current += 1;
     const state = crypto.randomUUID();
     const { verifier, challenge } = await createPkcePair();
@@ -246,6 +250,7 @@ export function useAppRuntime() {
 
   const signInWithGoogle = useCallback(async () => {
     if (!client.enabled) throw new Error("Supabase 환경 설정이 없어 로컬 전용 모드입니다.");
+    setAuth((current) => ({ ...current, error: undefined }));
     await authService.ensureGoogleProviderEnabled();
     authAttemptGenerationRef.current += 1;
     const state = crypto.randomUUID();
@@ -766,7 +771,7 @@ async function persistSession(session: SupabaseSession, scope?: string): Promise
   if (!scope) throw new Error("Supabase 세션을 저장할 서버 설정이 없습니다.");
   const marker = crypto.randomUUID();
   try {
-    await storeProviderSecret("supabase", JSON.stringify({ scope, session, marker }));
+    await storeProviderSecret("supabase", JSON.stringify({ scope, session: compactSessionForStorage(session), marker }));
   } catch (cause) {
     markSessionTombstone(scope);
     await removeProviderSecretIfMarker("supabase", marker).catch(() => undefined);
@@ -774,6 +779,11 @@ async function persistSession(session: SupabaseSession, scope?: string): Promise
   }
   window.localStorage.removeItem(SESSION_KEY);
   return marker;
+}
+
+export function compactSessionForStorage(session: SupabaseSession): SupabaseSession {
+  if (!session.refreshToken) throw new Error("Supabase 세션에 새로고침 토큰이 없어 안전하게 저장할 수 없습니다.");
+  return { accessToken: "", refreshToken: session.refreshToken, userId: session.userId };
 }
 
 async function removePersistedSession(marker: string): Promise<void> {
@@ -790,7 +800,7 @@ export async function loadStoredSession(
   if (secure) {
     try {
       const parsed = JSON.parse(secure) as { scope?: string; session?: SupabaseSession };
-      if (parsed.scope === scope && parsed.session?.accessToken) return parsed.session;
+      if (parsed.scope === scope && (parsed.session?.accessToken || parsed.session?.refreshToken)) return parsed.session;
       return null;
     } catch {
       const legacy = readJsonFromStorage<SupabaseSession | null>(storage, SESSION_KEY, null);

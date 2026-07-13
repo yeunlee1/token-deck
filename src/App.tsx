@@ -253,7 +253,7 @@ export default function App() {
   const cancelProjectNameEdit = () => { setEditingProjectId(undefined); setProjectNameDraft(""); };
   const saveProjectName = async (id: string) => { await runtime.updateProjectName(id, projectNameDraft); cancelProjectNameEdit(); };
 
-  if (!onboardingComplete && runtime.auth.status !== "authenticated") return <OnboardingScreen authEnabled={runtime.auth.enabled} onSignInWithGoogle={() => runtime.signInWithGoogle()} onSendMagicLink={(email) => runtime.sendMagicLink(email)} onContinueLocal={continueLocally} />;
+  if (!onboardingComplete && runtime.auth.status !== "authenticated") return <OnboardingScreen authEnabled={runtime.auth.enabled} authError={runtime.auth.error} onSignInWithGoogle={() => runtime.signInWithGoogle()} onSendMagicLink={(email) => runtime.sendMagicLink(email)} onContinueLocal={continueLocally} />;
 
   if (miniMode) return <MiniDashboard quotas={Object.values(providerQuotas.quotas)} providers={miniProviders} showTotal={miniTotalVisible} totalTokens={miniTotal} totalPeriod={period} updatedAt={providerQuotas.updatedAt} syncing={providerQuotas.loading || providerQuotas.busy} error={providerQuotas.error} pinned={miniPinned} onToggleProvider={(provider) => toggleProvider(provider, miniProviders, setMiniProviders, MINI_PROVIDERS_KEY)} onTogglePinned={() => void toggleMiniPinned()} onExit={() => void changeWindowMode(false)} />;
 

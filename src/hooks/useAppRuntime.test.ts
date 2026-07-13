@@ -6,6 +6,7 @@ import {
   commitSession,
   claimAccountLocalEvents,
   clearProductionSupabaseOverride,
+  compactSessionForStorage,
   createSerialTaskRunner,
   createUsageSyncCache,
   filterAccountLocalEvents,
@@ -298,6 +299,23 @@ describe("기기 설정 인벤토리 계정 격리", () => {
 });
 
 describe("로그아웃과 콜백 방어", () => {
+  it("Windows 자격 증명에는 짧은 새로고침 토큰만 저장한다", async () => {
+    const scope = "https://example.supabase.co\nsb_publishable_test";
+    const session = {
+      accessToken: "a".repeat(2_000),
+      refreshToken: "refresh-token",
+      expiresAt: 1_800_000_000,
+      userId: "user-a",
+    };
+    const compact = compactSessionForStorage(session);
+    const stored = JSON.stringify({ scope, session: compact, marker: "m".repeat(36) });
+
+    expect(compact).toEqual({ accessToken: "", refreshToken: "refresh-token", userId: "user-a" });
+    expect(stored.length * 2).toBeLessThanOrEqual(2_560);
+    await expect(loadStoredSession(scope, new MemoryStorage(), async () => stored)).resolves.toEqual(compact);
+    expect(() => compactSessionForStorage({ accessToken: "access-only" })).toThrow("새로고침 토큰");
+  });
+
   it("Credential Manager 삭제가 실패해도 tombstone이 재시작 세션 복원을 차단한다", async () => {
     const storage = new MemoryStorage();
     const scope = "https://example.supabase.co\nsb_publishable_test";

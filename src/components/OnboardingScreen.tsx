@@ -4,6 +4,7 @@ import { Icon } from "./Icon";
 
 interface OnboardingScreenProps {
   authEnabled: boolean;
+  authError?: string;
   onSignInWithGoogle: () => Promise<void> | void;
   onSendMagicLink: (email: string) => Promise<void>;
   onContinueLocal: () => void;
@@ -14,6 +15,8 @@ export function OnboardingScreen(props: OnboardingScreenProps) {
   const [pending, setPending] = useState<"google" | "email">();
   const [message, setMessage] = useState("");
   const [error, setError] = useState(false);
+  const visibleMessage = props.authError?.trim() || message;
+  const visibleError = Boolean(props.authError?.trim()) || error;
 
   async function signInWithGoogle() {
     setPending("google");
@@ -79,7 +82,7 @@ export function OnboardingScreen(props: OnboardingScreenProps) {
           <div><input id="onboarding-email" type="email" autoComplete="email" required disabled={!props.authEnabled || Boolean(pending)} value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@example.com" /><button type="submit" disabled={!props.authEnabled || Boolean(pending)}>{pending === "email" ? "전송 중…" : "로그인 링크 받기"}</button></div>
         </form>
 
-        <p className={`onboarding-message ${error ? "error" : ""}`} aria-live="polite">{message}</p>
+        <p className={`onboarding-message ${visibleError ? "error" : ""}`} aria-live="polite">{visibleMessage}</p>
 
         <button className="local-start-button" type="button" disabled={Boolean(pending)} onClick={props.onContinueLocal}>로그인 없이 로컬 전용으로 시작</button>
         <p className="onboarding-privacy"><Icon name="lock" /> 나중에 설정에서 로그인하고 동기화를 시작할 수 있습니다.</p>
