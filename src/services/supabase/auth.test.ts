@@ -5,6 +5,24 @@ import { SupabaseAuthService } from "./auth";
 import { SupabaseRestClient } from "./client";
 
 describe("SupabaseAuthService", () => {
+  it("Google 공급자가 비활성 상태면 외부 로그인 전에 명확하게 중단한다", async () => {
+    const request = vi.fn().mockResolvedValue(new Response(JSON.stringify({ external: { google: false } }), { status: 200 }));
+    const client = new SupabaseRestClient({ url: "https://example.supabase.co", anonKey: "publishable" }, request);
+
+    await expect(new SupabaseAuthService(client).ensureGoogleProviderEnabled())
+      .rejects.toThrow("현재 동기화 서버에서 Google 로그인이 활성화되지 않았습니다");
+
+    expect(request.mock.calls[0][0]).toBe("https://example.supabase.co/auth/v1/settings");
+    expect((request.mock.calls[0][1] as RequestInit).method).toBe("GET");
+  });
+
+  it("Google 공급자가 활성 상태면 로그인을 계속할 수 있다", async () => {
+    const request = vi.fn().mockResolvedValue(new Response(JSON.stringify({ external: { google: true } }), { status: 200 }));
+    const client = new SupabaseRestClient({ url: "https://example.supabase.co", anonKey: "publishable" }, request);
+
+    await expect(new SupabaseAuthService(client).ensureGoogleProviderEnabled()).resolves.toBeUndefined();
+  });
+
   it("매직링크 요청에 데스크톱 인증 딥링크를 포함한다", async () => {
     const request = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
     const client = new SupabaseRestClient({ url: "https://example.supabase.co", anonKey: "anon" }, request);

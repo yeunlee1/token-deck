@@ -9,11 +9,24 @@ interface AuthResponse {
   user?: { id?: string };
 }
 
+interface AuthSettingsResponse {
+  external?: { google?: boolean };
+}
+
 export class SupabaseAuthService {
   constructor(private readonly client: SupabaseRestClient) {}
 
   get enabled(): boolean {
     return this.client.enabled;
+  }
+
+  async ensureGoogleProviderEnabled(): Promise<void> {
+    const settings = await this.client.call<AuthSettingsResponse>("/auth/v1/settings", {
+      method: "GET",
+    }, { auth: false });
+    if (settings.external?.google !== true) {
+      throw new Error("현재 동기화 서버에서 Google 로그인이 활성화되지 않았습니다. 이메일 로그인 또는 로컬 전용 모드를 이용해 주세요.");
+    }
   }
 
   async sendMagicLink(email: string, redirectTo: string | undefined, codeChallenge: string): Promise<void> {

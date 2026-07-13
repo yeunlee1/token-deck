@@ -246,6 +246,7 @@ export function useAppRuntime() {
 
   const signInWithGoogle = useCallback(async () => {
     if (!client.enabled) throw new Error("Supabase 환경 설정이 없어 로컬 전용 모드입니다.");
+    await authService.ensureGoogleProviderEnabled();
     authAttemptGenerationRef.current += 1;
     const state = crypto.randomUUID();
     const { verifier, challenge } = await createPkcePair();

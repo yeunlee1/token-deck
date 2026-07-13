@@ -85,7 +85,7 @@ export class SupabaseRestClient {
     headers.set("Authorization", `Bearer ${token}`);
     if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
 
-    const response = await this.request(`${this.config.url}${path}`, { ...init, headers });
+    const response = await this.request.call(globalThis, `${this.config.url}${path}`, { ...init, headers });
     const text = await response.text();
     const body = text ? safeJson(text) : undefined;
     if (!response.ok) {

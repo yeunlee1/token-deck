@@ -1,6 +1,6 @@
 // 운영용 공개 키 기본값과 비밀 키 차단 규칙을 검증하는 테스트
-import { describe, expect, it } from "vitest";
-import { isSupabasePublicKey, readSupabaseConfig } from "./client";
+import { describe, expect, it, vi } from "vitest";
+import { isSupabasePublicKey, readSupabaseConfig, SupabaseRestClient } from "./client";
 
 describe("Supabase public configuration", () => {
   it("publishable key를 레거시 anon key보다 우선한다", () => {
@@ -20,6 +20,16 @@ describe("Supabase public configuration", () => {
     expect(isSupabasePublicKey(anon)).toBe(true);
     expect(isSupabasePublicKey("sb_publishable_browser_safe")).toBe(true);
     expect(readSupabaseConfig({ VITE_SUPABASE_URL: "https://project.supabase.co", VITE_SUPABASE_PUBLISHABLE_KEY: serviceRole })).toBeNull();
+  });
+
+  it("브라우저 fetch를 Window 수신자로 호출한다", async () => {
+    const request = vi.fn(function (this: unknown) {
+      if (this !== globalThis) throw new TypeError("Failed to execute 'fetch' on 'Window': Illegal invocation");
+      return Promise.resolve(new Response("{}", { status: 200 }));
+    }) as unknown as typeof fetch;
+    const client = new SupabaseRestClient({ url: "https://project.supabase.co", anonKey: "sb_publishable_test" }, request);
+
+    await expect(client.call("/auth/v1/settings", { method: "GET" }, { auth: false })).resolves.toEqual({});
   });
 });
 
