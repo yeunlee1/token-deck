@@ -2,7 +2,7 @@
 import { useMemo } from "react";
 import type { Provider } from "../core";
 import { Icon } from "./Icon";
-import { quotaStatusLabel, remainingLabel, remainingTone, type ProviderQuotaStatus } from "./quota-display";
+import { quotaStatusLabel, quotaWindowLabel, remainingTone, type ProviderQuotaStatus } from "./quota-display";
 
 interface MiniDashboardProps {
   quotas: ProviderQuotaStatus[];
@@ -38,8 +38,8 @@ export function MiniDashboard(props: MiniDashboardProps) {
       const quota = quotaByProvider.get(provider);
       return <article key={provider} className={provider}>
         <div><i /><strong>{names[provider]}</strong><small>{quotaStatusLabel(quota)}</small></div>
-        <b className={remainingTone(quota?.fiveHour ?? null)}><small>5H LEFT</small>{remainingLabel(quota?.fiveHour ?? null)}</b>
-        <b className={remainingTone(quota?.weekly ?? null)}><small>7D LEFT</small>{remainingLabel(quota?.weekly ?? null)}</b>
+        <b className={remainingTone(quota?.fiveHour ?? null)}><small>5H LEFT</small>{quotaWindowLabel(quota, "fiveHour")}</b>
+        <b className={remainingTone(quota?.weekly ?? null)}><small>7D LEFT</small>{quotaWindowLabel(quota, "weekly")}</b>
       </article>;
     })}</section>
     {props.error && <p className="mini-error" role="alert">{props.error}</p>}

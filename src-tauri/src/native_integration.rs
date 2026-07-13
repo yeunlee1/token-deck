@@ -360,21 +360,30 @@ fn quota_window(value: &Value, default_minutes: u64) -> Option<QuotaWindowStatus
 
 fn parse_codex_quota(value: &Value) -> Option<ProviderQuotaStatus> {
     let limits = value.pointer("/payload/rate_limits")?;
-    let primary = limits
-        .get("primary")
-        .and_then(|window| quota_window(window, 300));
-    let secondary = limits
-        .get("secondary")
-        .and_then(|window| quota_window(window, 10_080));
+    let mut five_hour = None;
+    let mut weekly = None;
+    for (key, default_minutes) in [("primary", 300), ("secondary", 10_080)] {
+        let Some(window) = limits
+            .get(key)
+            .and_then(|value| quota_window(value, default_minutes))
+        else {
+            continue;
+        };
+        match window.window_minutes {
+            300 => five_hour = Some(window),
+            10_080 => weekly = Some(window),
+            _ => {}
+        }
+    }
     Some(ProviderQuotaStatus {
         provider: "codex".to_owned(),
-        supported: primary.is_some() || secondary.is_some(),
+        supported: five_hour.is_some() || weekly.is_some(),
         plan_type: limits
             .get("plan_type")
             .and_then(Value::as_str)
             .map(str::to_owned),
-        five_hour: primary.filter(|window| window.window_minutes == 300),
-        weekly: secondary.filter(|window| window.window_minutes == 10_080),
+        five_hour,
+        weekly,
         daily: None,
         message: None,
         updated_at: None,
@@ -777,6 +786,42 @@ mod tests {
         assert_eq!(quota.plan_type.as_deref(), Some("pro"));
         assert_eq!(quota.five_hour.unwrap().remaining_percent, 94.0);
         assert_eq!(quota.weekly.unwrap().remaining_percent, 92.0);
+    }
+
+    #[test]
+    fn codex_jsonl_weekly_only_primary_window_remains_visible() {
+        let value = json!({
+            "timestamp": "2026-07-13T07:00:00.000Z",
+            "payload": {
+                "type": "token_count",
+                "rate_limits": {
+                    "primary": { "used_percent": 19.0, "window_minutes": 10080, "resets_at": 1784505600 },
+                    "secondary": null,
+                    "plan_type": "pro"
+                }
+            }
+        });
+        let quota = parse_codex_quota(&value).unwrap();
+
+        assert!(quota.supported);
+        assert!(quota.five_hour.is_none());
+        assert_eq!(quota.weekly.unwrap().remaining_percent, 81.0);
+    }
+
+    #[test]
+    fn codex_jsonl_windows_are_classified_by_duration_not_position() {
+        let value = json!({
+            "payload": {
+                "rate_limits": {
+                    "primary": { "used_percent": 12.0, "window_minutes": 10080 },
+                    "secondary": { "used_percent": 35.0, "window_minutes": 300 }
+                }
+            }
+        });
+        let quota = parse_codex_quota(&value).unwrap();
+
+        assert_eq!(quota.five_hour.unwrap().remaining_percent, 65.0);
+        assert_eq!(quota.weekly.unwrap().remaining_percent, 88.0);
     }
 
     #[test]

@@ -24,6 +24,12 @@ export function remainingLabel(window: QuotaWindowStatus | null): string {
   return `${Math.round(Math.max(0, Math.min(100, window.remainingPercent)))}%`;
 }
 
+export function quotaWindowLabel(quota: ProviderQuotaStatus | undefined, window: "fiveHour" | "weekly"): string {
+  const value = quota?.[window] ?? null;
+  if (value) return remainingLabel(value);
+  return quota?.supported ? "현재 미제공" : "—";
+}
+
 export function remainingTone(window: QuotaWindowStatus | null): "unknown" | "safe" | "watch" | "low" {
   if (!window) return "unknown";
   if (window.remainingPercent <= 20) return "low";

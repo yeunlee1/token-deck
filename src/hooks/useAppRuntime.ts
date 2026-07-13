@@ -538,7 +538,7 @@ export function useAppRuntime() {
           id: ACCOUNT_PROVIDER_DEVICE_ID,
           name: "계정 API 집계",
           platform: "account",
-          appVersion: "0.5.0",
+          appVersion: "0.5.1",
           lastSeenAt: new Date().toISOString(),
         });
         if (!activeAccountIsCurrent()) return;
@@ -875,7 +875,7 @@ function currentDevice(info: CurrentDeviceInfo = fallbackCurrentDeviceInfo()): D
     id: getOrCreateDeviceId(),
     name: info.name,
     platform: info.platform,
-    appVersion: "0.5.0",
+    appVersion: "0.5.1",
     lastSeenAt: new Date().toISOString(),
   };
 }

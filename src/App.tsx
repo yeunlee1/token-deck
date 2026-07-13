@@ -10,7 +10,7 @@ import { ONBOARDING_COMPLETE_KEY, prepareLoginScreen } from "./components/onboar
 import { ProjectNameEditor } from "./components/ProjectNameEditor";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { UsageChart } from "./components/UsageChart";
-import { quotaStatusLabel, remainingLabel, remainingTone } from "./components/quota-display";
+import { quotaStatusLabel, quotaWindowLabel, remainingTone } from "./components/quota-display";
 import { tokenTotal, type Provider, type UsageEvent } from "./core";
 import { buildAccountUsageMatrix } from "./core/account-usage";
 import { useAutoUpdater } from "./hooks/useAutoUpdater";
@@ -365,7 +365,7 @@ export default function App() {
             <article className={`provider-card ${provider.tone}`} key={provider.name}>
               <div className="provider-heading"><span className="provider-logo">{provider.monogram}</span><div><h3>{provider.name}</h3><p>{provider.model}</p></div><span className="provider-delta">{quotaStatusLabel(provider.quota)}</span></div>
               <strong className="provider-value">{provider.value}</strong><span className="provider-unit">tokens</span>
-              <div className="provider-windows"><div className={remainingTone(provider.quota.fiveHour)}><span>5시간 한도 잔여</span><strong>{remainingLabel(provider.quota.fiveHour)}</strong></div><div className={remainingTone(provider.quota.weekly)}><span>주간 한도 잔여</span><strong>{remainingLabel(provider.quota.weekly)}</strong></div></div>
+              <div className="provider-windows"><div className={remainingTone(provider.quota.fiveHour)}><span>5시간 한도 잔여</span><strong>{quotaWindowLabel(provider.quota, "fiveHour")}</strong></div><div className={remainingTone(provider.quota.weekly)}><span>주간 한도 잔여</span><strong>{quotaWindowLabel(provider.quota, "weekly")}</strong></div></div>
               <div className="meter" aria-label={`${provider.name}의 선택 기간 내 비중 ${provider.percent}%`}><i style={{ width: `${provider.percent}%` }} /></div>
               <div className="meter-label"><span>기간 내 비중</span><strong>{provider.percent}%</strong></div>
             </article>
@@ -451,7 +451,7 @@ export default function App() {
           />
         </section>
 
-        <footer><span>Token Deck <b>v0.5.0</b></span><span><i /> {usageEvents.length ? "실제 사용량 연결됨" : "수집 이벤트 대기 중"}</span><span>마지막 갱신 · {runtime.syncing ? "동기화 중" : runtime.updatedAt?.toLocaleTimeString("ko-KR") ?? "대기 중"}</span></footer>
+        <footer><span>Token Deck <b>v0.5.1</b></span><span><i /> {usageEvents.length ? "실제 사용량 연결됨" : "수집 이벤트 대기 중"}</span><span>마지막 갱신 · {runtime.syncing ? "동기화 중" : runtime.updatedAt?.toLocaleTimeString("ko-KR") ?? "대기 중"}</span></footer>
       </main>
 
       <SettingsPanel

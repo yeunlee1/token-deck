@@ -2,7 +2,7 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 import { MiniDashboard } from "./MiniDashboard";
-import { quotaStatusLabel, remainingLabel, type ProviderQuotaStatus } from "./quota-display";
+import { quotaStatusLabel, quotaWindowLabel, remainingLabel, type ProviderQuotaStatus } from "./quota-display";
 
 const quota: ProviderQuotaStatus = {
   provider: "codex",
@@ -39,5 +39,14 @@ describe("mini quota display", () => {
 
     expect(markup).not.toContain("7일 TOTAL");
     expect(markup).not.toContain("총 토큰 12,345");
+  });
+
+  it("최신 Codex 이벤트가 주간 창만 주면 5시간 미제공과 주간 잔여량을 표시한다", () => {
+    const weeklyOnly = { ...quota, fiveHour: null, weekly: { usedPercent: 19, remainingPercent: 81, windowMinutes: 10_080, resetsAt: null } };
+    const markup = renderToStaticMarkup(<MiniDashboard quotas={[weeklyOnly]} providers={["codex"]} showTotal={false} totalTokens={0} totalPeriod="7일" syncing={false} pinned={false} onToggleProvider={vi.fn()} onTogglePinned={vi.fn()} onExit={vi.fn()} />);
+
+    expect(quotaWindowLabel(weeklyOnly, "fiveHour")).toBe("현재 미제공");
+    expect(markup).toContain("현재 미제공");
+    expect(markup).toContain("81%");
   });
 });
