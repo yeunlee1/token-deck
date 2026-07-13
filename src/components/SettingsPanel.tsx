@@ -231,9 +231,9 @@ export function SettingsPanel(props: SettingsPanelProps) {
             <div className="provider-visibility provider-collection" role="group" aria-label="사용량과 잔여 한도를 수집할 AI 서비스">{collectionOptions.map((option) => {
               const enabled = props.enabledProviders.includes(option.provider);
               const required = enabled && props.enabledProviders.length === 1;
-              return <button key={option.provider} type="button" aria-pressed={enabled} aria-describedby="collection-rule" disabled={required} onClick={() => props.onToggleProvider(option.provider)}><span className={`project-dot ${option.provider === "claude" ? "lime" : option.provider === "gemini" ? "violet" : "ink"}`} /><span><strong>{option.label}</strong><small>{option.detail}</small></span><em>{enabled ? "수집 중" : "수집 안 함"}</em></button>;
+              return <button key={option.provider} type="button" aria-pressed={enabled} aria-disabled={required} aria-describedby="collection-rule" onClick={() => { if (!required) props.onToggleProvider(option.provider); }}><span className={`project-dot ${option.provider === "claude" ? "lime" : option.provider === "gemini" ? "violet" : "ink"}`} /><span><strong>{option.label}</strong><small>{option.detail}</small></span><em>{enabled ? "수집 중" : "수집 안 함"}</em></button>;
             })}</div>
-            <p className="setting-hint" id="collection-rule">최소 한 개는 항상 활성화됩니다. 선택한 서비스만 새 로컬 로그와 잔여 한도를 읽고 계정에 동기화하며, 해제해도 원본 로그와 기존 기록은 삭제하지 않습니다.</p>
+            <p className="setting-hint" id="collection-rule">최소 한 개는 항상 활성화됩니다. 선택한 서비스만 새 로컬 로그와 잔여 한도를 읽고 계정에 동기화하며, 해제해도 원본 로그와 기존 기록은 삭제하지 않습니다. Gemini CLI에서 이미 활성화한 로컬 telemetry 생성은 유지되지만 Token Deck은 Gemini 해제 중 해당 파일을 읽거나 동기화하지 않습니다.</p>
             <div className="setting-toggle-row"><div><strong>미니모드 총 토큰</strong><small>미니모드에서 선택한 공급사의 {props.miniTotalPeriod} 사용량 합계를 표시합니다.</small></div><button className={`toggle setting-switch ${props.miniTotalVisible ? "on" : ""}`} type="button" role="switch" aria-checked={props.miniTotalVisible} aria-label="미니모드 총 토큰 표시" onClick={props.onToggleMiniTotal}><span /></button></div>
           </section>
 

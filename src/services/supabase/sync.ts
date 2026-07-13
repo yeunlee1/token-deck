@@ -28,6 +28,10 @@ export interface SyncedProject {
   createdAt?: string;
 }
 
+export interface UsageSyncOptions {
+  shouldContinue?: () => boolean;
+}
+
 export class UsageSyncService {
   constructor(private readonly client: SupabaseRestClient) {}
 
@@ -54,14 +58,20 @@ export class UsageSyncService {
   async upsertUsageEvents(
     events: UsageEvent[],
     projectNames: Readonly<Record<string, string | undefined>> = {},
+    options: UsageSyncOptions = {},
   ): Promise<SyncResult> {
     if (!this.client.enabled) return { uploaded: 0, disabled: true };
     if (events.length === 0) return { uploaded: 0, disabled: false };
+    const shouldContinue = options.shouldContinue ?? (() => true);
+    if (!shouldContinue()) return { uploaded: 0, disabled: false };
 
     let uploaded = 0;
     try {
-      await this.upsertReferences(events, projectNames);
+      if (!await this.upsertReferences(events, projectNames, shouldContinue)) {
+        return { uploaded, disabled: false };
+      }
       for (let index = 0; index < events.length; index += BATCH_SIZE) {
+        if (!shouldContinue()) return { uploaded, disabled: false };
         const batch = events.slice(index, index + BATCH_SIZE).map(toRow);
         await this.client.call("/rest/v1/usage_events?on_conflict=user_id,event_id", {
           method: "POST",
@@ -79,7 +89,8 @@ export class UsageSyncService {
   private async upsertReferences(
     events: UsageEvent[],
     projectNames: Readonly<Record<string, string | undefined>>,
-  ): Promise<void> {
+    shouldContinue: () => boolean,
+  ): Promise<boolean> {
     const projects = new Map<string, {
       id: string;
       name: string;
@@ -112,15 +123,17 @@ export class UsageSyncService {
       }
     }
     const projectRows = [...projects.values()];
-    await this.insertProjectRows(projectRows);
+    if (!await this.insertProjectRows(projectRows, shouldContinue)) return false;
     const sessionRows = [...sessions.values()];
     for (let index = 0; index < sessionRows.length; index += BATCH_SIZE) {
+      if (!shouldContinue()) return false;
       await this.client.call("/rest/v1/sessions?on_conflict=user_id,id", {
         method: "POST",
         headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
         body: JSON.stringify(sessionRows.slice(index, index + BATCH_SIZE)),
       });
     }
+    return true;
   }
 
   private async insertProjectRows(
@@ -130,24 +143,36 @@ export class UsageSyncService {
       git_remote_hash: string | null;
       local_project_hash: string | null;
     }>,
-  ): Promise<void> {
+    shouldContinue: () => boolean,
+  ): Promise<boolean> {
     for (let index = 0; index < projects.length; index += BATCH_SIZE) {
+      if (!shouldContinue()) return false;
       await this.client.call("/rest/v1/projects?on_conflict=user_id,id", {
         method: "POST",
         headers: { Prefer: "resolution=ignore-duplicates,return=minimal" },
         body: JSON.stringify(projects.slice(index, index + BATCH_SIZE)),
       });
     }
+    return true;
   }
 
-  async listUsageEvents(createdAtOrAfter?: string, excludedDeviceId?: string): Promise<UsageEvent[]> {
+  async listUsageEvents(
+    createdAtOrAfter?: string,
+    excludedDeviceId?: string,
+    providers: readonly UsageEvent["provider"][] = [],
+    shouldContinue: () => boolean = () => true,
+  ): Promise<UsageEvent[]> {
     if (!this.client.enabled) return [];
     const events: UsageEvent[] = [];
     const createdAtFilter = createdAtOrAfter ? `&created_at=gte.${encodeURIComponent(createdAtOrAfter)}` : "";
     const deviceFilter = excludedDeviceId ? `&device_id=neq.${encodeURIComponent(excludedDeviceId)}` : "";
+    const providerFilter = providers.length
+      ? `&provider=in.(${[...new Set(providers)].map((provider) => encodeURIComponent(provider)).join(",")})`
+      : "";
     for (let offset = 0; ; offset += 1000) {
+      if (!shouldContinue()) break;
       const rows = await this.client.call<Array<Record<string, unknown>>>(
-        `/rest/v1/usage_events?select=event_id,provider,source,device_id,session_id,project_id,model,occurred_at,input_tokens,cached_tokens,output_tokens,reasoning_tokens,tool_tokens,session_title,metadata,created_at${createdAtFilter}${deviceFilter}&order=created_at.asc,event_id.asc`,
+        `/rest/v1/usage_events?select=event_id,provider,source,device_id,session_id,project_id,model,occurred_at,input_tokens,cached_tokens,output_tokens,reasoning_tokens,tool_tokens,session_title,metadata,created_at${createdAtFilter}${deviceFilter}${providerFilter}&order=created_at.asc,event_id.asc`,
         { headers: { Range: `${offset}-${offset + 999}` } },
       );
       events.push(...rows.map(fromRow));

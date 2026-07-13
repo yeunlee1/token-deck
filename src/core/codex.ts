@@ -3,6 +3,86 @@ import { EMPTY_TOKENS, finiteNumber, firstString, isoTimestamp, objectAt, parseJ
 import type { CollectorContext, CollectorState, TokenBreakdown, UsageEvent } from "./types";
 import { tokenTotal } from "./types";
 
+export const MAX_CODEX_CUMULATIVE_CHECKPOINTS = 50_000;
+const CODEX_RETIRED_SESSION_FILTER_BYTES = 1024 * 1024;
+const CODEX_RETIRED_SESSION_FILTER_HASHES = 8;
+
+function decodeRetiredSessionFilter(encoded = ""): Uint8Array {
+  if (!encoded) return new Uint8Array(CODEX_RETIRED_SESSION_FILTER_BYTES);
+  let binary: string;
+  try {
+    binary = atob(encoded);
+  } catch {
+    throw new Error("Codex 퇴역 세션 필터가 손상되었습니다.");
+  }
+  if (binary.length !== CODEX_RETIRED_SESSION_FILTER_BYTES) {
+    throw new Error("Codex 퇴역 세션 필터 크기가 올바르지 않습니다.");
+  }
+  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+}
+
+function encodeRetiredSessionFilter(filter: Uint8Array): string {
+  const chunks: string[] = [];
+  for (let offset = 0; offset < filter.length; offset += 32_768) {
+    chunks.push(String.fromCharCode(...filter.subarray(offset, offset + 32_768)));
+  }
+  return btoa(chunks.join(""));
+}
+
+function retiredSessionFilterIndexes(checkpointKey: string): number[] {
+  const hash = stableId(checkpointKey);
+  const bitLength = CODEX_RETIRED_SESSION_FILTER_BYTES * 8;
+  return Array.from({ length: CODEX_RETIRED_SESSION_FILTER_HASHES }, (_, index) => (
+    Number.parseInt(hash.slice(index * 8, index * 8 + 8), 16) % bitLength
+  ));
+}
+
+function retiredSessionFilterHas(filter: Uint8Array, checkpointKey: string): boolean {
+  return retiredSessionFilterIndexes(checkpointKey).every((bit) => (
+    (filter[Math.floor(bit / 8)] & (1 << (bit % 8))) !== 0
+  ));
+}
+
+function addRetiredSessionKeys(encoded: string, checkpointKeys: string[]): string {
+  if (!checkpointKeys.length) return encoded;
+  const filter = decodeRetiredSessionFilter(encoded);
+  for (const checkpointKey of checkpointKeys) {
+    for (const bit of retiredSessionFilterIndexes(checkpointKey)) {
+      filter[Math.floor(bit / 8)] |= 1 << (bit % 8);
+    }
+  }
+  return encodeRetiredSessionFilter(filter);
+}
+
+function touchCodexCheckpoint(
+  state: CollectorState,
+  checkpointKey: string,
+  cumulative: TokenBreakdown,
+): void {
+  delete state.codexCumulative[checkpointKey];
+  state.codexCumulative[checkpointKey] = cumulative;
+}
+
+export function pruneCodexCumulativeCheckpoints(
+  state: CollectorState,
+  limit = MAX_CODEX_CUMULATIVE_CHECKPOINTS,
+): number {
+  const entries = Object.entries(state.codexCumulative);
+  const boundedLimit = Number.isFinite(limit)
+    ? Math.max(0, Math.floor(limit))
+    : MAX_CODEX_CUMULATIVE_CHECKPOINTS;
+  if (entries.length <= boundedLimit) return 0;
+
+  const retireCount = entries.length - boundedLimit;
+  const retiredKeys = entries.slice(0, retireCount).map(([checkpointKey]) => checkpointKey);
+  state.codexCumulative = Object.fromEntries(entries.slice(retireCount));
+  state.codexRetiredSessionFilter = addRetiredSessionKeys(
+    state.codexRetiredSessionFilter,
+    retiredKeys,
+  );
+  return retiredKeys.length;
+}
+
 function codexTotals(record: Record<string, unknown>): TokenBreakdown | undefined {
   const usage =
     objectAt(record, "payload", "info", "total_token_usage") ??
@@ -36,6 +116,30 @@ function deltaFromCumulative(current: TokenBreakdown, previous: TokenBreakdown):
   };
 }
 
+export function applyCodexCumulativeBaselines(
+  input: string,
+  deviceId: string,
+  state: CollectorState,
+): void {
+  for (const record of parseJsonLines(input)) {
+    const cumulative = codexTotals(record);
+    if (!cumulative) continue;
+    const sessionId = firstString(
+      valueAt(record, "payload", "session_id"),
+      record.session_id,
+      record.sessionId,
+    );
+    if (!sessionId) continue;
+    const checkpointKey = `${deviceId}:${sessionId}`;
+    const previous = state.codexCumulative[checkpointKey];
+    if (tokenTotal(cumulative) > tokenTotal(previous ?? EMPTY_TOKENS)) {
+      touchCodexCheckpoint(state, checkpointKey, cumulative);
+    } else if (previous) {
+      touchCodexCheckpoint(state, checkpointKey, previous);
+    }
+  }
+}
+
 export function parseCodexJsonl(
   input: string,
   context: CollectorContext,
@@ -43,6 +147,7 @@ export function parseCodexJsonl(
 ): UsageEvent[] {
   const events: UsageEvent[] = [];
   const fallbackNow = context.now?.() ?? new Date();
+  let retiredSessionFilter: Uint8Array | undefined;
 
   for (const record of parseJsonLines(input)) {
     const cumulative = codexTotals(record);
@@ -55,10 +160,21 @@ export function parseCodexJsonl(
       context.sessionId,
     ) ?? "unknown";
     const checkpointKey = `${context.deviceId}:${sessionId}`;
-    const previous = state.codexCumulative[checkpointKey] ?? EMPTY_TOKENS;
-    if (tokenTotal(cumulative) <= tokenTotal(previous)) continue;
+    if (!(checkpointKey in state.codexCumulative) && state.codexRetiredSessionFilter) {
+      retiredSessionFilter ??= decodeRetiredSessionFilter(state.codexRetiredSessionFilter);
+      if (retiredSessionFilterHas(retiredSessionFilter, checkpointKey)) {
+        touchCodexCheckpoint(state, checkpointKey, cumulative);
+        continue;
+      }
+    }
+    const hasCheckpoint = Object.prototype.hasOwnProperty.call(state.codexCumulative, checkpointKey);
+    const previous = hasCheckpoint ? state.codexCumulative[checkpointKey] : EMPTY_TOKENS;
+    if (tokenTotal(cumulative) <= tokenTotal(previous)) {
+      if (hasCheckpoint) touchCodexCheckpoint(state, checkpointKey, previous);
+      continue;
+    }
     const tokens = deltaFromCumulative(cumulative, previous);
-    state.codexCumulative[checkpointKey] = cumulative;
+    touchCodexCheckpoint(state, checkpointKey, cumulative);
     if (tokenTotal(tokens) === 0) continue;
 
     const occurredAt = isoTimestamp(record.timestamp ?? record.created_at, fallbackNow);

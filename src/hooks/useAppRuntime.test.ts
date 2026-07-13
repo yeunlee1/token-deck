@@ -6,20 +6,26 @@ import {
   cancelPendingAuthAttempt,
   commitSession,
   claimAccountLocalEvents,
+  clearStalePendingSession,
   clearProductionSupabaseOverride,
   compactSessionForStorage,
+  createCredentialRevisionTracker,
   createSerialTaskRunner,
   createUsageSyncCache,
   filterAccountLocalEvents,
+  flushLocalUsageAccountBoundary,
   hasInventorySyncPreference,
   loadStoredSession,
   localEventsToTitledSyncEvents,
+  localUsageOwnerHash,
   markSessionTombstone,
   markInventoryLoginConsent,
   mergeAccountProjectNames,
   mergeAccountProviderUsage,
+  migrateLocalUsageOwnership,
   providerEventsForOwner,
   providerCredentialOwner,
+  pruneLocalUsageOwnership,
   readInventorySyncPreference,
   readAccountProjectNameOverrides,
   consumeInventoryLoginConsent,
@@ -27,15 +33,25 @@ import {
   recordUploadedUsage,
   requireOneTimeAuthCode,
   resolveSupabaseConfig,
+  runCredentialMutation,
+  sealLocalUsageOwnershipBaseline,
+  selectLocalUsagePersistenceSnapshot,
+  selectRetainedLocalUsageClaimEvents,
   selectChangedUsageEvents,
   selectRemoteInventoryItems,
   settleWithin,
   shouldFullyReconcile,
+  syncProvidersForUsageProviders,
   writeInventorySyncPreference,
   writeAccountProjectNameOverrides,
 } from "./useAppRuntime";
 
 describe("account provider usage summary", () => {
+  it("선택 공급사의 로컬 이벤트와 계정 API 이벤트만 원격 조회 대상으로 만든다", () => {
+    expect(syncProvidersForUsageProviders(["codex", "gemini"]))
+      .toEqual(["codex", "openai", "gemini", "google"]);
+  });
+
   it("원격 토큰·비용을 복원하고 현재 조회값으로 같은 버킷을 갱신한다", () => {
     const token = syncEvent({ eventId: "provider_openai_deadbeef", provider: "openai", source: "provider_api", inputTokens: 10 });
     const corrected = { provider: "openai" as const, kind: "tokens" as const, occurredAt: token.occurredAt, projectRef: token.projectId, inputTokens: 20, raw: {} };
@@ -71,26 +87,81 @@ describe("account provider usage summary", () => {
 });
 
 describe("인증 세션 경쟁 조건", () => {
+  it("재시작 시 남은 전환 대기 세션 정리에 실패하면 오류를 숨기지 않는다", async () => {
+    const remove = vi.fn().mockRejectedValue(new Error("Credential Manager 삭제 실패"));
+
+    await expect(clearStalePendingSession(remove)).rejects.toThrow("삭제 실패");
+    expect(remove).toHaveBeenCalledOnce();
+  });
+
+  it("계정 전환과 로그아웃 전에 현재 계정의 미수집 사용량 경계를 완료한다", async () => {
+    const refresh = vi.fn(async () => true);
+
+    await expect(flushLocalUsageAccountBoundary("account-a", "account-b", refresh)).resolves.toBe(true);
+    await expect(flushLocalUsageAccountBoundary("account-a", undefined, refresh)).resolves.toBe(true);
+    await expect(flushLocalUsageAccountBoundary("account-a", "account-a", refresh)).resolves.toBe(true);
+
+    expect(refresh).toHaveBeenCalledTimes(2);
+  });
+
+  it("현재 계정의 사용량 경계 저장이 실패하면 계정 전환을 허용하지 않는다", async () => {
+    await expect(flushLocalUsageAccountBoundary(
+      "account-a",
+      "account-b",
+      async () => false,
+    )).resolves.toBe(false);
+  });
+
+  it("자격 증명을 교체하거나 삭제하면 이전 사용량 요청 세대를 폐기한다", () => {
+    const revisions = createCredentialRevisionTracker();
+    const openAiRequest = revisions.current("openai");
+    const claudeRequest = revisions.current("anthropic");
+
+    revisions.invalidate("openai");
+
+    expect(revisions.matches("openai", openAiRequest)).toBe(false);
+    expect(revisions.matches("anthropic", claudeRequest)).toBe(true);
+  });
+
+  it("대기 중이던 자격 증명 변경의 실행 전후에 시작된 사용량 요청을 모두 폐기한다", async () => {
+    const revisions = createCredentialRevisionTracker();
+    revisions.invalidate("openai");
+    const queuedRequest = revisions.current("openai");
+    let finishMutation!: () => void;
+    const mutation = runCredentialMutation(revisions, "openai", () => new Promise<void>((resolve) => { finishMutation = resolve; }));
+    const inFlightRequest = revisions.current("openai");
+
+    expect(revisions.matches("openai", queuedRequest)).toBe(false);
+    finishMutation();
+    await mutation;
+
+    expect(revisions.matches("openai", inFlightRequest)).toBe(false);
+  });
+
   it("자격 증명 저장이 끝나기 전에는 세션을 승인하지 않고 세대가 바뀌면 폐기한다", async () => {
     let generation = 7;
-    let finishPersist!: (marker: string) => void;
-    const persist = vi.fn(() => new Promise<string>((resolve) => { finishPersist = resolve; }));
+    let finishStage!: (marker: string) => void;
+    const stage = vi.fn(() => new Promise<string>((resolve) => { finishStage = resolve; }));
     const accept = vi.fn();
-    const discard = vi.fn().mockResolvedValue(undefined);
+    const discardPending = vi.fn().mockResolvedValue(undefined);
+    const promote = vi.fn().mockResolvedValue(undefined);
     const commit = commitSession({ accessToken: "account-a", userId: "user-a" }, generation, "scope-a", {
       currentGeneration: () => generation,
       currentScope: () => "scope-a",
-      persist,
-      discard,
+      stage,
+      discardPending,
+      promote,
+      discardPromoted: vi.fn().mockResolvedValue(undefined),
       accept,
     });
 
     expect(accept).not.toHaveBeenCalled();
     generation += 1;
-    finishPersist("marker-a");
+    finishStage("marker-a");
 
     await expect(commit).resolves.toBe(false);
-    expect(discard).toHaveBeenCalledWith("marker-a");
+    expect(discardPending).toHaveBeenCalledWith("marker-a");
+    expect(promote).not.toHaveBeenCalled();
     expect(accept).not.toHaveBeenCalled();
   });
 
@@ -99,13 +170,59 @@ describe("인증 세션 경쟁 조건", () => {
     const accepted = await commitSession({ accessToken: "account-b", userId: "user-b" }, 3, "scope-b", {
       currentGeneration: () => 3,
       currentScope: () => "scope-b",
-      persist: async () => { order.push("persist"); return "marker-b"; },
-      discard: async () => undefined,
+      stage: async () => { order.push("stage"); return "marker-b"; },
+      discardPending: async () => undefined,
+      beforeAccept: async () => { order.push("boundary"); return true; },
+      promote: async () => { order.push("promote"); },
+      discardPromoted: async () => undefined,
       accept: () => { order.push("accept"); },
     });
 
     expect(accepted).toBe(true);
-    expect(order).toEqual(["persist", "accept"]);
+    expect(order).toEqual(["stage", "boundary", "promote", "accept"]);
+  });
+
+  it("계정 경계가 실패하면 대기 세션만 버리고 기존 활성 세션을 보존한다", async () => {
+    let active = "account-a";
+    let pending: string | undefined;
+    const order: string[] = [];
+
+    const accepted = await commitSession({ accessToken: "account-b", userId: "user-b" }, 3, "scope-b", {
+      currentGeneration: () => 3,
+      currentScope: () => "scope-b",
+      stage: async () => { order.push("stage"); pending = "account-b"; return "marker-b"; },
+      discardPending: async () => { order.push("discard-pending"); pending = undefined; },
+      beforeAccept: async () => { order.push("boundary"); return false; },
+      promote: async () => { order.push("promote"); active = pending ?? active; },
+      discardPromoted: async () => { order.push("discard-promoted"); },
+      accept: () => { order.push("accept"); },
+    });
+
+    expect(accepted).toBe(false);
+    expect(active).toBe("account-a");
+    expect(pending).toBeUndefined();
+    expect(order).toEqual(["stage", "boundary", "discard-pending"]);
+  });
+
+  it("대기 세션 승격이 실패해도 기존 활성 세션을 보존하고 대기 슬롯을 정리한다", async () => {
+    let active = "account-a";
+    let pending: string | undefined;
+    const discardPending = vi.fn(async () => { pending = undefined; });
+
+    await expect(commitSession({ accessToken: "account-b", userId: "user-b" }, 3, "scope-b", {
+      currentGeneration: () => 3,
+      currentScope: () => "scope-b",
+      stage: async () => { pending = "account-b"; return "marker-b"; },
+      discardPending,
+      beforeAccept: async () => true,
+      promote: async () => { throw new Error("활성 슬롯 저장 실패"); },
+      discardPromoted: async () => { active = ""; },
+      accept: () => { active = pending ?? active; },
+    })).rejects.toThrow("활성 슬롯 저장 실패");
+
+    expect(active).toBe("account-a");
+    expect(pending).toBeUndefined();
+    expect(discardPending).toHaveBeenCalledWith("marker-b");
   });
 
   it("자격 증명 저장이 실패하면 세션을 승인하지 않는다", async () => {
@@ -114,8 +231,10 @@ describe("인증 세션 경쟁 조건", () => {
     await expect(commitSession({ accessToken: "account-c", userId: "user-c" }, 4, "scope-c", {
       currentGeneration: () => 4,
       currentScope: () => "scope-c",
-      persist: async () => { throw new Error("Credential Manager 저장 실패"); },
-      discard: async () => undefined,
+      stage: async () => { throw new Error("Credential Manager 저장 실패"); },
+      discardPending: async () => undefined,
+      promote: async () => undefined,
+      discardPromoted: async () => undefined,
       accept,
     })).rejects.toThrow("저장 실패");
 
@@ -220,26 +339,116 @@ describe("증분 계정 동기화", () => {
 });
 
 describe("계정별 로컬 사용량 격리", () => {
+  it("이전 화면 스냅샷으로 동기화해도 방금 저장한 수집 이벤트와 누적 기준점을 제거하지 않는다", () => {
+    const previous = localEvent({ id: "previous" });
+    const newest = localEvent({ id: "newest" });
+    const latestCheckpoint = {
+      "device-1:session-1": { input: 200, cached: 20, output: 10, reasoning: 2, tool: 1 },
+    };
+
+    const snapshot = selectLocalUsagePersistenceSnapshot(
+      false,
+      [previous],
+      { "device-1:session-1": { input: 100, cached: 10, output: 5, reasoning: 1, tool: 0 } },
+      "old-filter",
+      [previous, newest],
+      latestCheckpoint,
+      "latest-filter",
+    );
+
+    expect(snapshot.events).toEqual([previous, newest]);
+    expect(snapshot.codexCumulative).toBe(latestCheckpoint);
+    expect(snapshot.codexRetiredSessionFilter).toBe("latest-filter");
+    expect(selectRetainedLocalUsageClaimEvents([previous], [newest])).toEqual([]);
+  });
+
   it("처음 동기화한 계정이 로컬 세션을 소유하고 다른 계정에는 보이지 않는다", () => {
     const local = localEvent({ id: "local-a", provider: "codex", deviceId: "device-1", sessionId: "session-1" });
-    const claimedA = claimAccountLocalEvents({}, [local], "scope\nuser-a");
-    const claimedB = claimAccountLocalEvents(claimedA.ownership, [local], "scope\nuser-b");
+    const empty = { version: 1 as const, knownEventIds: [], owners: {} };
+    const ownerA = localUsageOwnerHash("https://example.supabase.co", "user-a") ?? "";
+    const ownerB = localUsageOwnerHash("https://example.supabase.co", "user-b") ?? "";
+    const claimedA = claimAccountLocalEvents(empty, [local], ownerA);
+    const claimedB = claimAccountLocalEvents(claimedA.ownership, [local], ownerB);
 
     expect(claimedA.events).toEqual([local]);
     expect(claimedB.events).toEqual([]);
-    expect(filterAccountLocalEvents([local], claimedA.ownership, "scope\nuser-a")).toEqual([local]);
-    expect(filterAccountLocalEvents([local], claimedA.ownership, "scope\nuser-b")).toEqual([]);
+    expect(filterAccountLocalEvents([local], claimedA.ownership, ownerA)).toEqual([local]);
+    expect(filterAccountLocalEvents([local], claimedA.ownership, ownerB)).toEqual([]);
+    expect(JSON.stringify(claimedA.ownership)).not.toContain("example.supabase.co");
   });
 
   it("같은 세션에서 새로 만들어진 로컬 이벤트도 현재 계정에 귀속된다", () => {
     const first = localEvent({ id: "local-a", provider: "codex", deviceId: "device-1", sessionId: "session-1" });
     const second = localEvent({ id: "local-b", provider: "codex", deviceId: "device-1", sessionId: "session-1" });
-    const claimedA = claimAccountLocalEvents({}, [first], "scope\nuser-a");
-    const claimedB = claimAccountLocalEvents(claimedA.ownership, [first, second], "scope\nuser-b");
+    const empty = { version: 1 as const, knownEventIds: [], owners: {} };
+    const ownerA = localUsageOwnerHash("https://example.supabase.co", "user-a") ?? "";
+    const ownerB = localUsageOwnerHash("https://example.supabase.co", "user-b") ?? "";
+    const claimedA = claimAccountLocalEvents(empty, [first], ownerA);
+    const claimedB = claimAccountLocalEvents(claimedA.ownership, [first, second], ownerB);
 
     expect(claimedB.events).toEqual([second]);
-    expect(filterAccountLocalEvents([first, second], claimedB.ownership, "scope\nuser-a")).toEqual([first]);
-    expect(filterAccountLocalEvents([first, second], claimedB.ownership, "scope\nuser-b")).toEqual([second]);
+    expect(filterAccountLocalEvents([first, second], claimedB.ownership, ownerA)).toEqual([first]);
+    expect(filterAccountLocalEvents([first, second], claimedB.ownership, ownerB)).toEqual([second]);
+  });
+
+  it("소유권 근거가 없는 기존 캐시는 다른 계정에 자동 귀속하지 않는다", () => {
+    const existing = localEvent({ id: "legacy-event" });
+    const migrated = migrateLocalUsageOwnership([existing], {});
+    const owner = localUsageOwnerHash("https://example.supabase.co", "user-b") ?? "";
+
+    const claim = claimAccountLocalEvents(migrated, [existing], owner);
+
+    expect(claim.events).toEqual([]);
+    expect(claim.ownership.knownEventIds).toEqual(["legacy-event"]);
+    expect(claim.ownership.owners).toEqual({});
+  });
+
+  it("앱 종료 전에 소유권 저장이 끝나지 않은 캐시도 재시작 기준선에서 차단한다", () => {
+    const persistedBeforeCrash = localEvent({ id: "crash-gap" });
+    const existingState = { version: 1 as const, knownEventIds: [], owners: {} };
+    const sealed = sealLocalUsageOwnershipBaseline(existingState, [persistedBeforeCrash]);
+    const nextAccount = localUsageOwnerHash("https://example.supabase.co", "user-b") ?? "";
+
+    const claim = claimAccountLocalEvents(sealed, [persistedBeforeCrash], nextAccount);
+
+    expect(sealed.knownEventIds).toEqual(["crash-gap"]);
+    expect(claim.events).toEqual([]);
+  });
+
+  it("캐시에서 제거된 이벤트가 다시 나타나도 다른 계정에 재귀속하지 않는다", () => {
+    const local = localEvent({ id: "evicted-event" });
+    const ownerA = localUsageOwnerHash("https://example.supabase.co", "user-a") ?? "";
+    const ownerB = localUsageOwnerHash("https://example.supabase.co", "user-b") ?? "";
+    const pruned = pruneLocalUsageOwnership({
+      version: 1,
+      knownEventIds: ["evicted-event"],
+      owners: { "evicted-event": ownerA },
+      seenFilter: "",
+    }, []);
+
+    const claim = claimAccountLocalEvents(pruned, [local], ownerB);
+
+    expect(pruned.knownEventIds).toEqual([]);
+    expect(pruned.seenFilter).not.toBe("");
+    expect(claim.events).toEqual([]);
+    expect(claim.ownership.owners).toEqual({});
+  });
+
+  it("검증 가능한 기존 장부만 짧은 계정 해시로 이전하고 보존 이벤트에 맞춰 정리한다", () => {
+    const retained = localEvent({ id: "retained" });
+    const removed = localEvent({ id: "removed" });
+    const legacyOwner = "https://example.supabase.co\nsb_publishable_old\nuser-a";
+    const migrated = migrateLocalUsageOwnership(
+      [retained, removed],
+      { retained: legacyOwner, removed: legacyOwner, ignored: "invalid" },
+    );
+
+    const pruned = pruneLocalUsageOwnership(migrated, [retained]);
+
+    expect(pruned.knownEventIds).toEqual(["retained"]);
+    expect(pruned.owners.retained).toBe(localUsageOwnerHash("https://example.supabase.co", "user-a"));
+    expect(pruned.owners.removed).toBeUndefined();
+    expect(JSON.stringify(pruned)).not.toContain("sb_publishable_old");
   });
 
   it("동기화용 해시 세션 ID로 바꿔도 제목은 원본 로컬 세션 ID에서 가져온다", () => {

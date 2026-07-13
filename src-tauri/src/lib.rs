@@ -1,7 +1,7 @@
 // 로컬 AI 도구 로그를 안전하게 읽고 트레이 창을 관리하는 Tauri 백엔드
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
@@ -20,11 +20,23 @@ mod native_integration;
 const MAX_SCAN_DEPTH: usize = 32;
 const MAX_LOG_FILES: usize = 10_000;
 const MAX_RAW_BYTES_PER_FILE_PER_SCAN: u64 = 8 * 1024 * 1024;
+const MAX_CODEX_BASELINE_TAIL_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_CODEX_SESSION_META_BYTES: u64 = 64 * 1024;
 const MAX_LOG_LINE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_TOTAL_SANITIZED_BYTES: usize = 64 * 1024 * 1024;
 const MAX_DEVICE_DISPLAY_NAME_CHARS: usize = 64;
+const MAX_DEVICE_ID_STATE_BYTES: u64 = 4 * 1024;
+const MAX_LOCAL_USAGE_CACHE_BYTES: u64 = 48 * 1024 * 1024;
+const MAX_LOCAL_USAGE_CACHE_EVENTS: usize = 50_000;
+const LOCAL_USAGE_SEEN_FILTER_BYTES: usize = 1024 * 1024;
+const LOCAL_USAGE_SEEN_FILTER_ENCODED_BYTES: usize = LOCAL_USAGE_SEEN_FILTER_BYTES.div_ceil(3) * 4;
+const MAX_LOCAL_PROJECT_CACHE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_LOCAL_PROJECT_CACHE_ENTRIES: usize = 10_000;
 static CREDENTIAL_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static DEVICE_ID_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static SCAN_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static LOCAL_USAGE_CACHE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static SCAN_TRANSACTIONS: OnceLock<Mutex<ScanTransactionState>> = OnceLock::new();
 
 type BoundedLine = (Option<Vec<u8>>, usize, bool);
 
@@ -36,17 +48,106 @@ pub enum UsageProvider {
     Gemini,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum CachedUsageSource {
+    LocalJsonl,
+    Otel,
+    ProviderApi,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct CachedTokenBreakdown {
+    input: u64,
+    cached: u64,
+    output: u64,
+    reasoning: u64,
+    tool: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CachedUsageEvent {
+    id: String,
+    provider: UsageProvider,
+    source: CachedUsageSource,
+    device_id: String,
+    session_id: String,
+    project_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    occurred_at: String,
+    tokens: CachedTokenBreakdown,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CachedUsageOwnershipState {
+    version: u8,
+    known_event_ids: Vec<String>,
+    owners: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    seen_filter: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CachedLocalUsageState {
+    version: u8,
+    events: Vec<CachedUsageEvent>,
+    ownership: CachedUsageOwnershipState,
+    #[serde(default)]
+    codex_cumulative: HashMap<String, CachedTokenBreakdown>,
+    #[serde(default)]
+    codex_retired_session_filter: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CachedLocalUsageSnapshot {
+    events: Vec<CachedUsageEvent>,
+    ownership: Option<CachedUsageOwnershipState>,
+    codex_cumulative: HashMap<String, CachedTokenBreakdown>,
+    codex_retired_session_filter: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CachedDeviceIdentity {
+    version: u8,
+    device_id: String,
+}
+
 fn provider_selected(providers: Option<&[UsageProvider]>, provider: UsageProvider) -> bool {
     providers.is_none_or(|selected| selected.contains(&provider))
 }
 
-#[derive(Clone, Copy, Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 struct ScanCursor {
     offset: u64,
     prefix_fingerprint: u64,
     created_at_nanos: u64,
     #[serde(default)]
     gemini_discard_offset: Option<u64>,
+    #[serde(default)]
+    codex_baseline: Option<String>,
+}
+
+#[derive(Clone)]
+struct PendingScanCommit {
+    home: PathBuf,
+    cursors: HashMap<String, ScanCursor>,
+    policy_revision: u64,
+}
+
+#[derive(Default)]
+struct ScanTransactionState {
+    next_token: u64,
+    policy_revisions: HashMap<PathBuf, u64>,
+    pending: HashMap<String, PendingScanCommit>,
 }
 
 #[cfg(windows)]
@@ -72,7 +173,10 @@ fn credential_entry(provider: &str) -> Result<keyring::Entry, String> {
 }
 
 fn is_supported_credential_provider(provider: &str) -> bool {
-    if matches!(provider, "openai" | "anthropic" | "google" | "supabase") {
+    if matches!(
+        provider,
+        "openai" | "anthropic" | "google" | "supabase" | "supabase-pending"
+    ) {
         return true;
     }
     let Some((base, owner_hash)) = provider.split_once(':') else {
@@ -161,6 +265,14 @@ struct LogDocument {
     git_remote: Option<String>,
     project_id: String,
     project_name: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalUsageScanResult {
+    documents: Vec<LogDocument>,
+    commit_token: String,
+    codex_baselines: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -261,15 +373,52 @@ fn git_config_path(directory: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_files, file_prefix_fingerprint, git_remote_from_cwd, provider_selected,
-        read_json_value_chunk, read_log_chunk, resolve_device_display_name, safe_git_remote,
-        sanitize_device_display_name, sanitized_log_records, secret_has_marker,
-        stable_local_identifier, ScanCursor, UsageProvider, MAX_DEVICE_DISPLAY_NAME_CHARS,
-        MAX_RAW_BYTES_PER_FILE_PER_SCAN, MAX_SCAN_DEPTH,
+        collect_files, commit_scan_cursors_blocking, file_prefix_fingerprint, git_remote_from_cwd,
+        load_local_project_names_at, load_local_usage_cache_at, load_local_usage_state_at,
+        load_or_store_device_id_at, load_scan_cursors, local_project_name_cache_path,
+        local_usage_cache_path, prime_file_cursors, prime_file_cursors_with_mode,
+        provider_selected, read_json_value_chunk, read_log_chunk, resolve_device_display_name,
+        safe_git_remote, sanitize_device_display_name, sanitized_log_records,
+        save_local_project_names_at, save_local_usage_cache_at, save_local_usage_state_at,
+        save_scan_cursors, scan_cursor_path, scan_local_usage_at, secret_has_marker,
+        stable_local_identifier, CachedTokenBreakdown, CachedUsageEvent, CachedUsageOwnershipState,
+        CachedUsageSource, ScanCursor, UsageProvider, MAX_DEVICE_DISPLAY_NAME_CHARS,
+        MAX_LOCAL_USAGE_CACHE_BYTES, MAX_LOG_FILES, MAX_RAW_BYTES_PER_FILE_PER_SCAN,
+        MAX_SCAN_DEPTH,
     };
+
+    fn cached_usage_event() -> CachedUsageEvent {
+        CachedUsageEvent {
+            id: "event-1".to_owned(),
+            provider: UsageProvider::Codex,
+            source: CachedUsageSource::LocalJsonl,
+            device_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+            session_id: "session-1".to_owned(),
+            project_id: "project-1".to_owned(),
+            model: Some("gpt-5".to_owned()),
+            occurred_at: "2026-07-14T00:00:00.000Z".to_owned(),
+            tokens: CachedTokenBreakdown {
+                input: 1,
+                cached: 2,
+                output: 3,
+                reasoning: 4,
+                tool: 5,
+            },
+            request_id: None,
+        }
+    }
+
+    fn temporary_home(label: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("token-deck-{label}-{unique}"))
+    }
     use std::{
         collections::HashMap,
         fs,
+        io::Write,
         path::Path,
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -290,6 +439,369 @@ mod tests {
         assert!(!provider_selected(Some(&selected), UsageProvider::Claude));
         assert!(provider_selected(Some(&selected), UsageProvider::Gemini));
         assert!(!provider_selected(Some(&[]), UsageProvider::Codex));
+    }
+
+    #[test]
+    fn existing_webview_device_id_is_migrated_to_durable_native_state() {
+        let home = temporary_home("device-id-migration");
+        let existing = "00000000-0000-4000-8000-000000000001";
+
+        assert_eq!(
+            load_or_store_device_id_at(&home, existing).unwrap(),
+            existing
+        );
+        assert_eq!(
+            load_or_store_device_id_at(&home, "00000000-0000-4000-8000-000000000002").unwrap(),
+            existing
+        );
+
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn native_device_id_is_recovered_after_primary_state_is_lost() {
+        let home = temporary_home("device-id-recovery");
+        let existing = "00000000-0000-4000-8000-000000000003";
+        load_or_store_device_id_at(&home, existing).unwrap();
+        fs::remove_file(super::device_identity_path(&home)).unwrap();
+
+        assert_eq!(
+            load_or_store_device_id_at(&home, "00000000-0000-4000-8000-000000000004").unwrap(),
+            existing
+        );
+        assert!(super::device_identity_path(&home).exists());
+
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn native_device_id_rejects_unsafe_legacy_values() {
+        let home = temporary_home("invalid-device-id");
+
+        assert!(load_or_store_device_id_at(&home, "../different-device").is_err());
+        assert!(load_or_store_device_id_at(&home, "abc").is_err());
+        assert!(!super::device_identity_path(&home).exists());
+
+        if home.exists() {
+            fs::remove_dir_all(home).unwrap();
+        }
+    }
+
+    #[test]
+    fn first_scan_load_keeps_persisted_file_cursor() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let home = std::env::temp_dir().join(format!("token-deck-cursor-{unique}"));
+        let expected = ScanCursor {
+            offset: 321,
+            prefix_fingerprint: 654,
+            created_at_nanos: 987,
+            gemini_discard_offset: Some(123),
+            codex_baseline: None,
+        };
+        let cursors = HashMap::from([("persisted".to_owned(), expected.clone())]);
+
+        save_scan_cursors(&home, &cursors).unwrap();
+
+        let loaded = load_scan_cursors(&home);
+        assert_eq!(loaded.get("persisted").unwrap().offset, expected.offset);
+        assert_eq!(
+            loaded.get("persisted").unwrap().gemini_discard_offset,
+            expected.gemini_discard_offset
+        );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn uncommitted_scan_is_replayed_until_cache_acknowledges_it() {
+        let home = temporary_home("two-phase-scan");
+        let log = home.join(".claude").join("projects").join("session.jsonl");
+        fs::create_dir_all(log.parent().unwrap()).unwrap();
+        fs::write(
+            &log,
+            "{\"sessionId\":\"session-1\",\"requestId\":\"request-1\",\"message\":{\"usage\":{\"input_tokens\":3}}}\n",
+        )
+        .unwrap();
+
+        let first = scan_local_usage_at(&home, None, Some(vec![UsageProvider::Claude])).unwrap();
+        assert_eq!(first.documents.len(), 1);
+        assert!(!scan_cursor_path(&home).exists());
+
+        let replay = scan_local_usage_at(&home, None, Some(vec![UsageProvider::Claude])).unwrap();
+        assert_eq!(replay.documents.len(), 1);
+        assert!(!scan_cursor_path(&home).exists());
+
+        assert!(commit_scan_cursors_blocking(&replay.commit_token).unwrap());
+        let key = stable_local_identifier(&log.to_string_lossy());
+        assert_eq!(
+            load_scan_cursors(&home).get(&key).unwrap().offset,
+            fs::metadata(&log).unwrap().len()
+        );
+        assert!(!commit_scan_cursors_blocking(&first.commit_token).unwrap());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn local_usage_cache_round_trip_restores_only_event_metadata() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let home = std::env::temp_dir().join(format!("token-deck-usage-cache-{unique}"));
+        let expected = vec![cached_usage_event()];
+
+        save_local_usage_cache_at(&home, &expected).unwrap();
+
+        assert_eq!(load_local_usage_cache_at(&home).unwrap(), expected);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn local_usage_cache_rejects_prompt_fields_and_oversized_files() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let home = std::env::temp_dir().join(format!("token-deck-invalid-cache-{unique}"));
+        let path = local_usage_cache_path(&home);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!([{
+                "id": "event-1", "provider": "codex", "source": "local-jsonl",
+                "deviceId": "00000000-0000-4000-8000-000000000001", "sessionId": "session-1", "projectId": "project-1",
+                "occurredAt": "2026-07-14T00:00:00.000Z",
+                "tokens": { "input": 1, "cached": 0, "output": 0, "reasoning": 0, "tool": 0 },
+                "prompt": "저장하면 안 되는 원문"
+            }]))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(load_local_usage_cache_at(&home).is_err());
+
+        fs::File::create(&path)
+            .unwrap()
+            .set_len(MAX_LOCAL_USAGE_CACHE_BYTES + 1)
+            .unwrap();
+        assert!(load_local_usage_cache_at(&home).is_err());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn local_usage_ownership_round_trip_uses_only_bounded_hashes() {
+        let home = temporary_home("usage-ownership");
+        assert!(load_local_usage_state_at(&home)
+            .unwrap()
+            .ownership
+            .is_none());
+        let events = vec![cached_usage_event()];
+        let expected = CachedUsageOwnershipState {
+            version: 1,
+            known_event_ids: vec!["event-1".to_owned()],
+            owners: HashMap::from([("event-1".to_owned(), "a".repeat(64))]),
+            seen_filter: String::new(),
+        };
+        let unclaimed = CachedUsageOwnershipState {
+            version: 1,
+            known_event_ids: Vec::new(),
+            owners: HashMap::new(),
+            seen_filter: String::new(),
+        };
+        let checkpoint = HashMap::from([(
+            "00000000-0000-4000-8000-000000000001:session-1".to_owned(),
+            CachedTokenBreakdown {
+                input: 51_000,
+                cached: 500,
+                output: 200,
+                reasoning: 25,
+                tool: 3,
+            },
+        )]);
+        let retired_filter = format!(
+            "{}==",
+            "A".repeat(crate::LOCAL_USAGE_SEEN_FILTER_ENCODED_BYTES - 2)
+        );
+
+        save_local_usage_state_at(&home, &events, &unclaimed, &checkpoint, &retired_filter)
+            .unwrap();
+        save_local_usage_state_at(&home, &events, &expected, &checkpoint, &retired_filter).unwrap();
+
+        let snapshot = load_local_usage_state_at(&home).unwrap();
+        assert_eq!(snapshot.ownership, Some(expected.clone()));
+        assert_eq!(snapshot.codex_cumulative, checkpoint);
+        assert_eq!(snapshot.codex_retired_session_filter, retired_filter);
+
+        fs::write(local_usage_cache_path(&home), "{broken").unwrap();
+        let recovered = load_local_usage_state_at(&home).unwrap();
+        assert_eq!(recovered.events, events);
+        assert_eq!(recovered.ownership, Some(expected));
+        assert_eq!(recovered.codex_cumulative, checkpoint);
+        assert_eq!(recovered.codex_retired_session_filter, retired_filter);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn local_usage_ownership_rejects_unknown_events_and_corruption() {
+        let home = temporary_home("invalid-usage-ownership");
+        let unknown = CachedUsageOwnershipState {
+            version: 1,
+            known_event_ids: vec!["event-1".to_owned()],
+            owners: HashMap::from([("event-2".to_owned(), "b".repeat(64))]),
+            seen_filter: String::new(),
+        };
+        assert!(save_local_usage_state_at(
+            &home,
+            &[cached_usage_event()],
+            &unknown,
+            &HashMap::new(),
+            ""
+        )
+        .is_err());
+        let malformed_filter = CachedUsageOwnershipState {
+            version: 1,
+            known_event_ids: vec!["event-1".to_owned()],
+            owners: HashMap::new(),
+            seen_filter: "AAAA".to_owned(),
+        };
+        assert!(save_local_usage_state_at(
+            &home,
+            &[cached_usage_event()],
+            &malformed_filter,
+            &HashMap::new(),
+            ""
+        )
+        .is_err());
+        assert!(save_local_usage_state_at(
+            &home,
+            &[cached_usage_event()],
+            &CachedUsageOwnershipState {
+                version: 1,
+                known_event_ids: vec!["event-1".to_owned()],
+                owners: HashMap::new(),
+                seen_filter: String::new(),
+            },
+            &HashMap::new(),
+            "AAAA"
+        )
+        .is_err());
+
+        let path = local_usage_cache_path(&home);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{"version":1,"knownEventIds":[],"owners":{},"prompt":"secret"}"#,
+        )
+        .unwrap();
+        assert!(load_local_usage_state_at(&home).is_err());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn inferred_project_names_use_a_separate_safe_cache() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let home = std::env::temp_dir().join(format!("token-deck-project-cache-{unique}"));
+        let expected = HashMap::from([("local_1234".to_owned(), "Token Deck".to_owned())]);
+
+        save_local_project_names_at(&home, &expected).unwrap();
+
+        assert_eq!(load_local_project_names_at(&home).unwrap(), expected);
+        let path = local_project_name_cache_path(&home);
+        fs::write(&path, r#"{"local_1234":"C:\\private\\project"}"#).unwrap();
+        assert!(load_local_project_names_at(&home).is_err());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn newly_enabled_provider_starts_after_logs_created_while_disabled() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("token-deck-prime-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("usage.jsonl");
+        fs::write(&path, "disabled-period\n").unwrap();
+        let mut cursors = HashMap::new();
+        let mut files_seen = 0;
+
+        prime_file_cursors(&root, "jsonl", &mut cursors, 0, &mut files_seen).unwrap();
+        let key = stable_local_identifier(&path.to_string_lossy());
+        let offset = cursors.get(&key).unwrap().offset;
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"enabled-period\n")
+            .unwrap();
+
+        let (lines, _) = read_log_chunk(&path, offset).unwrap();
+        assert_eq!(lines, vec!["enabled-period"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reenabled_codex_marks_the_first_new_cumulative_record_as_a_baseline() {
+        let home = temporary_home("codex-rebaseline");
+        let root = home.join(".codex").join("sessions");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("session.jsonl");
+        let session_meta = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"session-1\",\"cwd\":\"C:\\\\work\\\\repo\"}}\n";
+        let disabled_usage = "{\"type\":\"event_msg\",\"timestamp\":\"2026-07-11T00:00:01Z\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":100}}}}\n";
+        fs::write(&path, format!("{session_meta}{disabled_usage}")).unwrap();
+        let mut cursors = HashMap::new();
+        let mut primed_files = 0;
+        prime_file_cursors_with_mode(&root, "jsonl", &mut cursors, 0, &mut primed_files, true)
+            .unwrap();
+        let key = stable_local_identifier(&path.to_string_lossy());
+        assert!(cursors.get(&key).unwrap().codex_baseline.is_some());
+        save_scan_cursors(&home, &cursors).unwrap();
+
+        let enabled_usage = "{\"type\":\"event_msg\",\"timestamp\":\"2026-07-11T00:00:02Z\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":1100}}}}\n";
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(enabled_usage.as_bytes())
+            .unwrap();
+        let scan = scan_local_usage_at(&home, None, Some(vec![UsageProvider::Codex])).unwrap();
+
+        assert_eq!(scan.codex_baselines.len(), 1);
+        assert!(scan.codex_baselines[0].contains("\"input_tokens\":100"));
+        assert!(scan.codex_baselines[0].contains("\"session_id\":\"session-1\""));
+        assert_eq!(scan.documents.len(), 1);
+        assert!(scan.documents[0].content.contains("1100"));
+        assert!(scan.documents[0]
+            .content
+            .contains("\"session_id\":\"session-1\""));
+        assert!(commit_scan_cursors_blocking(&scan.commit_token).unwrap());
+        assert!(load_scan_cursors(&home)
+            .get(&key)
+            .unwrap()
+            .codex_baseline
+            .is_none());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn activation_boundary_fails_instead_of_partially_priming_over_file_limit() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("token-deck-prime-limit-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("usage.jsonl"), "disabled-period\n").unwrap();
+        let mut cursors = HashMap::new();
+        let mut files_seen = MAX_LOG_FILES;
+
+        assert!(prime_file_cursors(&root, "jsonl", &mut cursors, 0, &mut files_seen).is_err());
+        assert!(cursors.is_empty());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -343,7 +855,7 @@ mod tests {
     #[test]
     fn claude_log_sanitizer_removes_message_content_and_hashes_path() {
         let line = r#"{"cwd":"C:\\Users\\person\\secret-project","sessionId":"session-1","requestId":"request-1","timestamp":"2026-07-11T00:00:00Z","message":{"id":"message-1","model":"claude-test","content":[{"type":"text","text":"private prompt and source code"}],"usage":{"input_tokens":12,"output_tokens":3,"prompt":"nested private prompt"}}}"#;
-        let records = sanitized_log_records("claude", line);
+        let records = sanitized_log_records("claude", line, None);
 
         assert_eq!(records.len(), 1);
         assert!(!records[0].line.contains("private prompt"));
@@ -365,7 +877,7 @@ mod tests {
     #[test]
     fn gemini_log_sanitizer_drops_prompt_attributes() {
         let line = r#"{"timestamp":"2026-07-11T00:00:00Z","attributes":{"gen_ai.usage.input_tokens":8,"gen_ai.usage.output_tokens":2,"gen_ai.prompt":"private prompt","session.id":"session-1"}}"#;
-        let records = sanitized_log_records("gemini", line);
+        let records = sanitized_log_records("gemini", line, None);
 
         assert_eq!(records.len(), 1);
         assert!(!records[0].line.contains("private prompt"));
@@ -376,7 +888,7 @@ mod tests {
     #[test]
     fn gemini_wrapped_attributes_keep_only_the_expected_scalar() {
         let line = r#"{"attributes":[{"key":"gen_ai.usage.input_tokens","value":{"intValue":"8","secret":"private prompt"}},{"key":"user.email","value":{"stringValue":"private@example.com"}},{"key":"gen_ai.input.messages","value":{"stringValue":"private source"}},{"key":"session.id","value":{"stringValue":"session-1"}}]}"#;
-        let records = sanitized_log_records("gemini", line);
+        let records = sanitized_log_records("gemini", line, None);
 
         assert_eq!(records.len(), 1);
         assert!(records[0]
@@ -708,7 +1220,7 @@ mod tests {
             "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"session-1\",\"cwd\":{}}}}}\n",
             serde_json::to_string(&cwd.to_string_lossy()).unwrap()
         );
-        let token_count = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"session_id\":\"session-1\",\"info\":{\"total_token_usage\":{\"input_tokens\":4,\"output_tokens\":1}}}}\n";
+        let token_count = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":4,\"output_tokens\":1}}}}\n";
         let path = root.join("session.jsonl");
         fs::write(&path, format!("{session_meta}{token_count}")).unwrap();
         let mut output = Vec::new();
@@ -721,6 +1233,7 @@ mod tests {
                 prefix_fingerprint: file_prefix_fingerprint(&path).unwrap(),
                 created_at_nanos: 0,
                 gemini_discard_offset: None,
+                codex_baseline: None,
             },
         )]);
 
@@ -738,11 +1251,55 @@ mod tests {
 
         assert_eq!(output.len(), 1);
         assert!(output[0].content.contains("input_tokens"));
+        assert!(output[0].content.contains("\"session_id\":\"session-1\""));
         assert!(!output[0].content.contains("session_meta"));
         assert_eq!(
             output[0].project_id,
             super::project_metadata(Some(&cwd), &path).1
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn codex_chunk_without_prefix_session_id_does_not_advance_its_cursor() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("token-deck-codex-no-session-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("session.jsonl");
+        let token_count = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":4}}}}\n";
+        fs::write(&path, token_count).unwrap();
+        let key = stable_local_identifier(&path.to_string_lossy());
+        let mut cursors = HashMap::from([(
+            key.clone(),
+            ScanCursor {
+                offset: 0,
+                prefix_fingerprint: file_prefix_fingerprint(&path).unwrap(),
+                created_at_nanos: 0,
+                gemini_discard_offset: None,
+                codex_baseline: None,
+            },
+        )]);
+        let mut output = Vec::new();
+        let mut files_seen = 0;
+        let mut output_bytes = 0;
+
+        collect_files(
+            &root,
+            "jsonl",
+            "codex",
+            0,
+            &mut output,
+            0,
+            &mut files_seen,
+            &mut output_bytes,
+            &mut cursors,
+        );
+
+        assert!(output.is_empty());
+        assert_eq!(cursors.get(&key).unwrap().offset, 0);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -765,6 +1322,7 @@ mod tests {
                 prefix_fingerprint: file_prefix_fingerprint(&path).unwrap(),
                 created_at_nanos: 0,
                 gemini_discard_offset: None,
+                codex_baseline: None,
             },
         )]);
         let replacement = "{\"cwd\":\"C:\\\\work\\\\new-project\",\"sessionId\":\"new\",\"requestId\":\"new-request\",\"padding\":\"replacement-is-longer-than-the-old-file\",\"message\":{\"usage\":{\"input_tokens\":9}}}\n";
@@ -787,6 +1345,48 @@ mod tests {
 
         assert_eq!(output.len(), 1);
         assert!(output[0].content.contains("\"input_tokens\":9"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restart_does_not_reset_an_unchanged_cursor_at_end_of_file() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("token-deck-restart-cursor-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("session.jsonl");
+        let existing = "{\"sessionId\":\"old\",\"requestId\":\"old-request\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n";
+        fs::write(&path, existing).unwrap();
+        let key = stable_local_identifier(&path.to_string_lossy());
+        let mut cursors = HashMap::from([(
+            key,
+            ScanCursor {
+                offset: existing.len() as u64,
+                prefix_fingerprint: file_prefix_fingerprint(&path).unwrap(),
+                created_at_nanos: 0,
+                gemini_discard_offset: None,
+                codex_baseline: None,
+            },
+        )]);
+        let mut output = Vec::new();
+        let mut files_seen = 0;
+        let mut output_bytes = 0;
+
+        collect_files(
+            &root,
+            "jsonl",
+            "claude",
+            0,
+            &mut output,
+            0,
+            &mut files_seen,
+            &mut output_bytes,
+            &mut cursors,
+        );
+
+        assert!(output.is_empty());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -833,6 +1433,7 @@ mod tests {
         assert!(crate::is_supported_credential_provider(
             "google:0123456789abcdef"
         ));
+        assert!(crate::is_supported_credential_provider("supabase-pending"));
         assert!(!crate::is_supported_credential_provider(
             "supabase:0123456789abcdef"
         ));
@@ -945,7 +1546,10 @@ fn sanitized_token_usage(value: &serde_json::Value) -> Option<serde_json::Value>
     (!usage.is_empty()).then_some(serde_json::Value::Object(usage))
 }
 
-fn sanitized_codex(value: &serde_json::Value) -> Option<serde_json::Value> {
+fn sanitized_codex(
+    value: &serde_json::Value,
+    fallback_session_id: Option<&str>,
+) -> Option<serde_json::Value> {
     if value
         .pointer("/payload/type")
         .and_then(serde_json::Value::as_str)
@@ -956,7 +1560,8 @@ fn sanitized_codex(value: &serde_json::Value) -> Option<serde_json::Value> {
             "type": "session_meta",
             "timestamp": value.get("timestamp"),
             "payload": {
-                "id": value_string(value, &["/payload/id", "/payload/session_id", "/session_id"]),
+                "id": value_string(value, &["/payload/id", "/payload/session_id", "/session_id"])
+                    .or(fallback_session_id),
                 "cwd": sanitized_cwd(value)
             }
         }));
@@ -975,7 +1580,8 @@ fn sanitized_codex(value: &serde_json::Value) -> Option<serde_json::Value> {
     Some(serde_json::json!({
         "timestamp": value.get("timestamp").or_else(|| value.get("created_at")),
         "payload": {
-            "session_id": value_string(value, &["/payload/session_id", "/session_id", "/sessionId"]),
+            "session_id": value_string(value, &["/payload/session_id", "/session_id", "/sessionId"])
+                .or(fallback_session_id),
             "model": value_string(value, &["/payload/model", "/model"]),
             "info": { "total_token_usage": usage }
         }
@@ -1234,12 +1840,16 @@ struct SanitizedRecord {
     cwd: Option<PathBuf>,
 }
 
-fn sanitized_log_records(provider: &str, line: &str) -> Vec<SanitizedRecord> {
+fn sanitized_log_records(
+    provider: &str,
+    line: &str,
+    codex_session_id: Option<&str>,
+) -> Vec<SanitizedRecord> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
         return Vec::new();
     };
     let values: Vec<(serde_json::Value, Option<PathBuf>)> = match provider {
-        "codex" => sanitized_codex(&value)
+        "codex" => sanitized_codex(&value, codex_session_id)
             .map(|safe| (safe, raw_cwd(&value)))
             .into_iter()
             .collect(),
@@ -1304,35 +1914,615 @@ fn scan_cursor_path(home: &Path) -> PathBuf {
     home.join(".token-deck").join("scan-cursors.json")
 }
 
-fn load_scan_cursors(home: &Path, reset: bool) -> HashMap<String, ScanCursor> {
+fn load_scan_cursors(home: &Path) -> HashMap<String, ScanCursor> {
     let path = scan_cursor_path(home);
-    if reset {
-        let _ = fs::remove_file(path);
-        return HashMap::new();
-    }
     fs::read_to_string(path)
         .ok()
         .and_then(|value| serde_json::from_str(&value).ok())
         .unwrap_or_default()
 }
 
-fn save_scan_cursors(home: &Path, cursors: &HashMap<String, ScanCursor>) {
+fn save_scan_cursors(home: &Path, cursors: &HashMap<String, ScanCursor>) -> Result<(), String> {
     let path = scan_cursor_path(home);
-    let Some(parent) = path.parent() else { return };
-    if fs::create_dir_all(parent).is_err() {
-        return;
-    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| "스캔 커서 저장 경로를 확인할 수 없습니다".to_owned())?;
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     let temporary = path.with_extension("json.tmp");
-    let Ok(content) = serde_json::to_string(cursors) else {
-        return;
-    };
-    if fs::write(&temporary, content).is_err() {
-        return;
-    }
+    let content = serde_json::to_string(cursors).map_err(|error| error.to_string())?;
+    fs::write(&temporary, content).map_err(|error| error.to_string())?;
     if fs::rename(&temporary, &path).is_err() {
-        let _ = fs::remove_file(&path);
-        let _ = fs::rename(&temporary, &path);
+        if path.exists() {
+            fs::remove_file(&path).map_err(|error| error.to_string())?;
+        }
+        fs::rename(&temporary, &path).map_err(|error| error.to_string())?;
     }
+    Ok(())
+}
+
+fn scan_transactions() -> &'static Mutex<ScanTransactionState> {
+    SCAN_TRANSACTIONS.get_or_init(|| Mutex::new(ScanTransactionState::default()))
+}
+
+fn collection_policy_revision(home: &Path) -> u64 {
+    let state = scan_transactions()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.policy_revisions.get(home).copied().unwrap_or(0)
+}
+
+pub(crate) fn increment_collection_policy_revision(home: &Path) {
+    let mut state = scan_transactions()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let revision = state
+        .policy_revisions
+        .entry(home.to_path_buf())
+        .or_default();
+    *revision = revision.wrapping_add(1);
+}
+
+fn stage_scan_commit(
+    home: &Path,
+    cursors: HashMap<String, ScanCursor>,
+    policy_revision: u64,
+) -> String {
+    let mut state = scan_transactions()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.pending.retain(|_, pending| pending.home != home);
+    state.next_token = state.next_token.wrapping_add(1);
+    let token = format!("{}-{}", std::process::id(), state.next_token);
+    state.pending.insert(
+        token.clone(),
+        PendingScanCommit {
+            home: home.to_path_buf(),
+            cursors,
+            policy_revision,
+        },
+    );
+    token
+}
+
+fn commit_scan_cursors_blocking(commit_token: &str) -> Result<bool, String> {
+    let _scan_guard = SCAN_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut state = scan_transactions()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(pending) = state.pending.get(commit_token).cloned() else {
+        return Ok(false);
+    };
+    let current_revision = state
+        .policy_revisions
+        .get(&pending.home)
+        .copied()
+        .unwrap_or(0);
+    if current_revision != pending.policy_revision {
+        state.pending.remove(commit_token);
+        return Ok(false);
+    }
+    save_scan_cursors(&pending.home, &pending.cursors)?;
+    state.pending.remove(commit_token);
+    Ok(true)
+}
+
+fn device_identity_path(home: &Path) -> PathBuf {
+    home.join(".token-deck").join("device-id.json")
+}
+
+fn valid_device_id(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+fn read_device_identity_file(path: &Path) -> Result<Option<CachedDeviceIdentity>, String> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    if metadata.len() > MAX_DEVICE_ID_STATE_BYTES {
+        return Err("기기 식별자 상태 파일이 허용 크기를 초과했습니다".to_owned());
+    }
+    let content = fs::read(path).map_err(|error| error.to_string())?;
+    let identity: CachedDeviceIdentity = serde_json::from_slice(&content)
+        .map_err(|error| format!("기기 식별자 상태 JSON이 올바르지 않습니다. {error}"))?;
+    if identity.version != 1 || !valid_device_id(&identity.device_id) {
+        return Err("기기 식별자 상태에 허용되지 않는 값이 있습니다".to_owned());
+    }
+    Ok(Some(identity))
+}
+
+fn replace_device_identity_file(path: &Path, content: &[u8]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "기기 식별자 저장 경로를 확인할 수 없습니다".to_owned())?;
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let temporary = path.with_extension(format!(
+        "{}.tmp",
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("state")
+    ));
+    fs::write(&temporary, content).map_err(|error| error.to_string())?;
+    if path.exists() {
+        fs::remove_file(path).map_err(|error| error.to_string())?;
+    }
+    fs::rename(&temporary, path)
+        .map_err(|error| format!("기기 식별자 상태를 원자 교체하지 못했습니다. {error}"))
+}
+
+fn save_device_identity_at(home: &Path, device_id: &str) -> Result<(), String> {
+    if !valid_device_id(device_id) {
+        return Err("허용되지 않는 기기 식별자입니다".to_owned());
+    }
+    let identity = CachedDeviceIdentity {
+        version: 1,
+        device_id: device_id.to_owned(),
+    };
+    let content = serde_json::to_vec(&identity).map_err(|error| error.to_string())?;
+    let primary = device_identity_path(home);
+    let backup = primary.with_extension("json.bak");
+    replace_device_identity_file(&backup, &content)?;
+    replace_device_identity_file(&primary, &content)
+}
+
+fn load_or_store_device_id_at(home: &Path, candidate: &str) -> Result<String, String> {
+    let _identity_guard = DEVICE_ID_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let primary = device_identity_path(home);
+    match read_device_identity_file(&primary) {
+        Ok(Some(identity)) => return Ok(identity.device_id),
+        Ok(None) => {}
+        Err(primary_error) => {
+            let backup = primary.with_extension("json.bak");
+            return match read_device_identity_file(&backup) {
+                Ok(Some(identity)) => {
+                    replace_device_identity_file(
+                        &primary,
+                        &serde_json::to_vec(&identity).map_err(|error| error.to_string())?,
+                    )?;
+                    Ok(identity.device_id)
+                }
+                Ok(None) | Err(_) => Err(format!(
+                    "기기 식별자 상태와 복구 백업을 읽지 못했습니다. {primary_error}"
+                )),
+            };
+        }
+    }
+
+    let backup = primary.with_extension("json.bak");
+    match read_device_identity_file(&backup) {
+        Ok(Some(identity)) => {
+            replace_device_identity_file(
+                &primary,
+                &serde_json::to_vec(&identity).map_err(|error| error.to_string())?,
+            )?;
+            Ok(identity.device_id)
+        }
+        Ok(None) => {
+            save_device_identity_at(home, candidate)?;
+            Ok(candidate.to_owned())
+        }
+        Err(backup_error) => Err(format!(
+            "기기 식별자 복구 백업을 읽지 못했습니다. {backup_error}"
+        )),
+    }
+}
+
+fn local_usage_cache_path(home: &Path) -> PathBuf {
+    home.join(".token-deck").join("local-usage-events.json")
+}
+
+fn valid_cache_identifier(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max_bytes
+        && !value.chars().any(char::is_control)
+        && !value.contains(['/', '\\'])
+}
+
+fn valid_cache_text(value: &str, max_bytes: usize) -> bool {
+    value.len() <= max_bytes
+        && !value.chars().any(char::is_control)
+        && !value.contains("\\")
+        && !value.starts_with('/')
+        && !value.contains("://")
+}
+
+fn validate_cached_usage_events(events: &[CachedUsageEvent]) -> Result<(), String> {
+    if events.len() > MAX_LOCAL_USAGE_CACHE_EVENTS {
+        return Err(format!(
+            "로컬 사용량 캐시는 최대 {MAX_LOCAL_USAGE_CACHE_EVENTS}개 이벤트까지 저장할 수 있습니다"
+        ));
+    }
+    for event in events {
+        if !valid_cache_identifier(&event.id, 256)
+            || !valid_device_id(&event.device_id)
+            || !valid_cache_identifier(&event.session_id, 256)
+            || !valid_cache_identifier(&event.project_id, 256)
+            || event
+                .request_id
+                .as_deref()
+                .is_some_and(|value| !valid_cache_identifier(value, 256))
+            || event
+                .model
+                .as_deref()
+                .is_some_and(|value| !valid_cache_text(value, 256))
+            || event.occurred_at.len() > 64
+            || chrono::DateTime::parse_from_rfc3339(&event.occurred_at).is_err()
+        {
+            return Err("로컬 사용량 캐시에 허용되지 않는 메타데이터가 있습니다".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn valid_owner_hash(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn validate_local_usage_ownership(state: &CachedUsageOwnershipState) -> Result<(), String> {
+    if state.version != 1 {
+        return Err("지원하지 않는 로컬 사용량 소유권 형식입니다".to_owned());
+    }
+    if state.known_event_ids.len() > MAX_LOCAL_USAGE_CACHE_EVENTS
+        || state.owners.len() > MAX_LOCAL_USAGE_CACHE_EVENTS
+    {
+        return Err(format!(
+            "로컬 사용량 소유권은 최대 {MAX_LOCAL_USAGE_CACHE_EVENTS}개 이벤트까지 저장할 수 있습니다"
+        ));
+    }
+    let known = state.known_event_ids.iter().collect::<HashSet<_>>();
+    if known.len() != state.known_event_ids.len()
+        || state
+            .known_event_ids
+            .iter()
+            .any(|event_id| !valid_cache_identifier(event_id, 256))
+        || state.owners.iter().any(|(event_id, owner_hash)| {
+            !known.contains(event_id)
+                || !valid_cache_identifier(event_id, 256)
+                || !valid_owner_hash(owner_hash)
+        })
+        || !valid_local_usage_seen_filter(&state.seen_filter)
+    {
+        return Err("로컬 사용량 소유권에 허용되지 않는 값이 있습니다".to_owned());
+    }
+    Ok(())
+}
+
+fn valid_local_usage_seen_filter(value: &str) -> bool {
+    value.is_empty()
+        || (value.len() == LOCAL_USAGE_SEEN_FILTER_ENCODED_BYTES
+            && value.bytes().enumerate().all(|(index, byte)| {
+                if index >= value.len() - 2 {
+                    byte == b'='
+                } else {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/')
+                }
+            }))
+}
+
+fn validate_local_usage_state(state: &CachedLocalUsageState) -> Result<(), String> {
+    if state.version != 1 {
+        return Err("지원하지 않는 로컬 사용량 상태 형식입니다".to_owned());
+    }
+    validate_cached_usage_events(&state.events)?;
+    validate_local_usage_ownership(&state.ownership)?;
+    if state.codex_cumulative.len() > MAX_LOCAL_USAGE_CACHE_EVENTS
+        || state
+            .codex_cumulative
+            .keys()
+            .any(|key| !valid_cache_identifier(key, 512))
+    {
+        return Err("로컬 Codex 누적 기준점에 허용되지 않는 값이 있습니다".to_owned());
+    }
+    if !valid_local_usage_seen_filter(&state.codex_retired_session_filter) {
+        return Err("로컬 Codex 퇴역 세션 필터가 올바르지 않습니다".to_owned());
+    }
+    let event_ids = state
+        .events
+        .iter()
+        .map(|event| &event.id)
+        .collect::<HashSet<_>>();
+    if state
+        .ownership
+        .known_event_ids
+        .iter()
+        .any(|event_id| !event_ids.contains(event_id))
+    {
+        return Err("로컬 사용량 상태의 소유권이 보존 이벤트와 일치하지 않습니다".to_owned());
+    }
+    Ok(())
+}
+
+fn decode_local_usage_snapshot(content: &[u8]) -> Result<CachedLocalUsageSnapshot, String> {
+    if let Ok(state) = serde_json::from_slice::<CachedLocalUsageState>(content) {
+        validate_local_usage_state(&state)?;
+        return Ok(CachedLocalUsageSnapshot {
+            events: state.events,
+            ownership: Some(state.ownership),
+            codex_cumulative: state.codex_cumulative,
+            codex_retired_session_filter: state.codex_retired_session_filter,
+        });
+    }
+    let events: Vec<CachedUsageEvent> = serde_json::from_slice(content)
+        .map_err(|error| format!("로컬 사용량 상태 JSON이 올바르지 않습니다. {error}"))?;
+    validate_cached_usage_events(&events)?;
+    Ok(CachedLocalUsageSnapshot {
+        events,
+        ownership: None,
+        codex_cumulative: HashMap::new(),
+        codex_retired_session_filter: String::new(),
+    })
+}
+
+fn read_local_usage_file(path: &Path) -> Result<Option<CachedLocalUsageSnapshot>, String> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    if metadata.len() > MAX_LOCAL_USAGE_CACHE_BYTES {
+        return Err("로컬 사용량 상태 파일이 허용 크기를 초과했습니다".to_owned());
+    }
+    let content = fs::read(path).map_err(|error| error.to_string())?;
+    decode_local_usage_snapshot(&content).map(Some)
+}
+
+fn load_local_usage_state_at(home: &Path) -> Result<CachedLocalUsageSnapshot, String> {
+    let _cache_guard = LOCAL_USAGE_CACHE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let path = local_usage_cache_path(home);
+    match read_local_usage_file(&path) {
+        Ok(Some(snapshot)) => Ok(snapshot),
+        Ok(None) => {
+            let backup = path.with_extension("json.bak");
+            match read_local_usage_file(&backup) {
+                Ok(Some(snapshot)) => Ok(snapshot),
+                Ok(None) => Ok(CachedLocalUsageSnapshot {
+                    events: Vec::new(),
+                    ownership: None,
+                    codex_cumulative: HashMap::new(),
+                    codex_retired_session_filter: String::new(),
+                }),
+                Err(backup_error) => Err(format!(
+                    "로컬 사용량 상태와 복구 백업을 읽지 못했습니다. {backup_error}"
+                )),
+            }
+        }
+        Err(primary_error) => {
+            let backup = path.with_extension("json.bak");
+            match read_local_usage_file(&backup) {
+                Ok(Some(snapshot)) => Ok(snapshot),
+                Ok(None) | Err(_) => Err(format!(
+                    "로컬 사용량 상태와 복구 백업을 읽지 못했습니다. {primary_error}"
+                )),
+            }
+        }
+    }
+}
+
+fn write_recoverable_file(path: &Path, content: &[u8]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "로컬 사용량 상태 경로를 확인할 수 없습니다".to_owned())?;
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let temporary = path.with_extension("json.tmp");
+    let backup = path.with_extension("json.bak");
+    let backup_temporary = path.with_extension("json.bak.tmp");
+    fs::write(&temporary, content).map_err(|error| error.to_string())?;
+    fs::write(&backup_temporary, content).map_err(|error| error.to_string())?;
+    if backup.exists() {
+        fs::remove_file(&backup).map_err(|error| error.to_string())?;
+    }
+    fs::rename(&backup_temporary, &backup).map_err(|error| error.to_string())?;
+    if path.exists() {
+        fs::remove_file(path).map_err(|error| error.to_string())?;
+    }
+    fs::rename(&temporary, path)
+        .map_err(|error| format!("새 로컬 사용량 상태를 원자 교체하지 못했습니다. {error}"))
+}
+
+fn save_local_usage_state_at(
+    home: &Path,
+    events: &[CachedUsageEvent],
+    ownership: &CachedUsageOwnershipState,
+    codex_cumulative: &HashMap<String, CachedTokenBreakdown>,
+    codex_retired_session_filter: &str,
+) -> Result<(), String> {
+    let _cache_guard = LOCAL_USAGE_CACHE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let state = CachedLocalUsageState {
+        version: 1,
+        events: events.to_vec(),
+        ownership: ownership.clone(),
+        codex_cumulative: codex_cumulative.clone(),
+        codex_retired_session_filter: codex_retired_session_filter.to_owned(),
+    };
+    validate_local_usage_state(&state)?;
+    let content = serde_json::to_vec(&state).map_err(|error| error.to_string())?;
+    if content.len() as u64 > MAX_LOCAL_USAGE_CACHE_BYTES {
+        return Err("로컬 사용량 상태 파일이 허용 크기를 초과했습니다".to_owned());
+    }
+    write_recoverable_file(&local_usage_cache_path(home), &content)
+}
+
+fn load_local_usage_cache_at(home: &Path) -> Result<Vec<CachedUsageEvent>, String> {
+    Ok(load_local_usage_state_at(home)?.events)
+}
+
+fn save_local_usage_cache_at(home: &Path, events: &[CachedUsageEvent]) -> Result<(), String> {
+    let ownership = CachedUsageOwnershipState {
+        version: 1,
+        known_event_ids: events.iter().map(|event| event.id.clone()).collect(),
+        owners: HashMap::new(),
+        seen_filter: String::new(),
+    };
+    save_local_usage_state_at(home, events, &ownership, &HashMap::new(), "")
+}
+
+fn local_project_name_cache_path(home: &Path) -> PathBuf {
+    home.join(".token-deck").join("local-project-names.json")
+}
+
+fn validate_local_project_names(names: &HashMap<String, String>) -> Result<(), String> {
+    if names.len() > MAX_LOCAL_PROJECT_CACHE_ENTRIES {
+        return Err(format!(
+            "로컬 프로젝트 이름 캐시는 최대 {MAX_LOCAL_PROJECT_CACHE_ENTRIES}개까지 저장할 수 있습니다"
+        ));
+    }
+    for (project_id, name) in names {
+        if !valid_cache_identifier(project_id, 256)
+            || name.is_empty()
+            || name.chars().count() > 80
+            || name.chars().any(char::is_control)
+            || name.contains(['/', '\\'])
+            || name.contains("://")
+            || matches!(name.as_str(), "." | "..")
+        {
+            return Err("로컬 프로젝트 이름 캐시에 허용되지 않는 값이 있습니다".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn load_local_project_names_at(home: &Path) -> Result<HashMap<String, String>, String> {
+    let _cache_guard = LOCAL_USAGE_CACHE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let path = local_project_name_cache_path(home);
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+    if metadata.len() > MAX_LOCAL_PROJECT_CACHE_BYTES {
+        return Err("로컬 프로젝트 이름 캐시 파일이 허용 크기를 초과했습니다".to_owned());
+    }
+    let content = fs::read(&path).map_err(|error| error.to_string())?;
+    let names: HashMap<String, String> = serde_json::from_slice(&content).map_err(|error| {
+        format!("로컬 프로젝트 이름 캐시 JSON 객체가 올바르지 않습니다. {error}")
+    })?;
+    validate_local_project_names(&names)?;
+    Ok(names)
+}
+
+fn save_local_project_names_at(home: &Path, names: &HashMap<String, String>) -> Result<(), String> {
+    let _cache_guard = LOCAL_USAGE_CACHE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    validate_local_project_names(names)?;
+    let content = serde_json::to_vec(names).map_err(|error| error.to_string())?;
+    if content.len() as u64 > MAX_LOCAL_PROJECT_CACHE_BYTES {
+        return Err("로컬 프로젝트 이름 캐시 파일이 허용 크기를 초과했습니다".to_owned());
+    }
+    let path = local_project_name_cache_path(home);
+    let parent = path
+        .parent()
+        .ok_or_else(|| "로컬 프로젝트 이름 캐시 경로를 확인할 수 없습니다".to_owned())?;
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let temporary = path.with_extension("json.tmp");
+    fs::write(&temporary, content).map_err(|error| error.to_string())?;
+    if fs::rename(&temporary, &path).is_err() {
+        if path.exists() {
+            fs::remove_file(&path).map_err(|error| error.to_string())?;
+        }
+        fs::rename(&temporary, &path).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn user_home_path() -> Result<PathBuf, String> {
+    std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        .ok_or_else(|| "사용자 홈 폴더를 찾을 수 없습니다".to_owned())
+}
+
+#[tauri::command]
+async fn load_or_store_device_id(candidate: String) -> Result<String, String> {
+    let home = user_home_path()?;
+    tauri::async_runtime::spawn_blocking(move || load_or_store_device_id_at(&home, &candidate))
+        .await
+        .map_err(|error| format!("기기 식별자 저장을 완료하지 못했습니다. {error}"))?
+}
+
+#[tauri::command]
+async fn load_local_usage_cache() -> Result<Vec<CachedUsageEvent>, String> {
+    let home = user_home_path()?;
+    tauri::async_runtime::spawn_blocking(move || load_local_usage_cache_at(&home))
+        .await
+        .map_err(|error| format!("로컬 사용량 캐시 읽기를 완료하지 못했습니다. {error}"))?
+}
+
+#[tauri::command]
+async fn save_local_usage_cache(events: Vec<CachedUsageEvent>) -> Result<(), String> {
+    let home = user_home_path()?;
+    tauri::async_runtime::spawn_blocking(move || save_local_usage_cache_at(&home, &events))
+        .await
+        .map_err(|error| format!("로컬 사용량 캐시 저장을 완료하지 못했습니다. {error}"))?
+}
+
+#[tauri::command]
+async fn load_local_usage_state() -> Result<CachedLocalUsageSnapshot, String> {
+    let home = user_home_path()?;
+    tauri::async_runtime::spawn_blocking(move || load_local_usage_state_at(&home))
+        .await
+        .map_err(|error| format!("로컬 사용량 상태 읽기를 완료하지 못했습니다. {error}"))?
+}
+
+#[tauri::command]
+async fn save_local_usage_state(
+    events: Vec<CachedUsageEvent>,
+    ownership: CachedUsageOwnershipState,
+    codex_cumulative: HashMap<String, CachedTokenBreakdown>,
+    codex_retired_session_filter: String,
+) -> Result<(), String> {
+    let home = user_home_path()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        save_local_usage_state_at(
+            &home,
+            &events,
+            &ownership,
+            &codex_cumulative,
+            &codex_retired_session_filter,
+        )
+    })
+    .await
+    .map_err(|error| format!("로컬 사용량 상태 저장을 완료하지 못했습니다. {error}"))?
+}
+
+#[tauri::command]
+async fn load_local_project_names() -> Result<HashMap<String, String>, String> {
+    let home = user_home_path()?;
+    tauri::async_runtime::spawn_blocking(move || load_local_project_names_at(&home))
+        .await
+        .map_err(|error| format!("로컬 프로젝트 이름 캐시 읽기를 완료하지 못했습니다. {error}"))?
+}
+
+#[tauri::command]
+async fn save_local_project_names(names: HashMap<String, String>) -> Result<(), String> {
+    let home = user_home_path()?;
+    tauri::async_runtime::spawn_blocking(move || save_local_project_names_at(&home, &names))
+        .await
+        .map_err(|error| format!("로컬 프로젝트 이름 캐시 저장을 완료하지 못했습니다. {error}"))?
 }
 
 fn read_bounded_line(reader: &mut BufReader<fs::File>) -> std::io::Result<Option<BoundedLine>> {
@@ -1646,15 +2836,12 @@ fn collect_files(
             .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
             .map(|value| value.as_nanos().min(u128::from(u64::MAX)) as u64)
             .unwrap_or(0);
-        let stored = cursors.get(&cursor_key).copied().unwrap_or_default();
+        let stored = cursors.get(&cursor_key).cloned().unwrap_or_default();
         let same_file = stored.prefix_fingerprint == prefix_fingerprint
             && (stored.created_at_nanos == 0
                 || created_at_nanos == 0
                 || stored.created_at_nanos == created_at_nanos);
-        let previous_offset = if same_file
-            && stored.offset <= metadata.len()
-            && !(stored.offset == metadata.len() && modified_at > modified_since)
-        {
+        let previous_offset = if same_file && stored.offset <= metadata.len() {
             stored.offset
         } else {
             0
@@ -1673,10 +2860,18 @@ fn collect_files(
             continue;
         };
         let default_cwd = initial_log_cwd(&path, provider);
+        let codex_session_id = if provider == "codex" {
+            match codex_session_id_from_prefix(&path) {
+                Ok(session_id) => Some(session_id),
+                Err(_) => continue,
+            }
+        } else {
+            None
+        };
         let mut grouped: HashMap<String, PendingLogDocument> = HashMap::new();
         for line in chunk.lines {
             if is_usage_line(provider, &line) {
-                for record in sanitized_log_records(provider, &line) {
+                for record in sanitized_log_records(provider, &line, codex_session_id.as_deref()) {
                     let cwd = if provider == "gemini" {
                         record.cwd.as_deref()
                     } else {
@@ -1702,6 +2897,7 @@ fn collect_files(
                 prefix_fingerprint,
                 created_at_nanos,
                 gemini_discard_offset: chunk.gemini_discard_offset,
+                codex_baseline: None,
             },
         );
         for (project_id, pending) in grouped {
@@ -1716,6 +2912,7 @@ fn collect_files(
                         prefix_fingerprint,
                         created_at_nanos,
                         gemini_discard_offset: previous_discard_offset,
+                        codex_baseline: None,
                     },
                 );
                 return;
@@ -1734,28 +2931,231 @@ fn collect_files(
     }
 }
 
-fn scan_local_usage_blocking(
+#[cfg(test)]
+fn prime_file_cursors(
+    root: &Path,
+    extension: &str,
+    cursors: &mut HashMap<String, ScanCursor>,
+    depth: usize,
+    files_seen: &mut usize,
+) -> Result<(), String> {
+    prime_file_cursors_with_mode(root, extension, cursors, depth, files_seen, false)
+}
+
+fn codex_baseline_from_tail(path: &Path, length: u64) -> Result<Option<String>, String> {
+    if length == 0 {
+        return Ok(None);
+    }
+    let start = length.saturating_sub(MAX_CODEX_BASELINE_TAIL_BYTES);
+    let mut file = fs::File::open(path).map_err(|error| error.to_string())?;
+    file.seek(SeekFrom::Start(start))
+        .map_err(|error| error.to_string())?;
+    let mut bytes = Vec::with_capacity((length - start) as usize);
+    file.read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    let content = String::from_utf8_lossy(&bytes);
+    let complete = if start == 0 {
+        content.as_ref()
+    } else {
+        content.split_once('\n').map_or("", |(_, rest)| rest)
+    };
+    for line in complete.lines().rev() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(mut sanitized) = sanitized_codex(&value, None) else {
+            continue;
+        };
+        if sanitized
+            .pointer("/payload/info/total_token_usage")
+            .is_some()
+        {
+            if sanitized
+                .pointer("/payload/session_id")
+                .and_then(serde_json::Value::as_str)
+                .is_none()
+            {
+                sanitized["payload"]["session_id"] =
+                    serde_json::Value::String(codex_session_id_from_prefix(path)?);
+            }
+            return serde_json::to_string(&sanitized)
+                .map(Some)
+                .map_err(|error| error.to_string());
+        }
+    }
+    if start > 0 {
+        return Err(format!(
+            "Codex 비활성 기간 기준점을 최근 {}바이트에서 찾지 못했습니다. {}",
+            MAX_CODEX_BASELINE_TAIL_BYTES,
+            path.display()
+        ));
+    }
+    Ok(None)
+}
+
+fn codex_session_id_from_prefix(path: &Path) -> Result<String, String> {
+    let file = fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut bytes = Vec::with_capacity(MAX_CODEX_SESSION_META_BYTES as usize + 1);
+    file.take(MAX_CODEX_SESSION_META_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    let truncated = bytes.len() as u64 > MAX_CODEX_SESSION_META_BYTES;
+    bytes.truncate(MAX_CODEX_SESSION_META_BYTES as usize);
+    let content = String::from_utf8_lossy(&bytes);
+    let complete = if truncated {
+        content.rsplit_once('\n').map_or("", |(lines, _)| lines)
+    } else {
+        content.as_ref()
+    };
+    for line in complete.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let is_session_meta = value.get("type").and_then(serde_json::Value::as_str)
+            == Some("session_meta")
+            || value
+                .pointer("/payload/type")
+                .and_then(serde_json::Value::as_str)
+                == Some("session_meta");
+        if !is_session_meta {
+            continue;
+        }
+        if let Some(session_id) = value_string(
+            &value,
+            &["/payload/id", "/payload/session_id", "/session_id"],
+        ) {
+            return Ok(session_id.to_owned());
+        }
+    }
+    Err("Codex 비활성 기간 기준점의 세션 식별자를 찾지 못했습니다".to_owned())
+}
+
+fn prime_file_cursors_with_mode(
+    root: &Path,
+    extension: &str,
+    cursors: &mut HashMap<String, ScanCursor>,
+    depth: usize,
+    files_seen: &mut usize,
+    capture_codex_baseline: bool,
+) -> Result<(), String> {
+    if depth > MAX_SCAN_DEPTH {
+        return Err("공급사 로그 폴더가 허용된 탐색 깊이를 초과했습니다".to_owned());
+    }
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let file_type = entry.file_type().map_err(|error| error.to_string())?;
+        if is_link_like(&file_type) {
+            continue;
+        }
+        let path = entry.path();
+        if file_type.is_dir() {
+            prime_file_cursors_with_mode(
+                &path,
+                extension,
+                cursors,
+                depth + 1,
+                files_seen,
+                capture_codex_baseline,
+            )?;
+            continue;
+        }
+        if path.extension().and_then(|value| value.to_str()) != Some(extension) {
+            continue;
+        }
+        if *files_seen >= MAX_LOG_FILES {
+            return Err(format!(
+                "공급사 로그 파일이 허용된 {MAX_LOG_FILES}개를 초과했습니다"
+            ));
+        }
+        let metadata = entry.metadata().map_err(|error| error.to_string())?;
+        *files_seen += 1;
+        let cursor_key = stable_local_identifier(&path.to_string_lossy());
+        let prefix_fingerprint = file_prefix_fingerprint(&path).ok_or_else(|| {
+            format!(
+                "공급사 로그 파일 경계를 읽을 수 없습니다. {}",
+                path.display()
+            )
+        })?;
+        let created_at_nanos = metadata
+            .created()
+            .ok()
+            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+            .map(|value| value.as_nanos().min(u128::from(u64::MAX)) as u64)
+            .unwrap_or(0);
+        cursors.insert(
+            cursor_key,
+            ScanCursor {
+                offset: metadata.len(),
+                prefix_fingerprint,
+                created_at_nanos,
+                gemini_discard_offset: None,
+                codex_baseline: capture_codex_baseline
+                    .then(|| codex_baseline_from_tail(&path, metadata.len()))
+                    .transpose()?
+                    .flatten(),
+            },
+        );
+    }
+    Ok(())
+}
+
+fn prime_provider_cursors(
+    home: &Path,
+    providers: &[UsageProvider],
+    cursors: &mut HashMap<String, ScanCursor>,
+) -> Result<(), String> {
+    for provider in providers {
+        let (root, extension) = match provider {
+            UsageProvider::Codex => (home.join(".codex").join("sessions"), "jsonl"),
+            UsageProvider::Claude => (home.join(".claude").join("projects"), "jsonl"),
+            UsageProvider::Gemini => (home.join(".gemini"), "log"),
+        };
+        let mut files_seen = 0;
+        prime_file_cursors_with_mode(
+            &root,
+            extension,
+            cursors,
+            0,
+            &mut files_seen,
+            matches!(provider, UsageProvider::Codex),
+        )?;
+    }
+    Ok(())
+}
+
+fn scan_local_usage_at(
+    home: &Path,
     modified_since: Option<u64>,
     providers: Option<Vec<UsageProvider>>,
-) -> Vec<LogDocument> {
+) -> Result<LocalUsageScanResult, String> {
     let _scan_guard = SCAN_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let Some(home) = std::env::var_os("USERPROFILE")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-    else {
-        return Vec::new();
-    };
+    let policy_revision = collection_policy_revision(home);
     let mut documents = Vec::new();
     let since = modified_since.unwrap_or(0);
     let mut files_seen = 0;
     let mut output_bytes = 0;
-    let mut cursors = load_scan_cursors(&home, modified_since.is_none());
-    if provider_selected(providers.as_deref(), UsageProvider::Codex) {
+    let mut cursors = load_scan_cursors(home);
+    let codex_selected = provider_selected(providers.as_deref(), UsageProvider::Codex);
+    let codex_baselines = if codex_selected {
+        cursors
+            .values_mut()
+            .filter_map(|cursor| cursor.codex_baseline.take())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if codex_selected {
+        let root = home.join(".codex").join("sessions");
         collect_files(
-            &home.join(".codex").join("sessions"),
+            &root,
             "jsonl",
             "codex",
             since,
@@ -1768,8 +3168,9 @@ fn scan_local_usage_blocking(
     }
     if provider_selected(providers.as_deref(), UsageProvider::Claude) {
         files_seen = 0;
+        let root = home.join(".claude").join("projects");
         collect_files(
-            &home.join(".claude").join("projects"),
+            &root,
             "jsonl",
             "claude",
             since,
@@ -1782,8 +3183,9 @@ fn scan_local_usage_blocking(
     }
     if provider_selected(providers.as_deref(), UsageProvider::Gemini) {
         files_seen = 0;
+        let root = home.join(".gemini");
         collect_files(
-            &home.join(".gemini"),
+            &root,
             "log",
             "gemini",
             since,
@@ -1794,21 +3196,40 @@ fn scan_local_usage_blocking(
             &mut cursors,
         );
     }
-    save_scan_cursors(&home, &cursors);
     documents.sort_by_key(|document| std::cmp::Reverse(document.modified_at));
-    documents
+    let commit_token = stage_scan_commit(home, cursors, policy_revision);
+    Ok(LocalUsageScanResult {
+        documents,
+        commit_token,
+        codex_baselines,
+    })
+}
+
+fn scan_local_usage_blocking(
+    modified_since: Option<u64>,
+    providers: Option<Vec<UsageProvider>>,
+) -> Result<LocalUsageScanResult, String> {
+    let home = user_home_path()?;
+    scan_local_usage_at(&home, modified_since, providers)
 }
 
 #[tauri::command]
 async fn scan_local_usage(
     modified_since: Option<u64>,
     providers: Option<Vec<UsageProvider>>,
-) -> Result<Vec<LogDocument>, String> {
+) -> Result<LocalUsageScanResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
         scan_local_usage_blocking(modified_since, providers)
     })
     .await
-    .map_err(|error| format!("로컬 사용량 수집 작업을 완료하지 못했습니다. {error}"))
+    .map_err(|error| format!("로컬 사용량 수집 작업을 완료하지 못했습니다. {error}"))?
+}
+
+#[tauri::command]
+async fn commit_scan_cursors(commit_token: String) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || commit_scan_cursors_blocking(&commit_token))
+        .await
+        .map_err(|error| format!("로컬 사용량 커서 저장을 완료하지 못했습니다. {error}"))?
 }
 
 #[tauri::command]
@@ -1871,6 +3292,14 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             scan_local_usage,
+            commit_scan_cursors,
+            load_or_store_device_id,
+            load_local_usage_cache,
+            save_local_usage_cache,
+            load_local_usage_state,
+            save_local_usage_state,
+            load_local_project_names,
+            save_local_project_names,
             integration_status,
             current_device_info,
             device_inventory::collect_device_inventory,
@@ -1884,6 +3313,7 @@ pub fn run() {
             native_integration::gemini_status,
             native_integration::configure_gemini_telemetry,
             native_integration::quota_statuses,
+            native_integration::load_collection_providers,
             native_integration::set_collection_providers,
             native_integration::claude_quota_capture_status,
             native_integration::configure_claude_quota_capture,

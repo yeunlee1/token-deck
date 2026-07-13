@@ -143,11 +143,13 @@ describe("UsageSyncService", () => {
     await new UsageSyncService(client).listUsageEvents(
       "2026-07-11T01:01:00.000Z",
       "00000000-0000-0000-0000-000000000001",
+      ["codex", "openai"],
     );
 
     const url = String(request.mock.calls[0][0]);
     expect(url).toContain("created_at=gte.2026-07-11T01%3A01%3A00.000Z");
     expect(url).toContain("device_id=neq.00000000-0000-0000-0000-000000000001");
+    expect(url).toContain("provider=in.(codex,openai)");
     expect(url).toContain("order=created_at.asc,event_id.asc");
     expect(url).toContain("metadata,created_at");
   });
@@ -208,6 +210,30 @@ describe("UsageSyncService", () => {
     }
   });
 
+  it("수집 선택이 바뀌면 이미 시작된 요청 뒤의 사용량 배치를 보내지 않는다", async () => {
+    let allowed = true;
+    let usageRequests = 0;
+    const request = vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input).includes("/rest/v1/usage_events?")) {
+        usageRequests += 1;
+        allowed = false;
+      }
+      return new Response(null, { status: 204 });
+    });
+    const client = new SupabaseRestClient({ url: "https://example.supabase.co", anonKey: "anon" }, request);
+    client.setSession({ accessToken: "access" });
+    const events = Array.from({ length: 1_201 }, (_, index) => ({ ...event(), eventId: `event-${index}` }));
+
+    const result = await new UsageSyncService(client).upsertUsageEvents(
+      events,
+      {},
+      { shouldContinue: () => allowed },
+    );
+
+    expect(result).toEqual({ uploaded: 500, disabled: false });
+    expect(usageRequests).toBe(1);
+  });
+
   it("1000행 Range 페이지를 반복해 1001개 이벤트를 모두 내려받는다", async () => {
     const base = {
       provider: "codex", source: "local_session", device_id: "device-2", session_id: null, project_id: null,
@@ -226,6 +252,27 @@ describe("UsageSyncService", () => {
     expect(result).toHaveLength(1001);
     expect(new Headers((request.mock.calls[0][1] as RequestInit).headers).get("Range")).toBe("0-999");
     expect(new Headers((request.mock.calls[1][1] as RequestInit).headers).get("Range")).toBe("1000-1999");
+  });
+
+  it("수집 선택이 바뀌면 원격 사용량의 다음 페이지를 내려받지 않는다", async () => {
+    let allowed = true;
+    const base = {
+      provider: "codex", source: "local_session", device_id: "device-2", session_id: null, project_id: null,
+      occurred_at: "2026-07-11T01:00:00.000Z", input_tokens: 1, cached_tokens: 0, output_tokens: 0,
+      reasoning_tokens: 0, tool_tokens: 0, metadata: {},
+    };
+    const firstPage = Array.from({ length: 1000 }, (_, index) => ({ ...base, event_id: `event-${index}` }));
+    const request = vi.fn(async () => {
+      allowed = false;
+      return new Response(JSON.stringify(firstPage), { status: 200 });
+    });
+    const client = new SupabaseRestClient({ url: "https://example.supabase.co", anonKey: "anon" }, request);
+    client.setSession({ accessToken: "access" });
+
+    const result = await new UsageSyncService(client).listUsageEvents(undefined, undefined, ["codex"], () => allowed);
+
+    expect(result).toHaveLength(1000);
+    expect(request).toHaveBeenCalledOnce();
   });
 
   it("계정 기기를 최근 접속 순서로 요청하고 앱 형식으로 변환한다", async () => {

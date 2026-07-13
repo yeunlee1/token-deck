@@ -63,6 +63,26 @@ describe("mini quota display", () => {
 
     expect(markup).toContain("Codex");
     expect(markup).not.toContain("Claude");
-    expect(markup).toContain("disabled");
+    expect(markup).toContain('aria-disabled="true"');
+    expect(markup).toContain("최소 한 개의 공급사는 항상 표시됩니다.");
+  });
+
+  it("미니모드에 보이는 공급사의 원본 갱신 시각만 표시한다", () => {
+    const visible = { ...quota, updatedAt: 100 };
+    const hidden = { ...quota, provider: "claude" as const, updatedAt: 200 };
+    const markup = renderToStaticMarkup(<MiniDashboard quotas={[visible, hidden]} providers={["codex"]} availableProviders={["codex", "claude"]} showTotal={false} totalTokens={0} totalPeriod="7일" updatedAt={new Date(200_000)} syncing={false} pinned={false} onToggleProvider={vi.fn()} onTogglePinned={vi.fn()} onExit={vi.fn()} />);
+
+    const expected = new Date(100_000).toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" });
+    const hiddenTime = new Date(200_000).toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" });
+    expect(markup).toContain(expected);
+    expect(markup).not.toContain(hiddenTime);
+  });
+
+  it("원래 한도를 제공하지 않는 공급사를 만료된 한도처럼 안내하지 않는다", () => {
+    const unsupported = { ...quota, provider: "gemini" as const, supported: false, fiveHour: null, weekly: null, message: "정액제 한도 미제공" };
+    const markup = renderToStaticMarkup(<MiniDashboard quotas={[unsupported]} providers={["gemini"]} availableProviders={["gemini"]} showTotal={false} totalTokens={0} totalPeriod="7일" syncing={false} pinned={false} onToggleProvider={vi.fn()} onTogglePinned={vi.fn()} onExit={vi.fn()} />);
+
+    expect(markup).toContain("한도 정보 없음");
+    expect(markup).not.toContain("새 한도 대기 중");
   });
 });

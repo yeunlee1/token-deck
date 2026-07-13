@@ -2,7 +2,12 @@
 import { describe, expect, it } from "vitest";
 
 import { parseClaudeJsonl } from "./claude";
-import { parseCodexJsonl } from "./codex";
+import {
+  applyCodexCumulativeBaselines,
+  MAX_CODEX_CUMULATIVE_CHECKPOINTS,
+  parseCodexJsonl,
+  pruneCodexCumulativeCheckpoints,
+} from "./codex";
 import { parseGeminiOtel } from "./gemini";
 import { stableId } from "./parse-utils";
 import { createCollectorState } from "./types";
@@ -46,6 +51,105 @@ describe("Codex JSONL collector", () => {
     const [event] = parseCodexJsonl(record, context, createCollectorState());
     expect(Object.values(event.tokens).reduce((sum, value) => sum + value, 0)).toBe(24_425);
     expect(event.id).toBe(stableId("codex", "device-a", "s1", "2026-07-11T00:00:01.000Z", 23_692, 9_984, 733, 255, 0));
+  });
+
+  it("수집 재활성화 직후 첫 누적값은 기준점으로만 저장하고 비활성 기간을 더하지 않는다", () => {
+    const state = createCollectorState();
+    state.codexCumulative["device-a:s1"] = { input: 100, cached: 0, output: 0, reasoning: 0, tool: 0 };
+    const baseline = JSON.stringify({ timestamp: "2026-07-11T00:00:01Z", payload: { session_id: "s1", info: { total_token_usage: { input_tokens: 1_000 } } } });
+    const firstEnabledRecord = JSON.stringify({ timestamp: "2026-07-11T00:00:02Z", payload: { session_id: "s1", info: { total_token_usage: { input_tokens: 1_100 } } } });
+
+    applyCodexCumulativeBaselines(baseline, context.deviceId, state);
+    const events = parseCodexJsonl(firstEnabledRecord, context, state);
+
+    expect(events).toHaveLength(1);
+    expect(events[0].tokens.input).toBe(100);
+    expect(state.codexCumulative["device-a:s1"].input).toBe(1_100);
+  });
+
+  it("5만 건을 넘은 체크포인트를 퇴역시키고 같은 세션의 재등장을 과대계상하지 않는다", () => {
+    const state = createCollectorState();
+    for (let index = 0; index <= MAX_CODEX_CUMULATIVE_CHECKPOINTS; index += 1) {
+      state.codexCumulative[`device-a:session-${index}`] = {
+        input: index + 1,
+        cached: 0,
+        output: 0,
+        reasoning: 0,
+        tool: 0,
+      };
+    }
+    expect(pruneCodexCumulativeCheckpoints(state)).toBe(1);
+    expect(Object.keys(state.codexCumulative)).toHaveLength(MAX_CODEX_CUMULATIVE_CHECKPOINTS);
+    expect(state.codexCumulative["device-a:session-0"]).toBeUndefined();
+    expect(state.codexCumulative["device-a:session-1"]).toBeDefined();
+    expect(state.codexRetiredSessionFilter).not.toBe("");
+
+    const restored = createCollectorState();
+    restored.codexRetiredSessionFilter = state.codexRetiredSessionFilter;
+    const reappeared = JSON.stringify({
+      timestamp: "2026-07-11T00:00:01Z",
+      payload: { session_id: "session-0", info: { total_token_usage: { input_tokens: 100 } } },
+    });
+    const nextIncrease = JSON.stringify({
+      timestamp: "2026-07-11T00:00:02Z",
+      payload: { session_id: "session-0", info: { total_token_usage: { input_tokens: 120 } } },
+    });
+
+    expect(parseCodexJsonl(reappeared, context, restored)).toEqual([]);
+    expect(parseCodexJsonl(nextIncrease, context, restored)[0].tokens.input).toBe(20);
+  });
+
+  it("재등장 기준점을 5만 건 상태에서 다시 가지치기해도 다음 증가분을 놓치지 않는다", () => {
+    const state = createCollectorState();
+    state.codexCumulative["device-a:reappeared"] = {
+      input: 1,
+      cached: 0,
+      output: 0,
+      reasoning: 0,
+      tool: 0,
+    };
+    for (let index = 0; index < MAX_CODEX_CUMULATIVE_CHECKPOINTS; index += 1) {
+      state.codexCumulative[`device-a:retained-${index}`] = {
+        input: index + 1,
+        cached: 0,
+        output: 0,
+        reasoning: 0,
+        tool: 0,
+      };
+    }
+    pruneCodexCumulativeCheckpoints(state);
+
+    const reappeared = JSON.stringify({
+      timestamp: "2026-07-11T00:00:01Z",
+      payload: { session_id: "reappeared", info: { total_token_usage: { input_tokens: 100 } } },
+    });
+    const nextIncrease = JSON.stringify({
+      timestamp: "2026-07-11T00:00:02Z",
+      payload: { session_id: "reappeared", info: { total_token_usage: { input_tokens: 120 } } },
+    });
+
+    expect(parseCodexJsonl(reappeared, context, state)).toEqual([]);
+    expect(pruneCodexCumulativeCheckpoints(state)).toBe(1);
+    expect(state.codexCumulative["device-a:reappeared"]?.input).toBe(100);
+    expect(parseCodexJsonl(nextIncrease, context, state)[0].tokens.input).toBe(20);
+  });
+
+  it("퇴역 필터에 없는 새 세션의 첫 누적값은 계속 수집한다", () => {
+    const state = createCollectorState();
+    state.codexCumulative["device-a:retired"] = {
+      input: 10,
+      cached: 0,
+      output: 0,
+      reasoning: 0,
+      tool: 0,
+    };
+    pruneCodexCumulativeCheckpoints(state, 0);
+    const newSession = JSON.stringify({
+      timestamp: "2026-07-11T00:00:01Z",
+      payload: { session_id: "new-session", info: { total_token_usage: { input_tokens: 25 } } },
+    });
+
+    expect(parseCodexJsonl(newSession, context, state)[0].tokens.input).toBe(25);
   });
 
   it("ignores malformed and content-only lines", () => {

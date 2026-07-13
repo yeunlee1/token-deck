@@ -29,6 +29,13 @@ export function MiniDashboard(props: MiniDashboardProps) {
   const availableOptions = options.filter((option) => availableProviderValues.includes(option.value));
   const selectedAvailableProviders = props.providers.filter((provider) => availableProviderValues.includes(provider));
   const visibleProviders = selectedAvailableProviders.length ? selectedAvailableProviders : availableOptions.slice(0, 1).map((option) => option.value);
+  const hasCurrentQuota = visibleProviders.some((provider) => quotaByProvider.get(provider)?.supported);
+  const hasExpiredQuota = visibleProviders.some((provider) => (quotaByProvider.get(provider)?.expiredWindows?.length ?? 0) > 0);
+  const visibleUpdatedAt = visibleProviders.reduce<number | undefined>((latest, provider) => {
+    const quota = quotaByProvider.get(provider);
+    if (!quota?.supported || quota.updatedAt === null) return latest;
+    return latest === undefined ? quota.updatedAt : Math.max(latest, quota.updatedAt);
+  }, undefined);
   const compactTotal = new Intl.NumberFormat("ko-KR", { notation: props.totalTokens > 9999 ? "compact" : "standard", maximumFractionDigits: 1 }).format(props.totalTokens);
 
   return <main className="mini-dashboard" aria-label="Token Deck 미니 모드">
@@ -39,8 +46,9 @@ export function MiniDashboard(props: MiniDashboardProps) {
     </header>
     <div className="mini-selector" role="group" aria-label="표시할 공급사">{availableOptions.map((option) => {
       const selected = visibleProviders.includes(option.value);
-      return <button key={option.value} aria-pressed={selected} disabled={selected && visibleProviders.length === 1} onClick={() => props.onToggleProvider(option.value)}>{option.label}</button>;
-    })}</div>
+      const required = selected && visibleProviders.length === 1;
+      return <button key={option.value} aria-pressed={selected} aria-disabled={required} aria-describedby="mini-provider-rule" onClick={() => { if (!required) props.onToggleProvider(option.value); }}>{option.label}</button>;
+    })}<span className="visually-hidden" id="mini-provider-rule">최소 한 개의 공급사는 항상 표시됩니다.</span></div>
     <div className="mini-columns" aria-hidden="true"><span>공급사</span><span>5시간 잔여</span><span>주간 잔여</span></div>
     <section className="mini-provider-rows" aria-live="polite">{visibleProviders.map((provider) => {
       const quota = quotaByProvider.get(provider);
@@ -51,6 +59,6 @@ export function MiniDashboard(props: MiniDashboardProps) {
       </article>;
     })}</section>
     {props.error && <p className="mini-error" role="alert">{props.error}</p>}
-    <footer className="mini-footer"><span><i /> {props.syncing ? "SYNC" : "LIVE"}</span><small>{props.syncing ? "확인 중" : props.updatedAt?.toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" }) ?? "대기 중"}</small></footer>
+    <footer className="mini-footer"><span><i /> {props.syncing ? "SYNC" : hasCurrentQuota ? "LIVE" : "WAIT"}</span><small>{props.syncing ? "확인 중" : hasCurrentQuota ? visibleUpdatedAt === undefined ? "원본 시각 없음" : new Date(visibleUpdatedAt * 1_000).toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" }) : hasExpiredQuota ? "새 한도 대기 중" : "한도 정보 없음"}</small></footer>
   </main>;
 }

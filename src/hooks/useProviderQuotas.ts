@@ -57,6 +57,14 @@ export function pendingQuotaRecord(enabledProviders: QuotaProvider[]): Record<Qu
   ])) as Record<QuotaProvider, ProviderQuotaStatus>;
 }
 
+export function latestCurrentQuotaUpdate(statuses: ProviderQuotaStatus[]): Date | undefined {
+  const seconds = statuses.reduce<number | undefined>((latest, status) => {
+    if (!status.supported || status.updatedAt === null) return latest;
+    return latest === undefined ? status.updatedAt : Math.max(latest, status.updatedAt);
+  }, undefined);
+  return seconds === undefined ? undefined : new Date(seconds * 1_000);
+}
+
 export function useProviderQuotas(enabledProviders: QuotaProvider[] = ALL_PROVIDERS, pollIntervalMs = 30_000) {
   const providerKey = enabledProviders.join("|");
   const currentProviderKey = useRef(providerKey);
@@ -83,7 +91,7 @@ export function useProviderQuotas(enabledProviders: QuotaProvider[] = ALL_PROVID
         if (currentProviderKey.current !== providerKey) return;
         setQuotas(quotaRecord(statuses, enabledProviders));
         setClaudeCapture(capture);
-        setUpdatedAt(new Date());
+        setUpdatedAt(latestCurrentQuotaUpdate(statuses));
         setError(undefined);
       } catch (cause) {
         if (currentProviderKey.current !== providerKey) return;
@@ -102,6 +110,7 @@ export function useProviderQuotas(enabledProviders: QuotaProvider[] = ALL_PROVID
     setQuotas(pendingQuotaRecord(enabledProviders));
     setClaudeCapture((current) => enabledProviders.includes("claude") ? current : EMPTY_CAPTURE);
     setError(undefined);
+    setUpdatedAt(undefined);
     setLoading(true);
   }, [enabledProviders, providerKey]);
 

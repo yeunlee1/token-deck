@@ -1,6 +1,6 @@
 // 한도 상태 배열을 공급사별 안정적인 레코드로 변환하는지 검증하는 테스트
 import { describe, expect, it } from "vitest";
-import { pendingQuotaRecord, quotaRecord } from "./useProviderQuotas";
+import { latestCurrentQuotaUpdate, pendingQuotaRecord, quotaRecord } from "./useProviderQuotas";
 
 describe("quotaRecord", () => {
   it("누락 공급사는 미지원 기본값으로 채운다", () => {
@@ -31,5 +31,19 @@ describe("quotaRecord", () => {
 
     expect(result.claude.message).toBe("잔여 한도를 확인 중입니다.");
     expect(result.codex.message).toBe("설정에서 수집이 꺼져 있습니다.");
+  });
+
+  it("화면 갱신 시각은 폴링 시각이 아니라 현재 한도 원본 시각을 사용한다", () => {
+    const statuses = [{
+      provider: "codex" as const, supported: true, planType: "pro",
+      fiveHour: null, weekly: { usedPercent: 20, remainingPercent: 80, windowMinutes: 10_080, resetsAt: 200 },
+      daily: null, message: null, updatedAt: 100,
+    }, {
+      provider: "claude" as const, supported: false, planType: null,
+      fiveHour: null, weekly: null, daily: null, message: "만료됨", updatedAt: 999,
+    }];
+
+    expect(latestCurrentQuotaUpdate(statuses)?.getTime()).toBe(100_000);
+    expect(latestCurrentQuotaUpdate(statuses.slice(1))).toBeUndefined();
   });
 });

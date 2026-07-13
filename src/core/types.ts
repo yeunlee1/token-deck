@@ -31,6 +31,7 @@ export interface CollectorContext {
 
 export interface CollectorState {
   codexCumulative: Record<string, TokenBreakdown>;
+  codexRetiredSessionFilter: string;
   claudeRequestIds: Set<string>;
   geminiEventIds: Set<string>;
 }
@@ -38,6 +39,7 @@ export interface CollectorState {
 export function createCollectorState(): CollectorState {
   return {
     codexCumulative: {},
+    codexRetiredSessionFilter: "",
     claudeRequestIds: new Set(),
     geminiEventIds: new Set(),
   };

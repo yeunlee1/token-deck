@@ -31,4 +31,10 @@ describe("quota display", () => {
     expect(quotaWindowLabel(status, "fiveHour")).toBe("현재 미제공");
     expect(quotaWindowLabel(status, "weekly")).toBe("81%");
   });
+
+  it("원래 있던 한도 창이 만료되면 공급사 미제공과 구분한다", () => {
+    const status: ProviderQuotaStatus = { provider: "claude", supported: true, planType: "pro", fiveHour: null, weekly: quota(81), daily: null, expiredWindows: ["fiveHour"], message: null, updatedAt: 100 };
+
+    expect(quotaWindowLabel(status, "fiveHour")).toBe("새 한도 대기");
+  });
 });

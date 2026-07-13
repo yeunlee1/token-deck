@@ -40,6 +40,7 @@ export interface ProviderQuotaStatus {
   fiveHour: QuotaWindowStatus | null;
   weekly: QuotaWindowStatus | null;
   daily: QuotaWindowStatus | null;
+  expiredWindows?: Array<"fiveHour" | "weekly" | "daily">;
   message: string | null;
   updatedAt: number | null;
 }

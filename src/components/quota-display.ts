@@ -15,6 +15,7 @@ export interface ProviderQuotaStatus {
   fiveHour: QuotaWindowStatus | null;
   weekly: QuotaWindowStatus | null;
   daily: QuotaWindowStatus | null;
+  expiredWindows?: Array<"fiveHour" | "weekly" | "daily">;
   message: string | null;
   updatedAt: number | null;
 }
@@ -27,6 +28,7 @@ export function remainingLabel(window: QuotaWindowStatus | null): string {
 export function quotaWindowLabel(quota: ProviderQuotaStatus | undefined, window: "fiveHour" | "weekly"): string {
   const value = quota?.[window] ?? null;
   if (value) return remainingLabel(value);
+  if (quota?.expiredWindows?.includes(window)) return "새 한도 대기";
   return quota?.supported ? "현재 미제공" : "—";
 }
 

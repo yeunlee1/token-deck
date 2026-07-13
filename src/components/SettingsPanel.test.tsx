@@ -129,7 +129,8 @@ describe("SettingsPanel 계정 진입 경로", () => {
     expect((markup.match(/aria-pressed="true"/g) ?? [])).toHaveLength(1);
     expect((markup.match(/aria-pressed="false"/g) ?? [])).toHaveLength(2);
     expect((markup.match(/class="credential-form"/g) ?? [])).toHaveLength(3);
-    expect(markup).toContain("disabled");
+    expect(markup).toContain('aria-disabled="true"');
+    expect(markup).toContain("Gemini 해제 중 해당 파일을 읽거나 동기화하지 않습니다");
     expect(markup).not.toContain("Claude 한도 연동이 꺼져 있습니다");
     expect(markup).not.toContain("Gemini CLI 수집");
   });
