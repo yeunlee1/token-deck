@@ -309,6 +309,8 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .nav-item.active { color: var(--sidebar-text); background: var(--sidebar-active); }
 .nav-item.active::before { content: ""; width: 3px; height: 21px; position: absolute; left: -18px; background: var(--lime); border-radius: 0 3px 3px 0; }
 .sidebar-bottom { position: relative; margin-top: auto; }
+.login-screen-entry { min-height: 44px; margin-bottom: 4px; color: var(--sidebar-text); background: var(--sidebar-active); }
+.login-screen-entry svg { color: var(--accent-highlight); }
 .account-chip { display: grid; grid-template-columns: 34px 1fr 15px; gap: 10px; align-items: center; margin-top: 14px; padding: 16px 6px 0; border-top: 1px solid var(--inverse-border); }
 .account-button { width: 100%; color: inherit; text-align: left; background: transparent; border: 0; cursor: pointer; }
 .avatar { width: 34px; height: 34px; display: grid; place-items: center; background: var(--inverse-surface); color: var(--accent-highlight); border-radius: 50%; font-size: 11px; font-weight: 800; }

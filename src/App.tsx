@@ -61,6 +61,26 @@ function SectionTitle({ eyebrow, title, action }: { eyebrow: string; title: stri
   return <div className="section-title"><div><span>{eyebrow}</span><h2>{title}</h2></div>{action}</div>;
 }
 
+export function LoginScreenEntry({ authenticated, onReturnToLogin }: { authenticated: boolean; onReturnToLogin: () => Promise<void> | void }) {
+  if (authenticated) return null;
+
+  return <button type="button" className="nav-item login-screen-entry" aria-label="로그인 화면으로 돌아가기" onClick={() => void onReturnToLogin()}><Icon name="cloud" /><span>로그인 화면으로 돌아가기</span></button>;
+}
+
+export function dashboardConnectionLabels(
+  onboardingComplete: boolean,
+  authStatus: "local" | "signed_out" | "authenticated",
+  authEnabled: boolean,
+  cloudSyncStatus: string,
+): { accountMeta: string; syncHealth: string } {
+  const authenticated = authStatus === "authenticated";
+  const localOnly = onboardingComplete && !authenticated;
+  return {
+    accountMeta: authenticated ? "여러 기기 동기화 활성" : localOnly ? "로컬 전용 사용 중" : authEnabled ? "로그인 필요" : "운영 서버 연결 오류",
+    syncHealth: localOnly || cloudSyncStatus === "disabled" ? "LOCAL" : cloudSyncStatus.toUpperCase(),
+  };
+}
+
 export default function App() {
   useAutoUpdater();
   const runtime = useAppRuntime();
@@ -182,8 +202,9 @@ export default function App() {
 
   const connectedCount = Object.values(runtime.integrations).filter(Boolean).length;
   const authenticated = runtime.auth.status === "authenticated";
+  const connectionLabels = dashboardConnectionLabels(onboardingComplete, runtime.auth.status, runtime.auth.enabled, runtime.cloudSync.status);
   const accountName = authenticated ? "동기화 계정" : "로컬 사용자";
-  const accountMeta = authenticated ? "여러 기기 동기화 활성" : runtime.auth.enabled ? "로그인 필요" : "운영 서버 연결 오류";
+  const accountMeta = connectionLabels.accountMeta;
   const syncLabel = runtime.cloudSync.status === "syncing" || runtime.syncing ? "동기화 중" : runtime.cloudSync.status === "error" || runtime.error ? "수집 오류" : "실시간 수집 중";
 
   const runSync = () => void Promise.all([runtime.syncNow(), providerQuotas.refresh()]);
@@ -247,6 +268,7 @@ export default function App() {
           <button className={`nav-item ${activeView === "devices" ? "active" : ""}`} aria-current={activeView === "devices" ? "page" : undefined} onClick={() => setActiveView("devices")}><Icon name="device" /><span>기기</span></button>
         </nav>
         <div className="sidebar-bottom">
+          <LoginScreenEntry authenticated={authenticated} onReturnToLogin={returnToLogin} />
           <button className="nav-item" onClick={() => setSettingsOpen(true)}><Icon name="settings" /><span>설정</span></button>
           <button className="account-chip account-button" onClick={() => setSettingsOpen(true)}><span className="avatar">TD</span><div><strong>{accountName}</strong><small>{accountMeta}</small></div><Icon name="chevron" /></button>
         </div>
@@ -268,7 +290,7 @@ export default function App() {
             <div className="pulse-orbit" aria-hidden="true"><span /><i /><b /></div>
           </article>
           <article className="status-card">
-            <span className="eyebrow">SYNC HEALTH</span><div className="health-label"><strong>{runtime.cloudSync.status === "disabled" ? "LOCAL" : runtime.cloudSync.status.toUpperCase()}</strong></div>
+            <span className="eyebrow">SYNC HEALTH</span><div className="health-label"><strong>{connectionLabels.syncHealth}</strong></div>
             <p>최근 갱신 <strong>{runtime.syncing ? "진행 중" : runtime.updatedAt ? runtime.updatedAt.toLocaleTimeString("ko-KR") : "대기 중"}</strong></p>
             <div className="status-row"><span><i className="ok" /> 현재 기기</span><strong>1</strong></div>
             <div className="status-row"><span><i className={connectedCount ? "ok" : ""} /> 수집 커넥터</span><strong>{connectedCount} / 3</strong></div>
