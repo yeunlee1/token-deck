@@ -44,6 +44,7 @@ describe("UsageSyncService", () => {
 
     expect(request).toHaveBeenCalledTimes(3);
     expect(request.mock.calls[0][0]).toContain("/projects?on_conflict=user_id,id");
+    expect(new Headers((request.mock.calls[0][1] as RequestInit).headers).get("Prefer")).toContain("resolution=ignore-duplicates");
     expect(request.mock.calls[1][0]).toContain("/sessions?on_conflict=user_id,id");
     expect(request.mock.calls[2][0]).toContain("/usage_events?on_conflict=user_id,event_id");
     expect(JSON.parse(String((request.mock.calls[2][1] as RequestInit).body))[0]).toEqual(expect.objectContaining({
@@ -52,6 +53,68 @@ describe("UsageSyncService", () => {
     }));
     expect(String((request.mock.calls[1][1] as RequestInit).body)).not.toContain("session-external");
     expect(String((request.mock.calls[2][1] as RequestInit).body)).not.toContain("session-external");
+  });
+
+  it("선택한 프로젝트 표시명은 신규 행에 넣되 기존 계정 이름은 덮지 않는다", async () => {
+    const request = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    const client = new SupabaseRestClient({ url: "https://example.supabase.co", anonKey: "anon" }, request);
+    client.setSession({ accessToken: "access" });
+    const namedProjectId = `git_${"a".repeat(64)}`;
+    const unnamedProjectId = `local_${"b".repeat(64)}`;
+
+    await new UsageSyncService(client).upsertUsageEvents([
+      { ...event(), eventId: "named", projectId: namedProjectId },
+      { ...event(), eventId: "unnamed", projectId: unnamedProjectId },
+    ], { [namedProjectId]: "  토큰 덱  " });
+
+    const projectCalls = request.mock.calls.filter(([url]) => String(url).includes("/rest/v1/projects?"));
+    expect(projectCalls).toHaveLength(1);
+    expect(new Headers((projectCalls[0][1] as RequestInit).headers).get("Prefer")).toContain("resolution=ignore-duplicates");
+    expect(JSON.parse(String((projectCalls[0][1] as RequestInit).body))).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: unnamedProjectId, name: `프로젝트 ${"b".repeat(8)}` }),
+      expect.objectContaining({ id: namedProjectId, name: "토큰 덱" }),
+    ]));
+  });
+
+  it("나중 기기의 일반 프로젝트 이름이 기존 명시 이름을 덮지 않는다", async () => {
+    let storedName: string | undefined;
+    const request = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).includes("/rest/v1/projects?")) {
+        const [row] = JSON.parse(String(init?.body)) as Array<{ name: string }>;
+        const prefer = new Headers(init?.headers).get("Prefer") ?? "";
+        if (!storedName || prefer.includes("merge-duplicates")) storedName = row.name;
+      }
+      return new Response(null, { status: 204 });
+    });
+    const client = new SupabaseRestClient({ url: "https://example.supabase.co", anonKey: "anon" }, request);
+    client.setSession({ accessToken: "access" });
+    const projectId = `git_${"f".repeat(64)}`;
+    const service = new UsageSyncService(client);
+
+    await service.upsertUsageEvents([{ ...event(), eventId: "explicit", projectId }], { [projectId]: "사용자 이름" });
+    await service.upsertUsageEvents([{ ...event(), eventId: "fallback", projectId }]);
+
+    expect(storedName).toBe("사용자 이름");
+  });
+
+  it("비어 있거나 80자를 넘는 표시명은 일반 이름으로만 신규 삽입한다", async () => {
+    const request = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    const client = new SupabaseRestClient({ url: "https://example.supabase.co", anonKey: "anon" }, request);
+    client.setSession({ accessToken: "access" });
+    const emptyNameId = `project_${"c".repeat(64)}`;
+    const longNameId = `provider_${"d".repeat(64)}`;
+
+    await new UsageSyncService(client).upsertUsageEvents([
+      { ...event(), eventId: "empty", projectId: emptyNameId },
+      { ...event(), eventId: "long", projectId: longNameId },
+    ], { [emptyNameId]: "   ", [longNameId]: "가".repeat(81) });
+
+    const projectCall = request.mock.calls.find(([url]) => String(url).includes("/rest/v1/projects?"));
+    expect(new Headers((projectCall?.[1] as RequestInit).headers).get("Prefer")).toContain("resolution=ignore-duplicates");
+    expect(JSON.parse(String((projectCall?.[1] as RequestInit).body))).toEqual([
+      expect.objectContaining({ id: emptyNameId, name: `프로젝트 ${"c".repeat(8)}` }),
+      expect.objectContaining({ id: longNameId, name: `프로젝트 ${"d".repeat(8)}` }),
+    ]);
   });
 
   it("다른 기기의 클라우드 이벤트와 원본 프로젝트 식별자를 내려받는다", async () => {
@@ -176,6 +239,57 @@ describe("UsageSyncService", () => {
       id: "device-2", name: "노트북", platform: "windows", appVersion: "0.2.0", lastSeenAt: "2026-07-11T02:00:00Z",
     }]);
     expect(request.mock.calls[0][0]).toContain("order=last_seen_at.desc");
+  });
+
+  it("계정 프로젝트를 조회해 표시명과 익명 식별자를 앱 형식으로 변환한다", async () => {
+    const projectId = `git_${"a".repeat(64)}`;
+    const request = vi.fn().mockResolvedValue(new Response(JSON.stringify([{
+      id: projectId,
+      name: "토큰 덱",
+      git_remote_hash: projectId,
+      local_project_hash: null,
+      created_at: "2026-07-11T02:00:00Z",
+    }]), { status: 200 }));
+    const client = new SupabaseRestClient({ url: "https://example.supabase.co", anonKey: "anon" }, request);
+    client.setSession({ accessToken: "access" });
+
+    await expect(new UsageSyncService(client).listProjects()).resolves.toEqual([{
+      id: projectId,
+      name: "토큰 덱",
+      gitRemoteHash: projectId,
+      createdAt: "2026-07-11T02:00:00Z",
+    }]);
+    expect(request.mock.calls[0][0]).toContain("projects?select=id,name,git_remote_hash,local_project_hash,created_at");
+    expect(new Headers((request.mock.calls[0][1] as RequestInit).headers).get("Range")).toBe("0-999");
+  });
+
+  it("사용자 프로젝트 이름을 소유 계정 행에만 PATCH한다", async () => {
+    const request = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    const client = new SupabaseRestClient({ url: "https://example.supabase.co", anonKey: "anon" }, request);
+    client.setSession({ accessToken: "access" });
+    const projectId = `project_${"e".repeat(64)}`;
+
+    await expect(new UsageSyncService(client).updateProjectName(projectId, "  회사 프로젝트  "))
+      .resolves.toEqual({ uploaded: 1, disabled: false });
+
+    expect(request.mock.calls[0][0]).toContain(`/projects?id=eq.${projectId}`);
+    expect((request.mock.calls[0][1] as RequestInit).method).toBe("PATCH");
+    expect(JSON.parse(String((request.mock.calls[0][1] as RequestInit).body))).toEqual({ name: "회사 프로젝트" });
+    expect(new Headers((request.mock.calls[0][1] as RequestInit).headers).get("Prefer")).toBe("return=minimal");
+  });
+
+  it("잘못된 사용자 프로젝트 이름은 네트워크 요청 전에 거부한다", async () => {
+    const request = vi.fn();
+    const client = new SupabaseRestClient({ url: "https://example.supabase.co", anonKey: "anon" }, request);
+    client.setSession({ accessToken: "access" });
+    const service = new UsageSyncService(client);
+
+    await expect(service.updateProjectName("project-1", "   ")).resolves.toEqual(expect.objectContaining({
+      uploaded: 0,
+      disabled: false,
+      error: expect.stringContaining("1자 이상 80자 이하"),
+    }));
+    expect(request).not.toHaveBeenCalled();
   });
 });
 

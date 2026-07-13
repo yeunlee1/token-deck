@@ -1,8 +1,9 @@
 // 동기화된 계정 API 토큰과 비용이 재시작 후에도 설정 요약에 복원되는지 검증하는 테스트
 import { describe, expect, it, vi } from "vitest";
-import type { DeviceInventoryItem, UsageEvent } from "../services";
+import { SupabaseRestClient, UsageSyncService, type DeviceInventoryItem, type UsageEvent } from "../services";
 import { decodeOwnedProviderSecret, encodeOwnedProviderSecret } from "../services/credential-store";
 import {
+  cancelPendingAuthAttempt,
   commitSession,
   claimAccountLocalEvents,
   clearProductionSupabaseOverride,
@@ -10,13 +11,18 @@ import {
   createSerialTaskRunner,
   createUsageSyncCache,
   filterAccountLocalEvents,
+  hasInventorySyncPreference,
   loadStoredSession,
   localEventsToTitledSyncEvents,
   markSessionTombstone,
+  markInventoryLoginConsent,
+  mergeAccountProjectNames,
   mergeAccountProviderUsage,
   providerEventsForOwner,
   providerCredentialOwner,
   readInventorySyncPreference,
+  readAccountProjectNameOverrides,
+  consumeInventoryLoginConsent,
   reconcileDownloadedUsage,
   recordUploadedUsage,
   requireOneTimeAuthCode,
@@ -26,6 +32,7 @@ import {
   settleWithin,
   shouldFullyReconcile,
   writeInventorySyncPreference,
+  writeAccountProjectNameOverrides,
 } from "./useAppRuntime";
 
 describe("account provider usage summary", () => {
@@ -244,14 +251,92 @@ describe("계정별 로컬 사용량 격리", () => {
   });
 });
 
+describe("계정별 프로젝트 이름 격리", () => {
+  it("A 계정과 로컬 전용 이름을 B 계정의 표시·원격 삽입 이름에 섞지 않는다", async () => {
+    const storage = new MemoryStorage();
+    const ownerA = "scope\nuser-a";
+    const ownerB = "scope\nuser-b";
+    const projectId = `git_${"a".repeat(64)}`;
+    storage.setItem("token-deck-project-names", JSON.stringify({ [projectId]: "로컬 전용 이름" }));
+    writeAccountProjectNameOverrides(ownerA, { [projectId]: "A 비공개 이름" }, storage);
+    writeAccountProjectNameOverrides(ownerB, { [projectId]: "B 계정 이름" }, storage);
+
+    const namesForB = mergeAccountProjectNames(
+      { [projectId]: "프로젝트 폴더 이름" },
+      {},
+      readAccountProjectNameOverrides(ownerB, storage),
+    );
+    const namesForNewAccount = mergeAccountProjectNames(
+      { [projectId]: "프로젝트 폴더 이름" },
+      {},
+      readAccountProjectNameOverrides("scope\nuser-c", storage),
+    );
+
+    expect(readAccountProjectNameOverrides(ownerA, storage)).toEqual({ [projectId]: "A 비공개 이름" });
+    expect(namesForB[projectId]).toBe("B 계정 이름");
+    expect(namesForNewAccount[projectId]).toBe("프로젝트 폴더 이름");
+    expect(storage.getItem("token-deck-project-names")).toBe(JSON.stringify({ [projectId]: "로컬 전용 이름" }));
+
+    const request = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    const client = new SupabaseRestClient({ url: "https://example.supabase.co", anonKey: "anon" }, request);
+    client.setSession({ accessToken: "account-b" });
+    await new UsageSyncService(client).upsertUsageEvents([syncEvent({
+      eventId: "account-b-project-event",
+      provider: "codex",
+      source: "local_session",
+      projectId,
+    })], namesForB);
+
+    const projectCall = request.mock.calls.find(([url]) => String(url).includes("/rest/v1/projects?"));
+    const [inserted] = JSON.parse(String((projectCall?.[1] as RequestInit).body)) as Array<{ name: string }>;
+    expect(inserted.name).toBe("B 계정 이름");
+    expect(inserted.name).not.toBe("A 비공개 이름");
+    expect(inserted.name).not.toBe("로컬 전용 이름");
+  });
+});
+
 describe("기기 설정 인벤토리 계정 격리", () => {
-  it("설정 목록 동기화 동의를 계정별로 분리해 저장한다", () => {
+  it("설정 목록 공유 선택을 계정별로 분리하고 저장 전에는 활성화하지 않는다", () => {
     const storage = new MemoryStorage();
     writeInventorySyncPreference("scope\nuser-a", true, storage);
 
     expect(readInventorySyncPreference("scope\nuser-a", storage)).toBe(true);
+    expect(hasInventorySyncPreference("scope\nuser-a", storage)).toBe(true);
     expect(readInventorySyncPreference("scope\nuser-b", storage)).toBe(false);
+    expect(hasInventorySyncPreference("scope\nuser-b", storage)).toBe(false);
+    writeInventorySyncPreference("scope\nuser-b", false, storage);
+    expect(readInventorySyncPreference("scope\nuser-b", storage)).toBe(false);
+    expect(hasInventorySyncPreference("scope\nuser-b", storage)).toBe(true);
     expect(readInventorySyncPreference(undefined, storage)).toBe(false);
+  });
+
+  it("로그인 화면에서 확인한 메타데이터 공유 동의는 한 번만 소비한다", () => {
+    const storage = new MemoryStorage();
+
+    markInventoryLoginConsent(storage);
+
+    expect(consumeInventoryLoginConsent(storage)).toBe(true);
+    expect(consumeInventoryLoginConsent(storage)).toBe(false);
+  });
+
+  it("로컬 전용 선택은 진행 중 인증 상태와 동의를 지우고 콜백 세대를 무효화한다", () => {
+    const authStorage = new MemoryStorage();
+    const consentStorage = new MemoryStorage();
+    authStorage.setItem("token-deck-auth-state", "pending-state");
+    authStorage.setItem("token-deck-auth-pkce-verifier", "pending-verifier");
+    authStorage.setItem("unrelated", "preserved");
+    markInventoryLoginConsent(consentStorage);
+    const authAttemptGeneration = { current: 7 };
+    const accountGeneration = { current: 11 };
+
+    cancelPendingAuthAttempt(authAttemptGeneration, accountGeneration, authStorage, consentStorage);
+
+    expect(authAttemptGeneration.current).toBe(8);
+    expect(accountGeneration.current).toBe(12);
+    expect(authStorage.getItem("token-deck-auth-state")).toBeNull();
+    expect(authStorage.getItem("token-deck-auth-pkce-verifier")).toBeNull();
+    expect(authStorage.getItem("unrelated")).toBe("preserved");
+    expect(consumeInventoryLoginConsent(consentStorage)).toBe(false);
   });
 
   it("현재 기기와 수동 항목을 제외하고 원격 스냅샷의 정규 항목만 적용한다", () => {

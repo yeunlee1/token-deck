@@ -18,6 +18,15 @@ import { stableId } from "../../core/parse-utils";
 const BATCH_SIZE = 500;
 const DEVICE_INVENTORY_MAX_ITEMS = 512;
 const DEVICE_INVENTORY_MAX_BYTES = 512 * 1024;
+const PROJECT_NAME_MAX_LENGTH = 80;
+
+export interface SyncedProject {
+  id: string;
+  name: string;
+  gitRemoteHash?: string;
+  localProjectHash?: string;
+  createdAt?: string;
+}
 
 export class UsageSyncService {
   constructor(private readonly client: SupabaseRestClient) {}
@@ -42,13 +51,16 @@ export class UsageSyncService {
     }
   }
 
-  async upsertUsageEvents(events: UsageEvent[]): Promise<SyncResult> {
+  async upsertUsageEvents(
+    events: UsageEvent[],
+    projectNames: Readonly<Record<string, string | undefined>> = {},
+  ): Promise<SyncResult> {
     if (!this.client.enabled) return { uploaded: 0, disabled: true };
     if (events.length === 0) return { uploaded: 0, disabled: false };
 
     let uploaded = 0;
     try {
-      await this.upsertReferences(events);
+      await this.upsertReferences(events, projectNames);
       for (let index = 0; index < events.length; index += BATCH_SIZE) {
         const batch = events.slice(index, index + BATCH_SIZE).map(toRow);
         await this.client.call("/rest/v1/usage_events?on_conflict=user_id,event_id", {
@@ -64,14 +76,23 @@ export class UsageSyncService {
     }
   }
 
-  private async upsertReferences(events: UsageEvent[]): Promise<void> {
-    const projects = new Map<string, { id: string; name: string; git_remote_hash: string | null; local_project_hash: string | null }>();
+  private async upsertReferences(
+    events: UsageEvent[],
+    projectNames: Readonly<Record<string, string | undefined>>,
+  ): Promise<void> {
+    const projects = new Map<string, {
+      id: string;
+      name: string;
+      git_remote_hash: string | null;
+      local_project_hash: string | null;
+    }>();
     const sessions = new Map<string, { id: string; device_id: string; project_id: string | null; provider: UsageEvent["provider"]; external_id: string; started_at: string; title: string | null }>();
     for (const event of events) {
       if (event.projectId) {
+        const explicitName = normalizeProjectName(projectNames[event.projectId]);
         projects.set(event.projectId, {
           id: event.projectId,
-          name: `프로젝트 ${event.projectId.slice(-8)}`,
+          name: explicitName ?? fallbackProjectName(event.projectId),
           git_remote_hash: event.projectId.startsWith("git_") ? event.projectId : null,
           local_project_hash: event.projectId.startsWith("git_") ? null : event.projectId,
         });
@@ -91,19 +112,30 @@ export class UsageSyncService {
       }
     }
     const projectRows = [...projects.values()];
-    for (let index = 0; index < projectRows.length; index += BATCH_SIZE) {
-      await this.client.call("/rest/v1/projects?on_conflict=user_id,id", {
-        method: "POST",
-        headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
-        body: JSON.stringify(projectRows.slice(index, index + BATCH_SIZE)),
-      });
-    }
+    await this.insertProjectRows(projectRows);
     const sessionRows = [...sessions.values()];
     for (let index = 0; index < sessionRows.length; index += BATCH_SIZE) {
       await this.client.call("/rest/v1/sessions?on_conflict=user_id,id", {
         method: "POST",
         headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
         body: JSON.stringify(sessionRows.slice(index, index + BATCH_SIZE)),
+      });
+    }
+  }
+
+  private async insertProjectRows(
+    projects: Array<{
+      id: string;
+      name: string;
+      git_remote_hash: string | null;
+      local_project_hash: string | null;
+    }>,
+  ): Promise<void> {
+    for (let index = 0; index < projects.length; index += BATCH_SIZE) {
+      await this.client.call("/rest/v1/projects?on_conflict=user_id,id", {
+        method: "POST",
+        headers: { Prefer: "resolution=ignore-duplicates,return=minimal" },
+        body: JSON.stringify(projects.slice(index, index + BATCH_SIZE)),
       });
     }
   }
@@ -138,6 +170,41 @@ export class UsageSyncService {
     }));
   }
 
+  async listProjects(): Promise<SyncedProject[]> {
+    if (!this.client.enabled) return [];
+    const projects: SyncedProject[] = [];
+    for (let offset = 0; ; offset += 1000) {
+      const rows = await this.client.call<Array<Record<string, unknown>>>(
+        "/rest/v1/projects?select=id,name,git_remote_hash,local_project_hash,created_at&order=created_at.asc,id.asc",
+        { headers: { Range: `${offset}-${offset + 999}` } },
+      );
+      projects.push(...rows.flatMap((row) => {
+        const project = fromProjectRow(row);
+        return project ? [project] : [];
+      }));
+      if (rows.length < 1000) break;
+    }
+    return projects;
+  }
+
+  async updateProjectName(projectId: string, name: string): Promise<SyncResult> {
+    if (!this.client.enabled) return { uploaded: 0, disabled: true };
+    const normalizedId = projectId.trim();
+    const normalizedName = normalizeProjectName(name);
+    if (!normalizedId) return failed(new Error("프로젝트 ID가 필요합니다."));
+    if (!normalizedName) return failed(new Error(`프로젝트 이름은 1자 이상 ${PROJECT_NAME_MAX_LENGTH}자 이하여야 합니다.`));
+    try {
+      await this.client.call(`/rest/v1/projects?id=eq.${encodeURIComponent(normalizedId)}`, {
+        method: "PATCH",
+        headers: { Prefer: "return=minimal" },
+        body: JSON.stringify({ name: normalizedName }),
+      });
+      return { uploaded: 1, disabled: false };
+    } catch (error) {
+      return failed(error);
+    }
+  }
+
   async upsertDeviceInventorySnapshot(snapshot: DeviceInventorySnapshot): Promise<SyncResult> {
     if (!this.client.enabled) return { uploaded: 0, disabled: true };
     try {
@@ -168,6 +235,30 @@ export class UsageSyncService {
     }
     return snapshots;
   }
+}
+
+function fallbackProjectName(projectId: string): string {
+  return `프로젝트 ${projectId.slice(-8)}`;
+}
+
+function normalizeProjectName(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim();
+  return normalized && normalized.length <= PROJECT_NAME_MAX_LENGTH ? normalized : undefined;
+}
+
+function fromProjectRow(row: Record<string, unknown>): SyncedProject | undefined {
+  if (typeof row.id !== "string" || typeof row.name !== "string") return undefined;
+  const id = row.id.trim();
+  const name = row.name.trim();
+  if (!id || !name) return undefined;
+  return {
+    id,
+    name,
+    ...(typeof row.git_remote_hash === "string" ? { gitRemoteHash: row.git_remote_hash } : {}),
+    ...(typeof row.local_project_hash === "string" ? { localProjectHash: row.local_project_hash } : {}),
+    ...(typeof row.created_at === "string" ? { createdAt: row.created_at } : {}),
+  };
 }
 
 export function createDeviceInventorySnapshot(

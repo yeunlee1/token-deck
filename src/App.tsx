@@ -12,6 +12,7 @@ import { SettingsPanel } from "./components/SettingsPanel";
 import { UsageChart } from "./components/UsageChart";
 import { quotaStatusLabel, remainingLabel, remainingTone } from "./components/quota-display";
 import { tokenTotal, type Provider, type UsageEvent } from "./core";
+import { buildAccountUsageMatrix } from "./core/account-usage";
 import { useAutoUpdater } from "./hooks/useAutoUpdater";
 import { useAppRuntime } from "./hooks/useAppRuntime";
 import { getOrCreateDeviceId } from "./hooks/useLocalUsage";
@@ -40,6 +41,12 @@ const providerInfo = {
 
 function formatTokens(value: number): string {
   return new Intl.NumberFormat("ko-KR", { notation: value > 9999 ? "compact" : "standard", maximumFractionDigits: 1 }).format(value);
+}
+
+function formatTimestamp(value?: string | number): string {
+  if (value === undefined) return "기록 없음";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "기록 없음" : date.toLocaleString("ko-KR");
 }
 
 function periodStart(period: Period): Date {
@@ -97,15 +104,18 @@ export default function App() {
   const [onboardingComplete, setOnboardingComplete] = useState(() => window.localStorage.getItem(ONBOARDING_COMPLETE_KEY) === "true");
   const [editingProjectId, setEditingProjectId] = useState<string>();
   const [projectNameDraft, setProjectNameDraft] = useState("");
+  const [projectNameError, setProjectNameError] = useState("");
+  const [inventoryChoiceError, setInventoryChoiceError] = useState("");
+  const [inventoryChoiceBusy, setInventoryChoiceBusy] = useState(false);
   const [windowModeError, setWindowModeError] = useState("");
-  const [privacy, setPrivacy] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [theme, setTheme] = useState<ThemeId>(() => readTheme());
   const usageEvents = runtime.combinedEvents;
   const visibleEvents = useMemo(() => usageEvents.filter((event) => displayProviders.includes(event.provider)), [displayProviders, usageEvents]);
   const periodEvents = useMemo(() => usageInPeriod(visibleEvents, period), [visibleEvents, period]);
   const projectDeviceEvents = useMemo(() => selectProjectDeviceEvents(runtime.localSessionEvents, displayProviders, periodStart(period)), [displayProviders, period, runtime.localSessionEvents]);
-  const actualTotal = useMemo(() => periodEvents.reduce((sum, event) => sum + tokenTotal(event.tokens), 0), [periodEvents]);
+  const accountUsage = useMemo(() => buildAccountUsageMatrix(projectDeviceEvents), [projectDeviceEvents]);
+  const actualTotal = accountUsage.totals.totalTokens;
   const miniTotal = useMemo(() => usageInPeriod(usageEvents.filter((event) => miniProviders.includes(event.provider)), period).reduce((sum, event) => sum + tokenTotal(event.tokens), 0), [miniProviders, period, usageEvents]);
   const chartData = useMemo(() => buildUsageChart(visibleEvents, period), [visibleEvents, period]);
 
@@ -115,6 +125,12 @@ export default function App() {
     window.addEventListener("keydown", close);
     return () => window.removeEventListener("keydown", close);
   }, [settingsOpen]);
+
+  useEffect(() => {
+    setEditingProjectId(undefined);
+    setProjectNameDraft("");
+    setProjectNameError("");
+  }, [runtime.auth.status, runtime.auth.userId]);
 
   useEffect(() => {
     window.localStorage.setItem(DASHBOARD_PERIOD_KEY, period);
@@ -155,36 +171,57 @@ export default function App() {
   }, [actualTotal, displayProviders, periodEvents, providerQuotas.quotas, runtime.integrations]);
 
   const projects = useMemo(() => {
-    const grouped = new Map<string, UsageEvent[]>();
-    projectDeviceEvents.forEach((event) => grouped.set(event.projectId, [...(grouped.get(event.projectId) ?? []), event]));
-    const totals = [...grouped.entries()].map(([id, events]) => ({ id, events, value: events.reduce((sum, event) => sum + tokenTotal(event.tokens), 0) }));
-    const max = Math.max(...totals.map((project) => project.value), 1);
-    return totals.sort((a, b) => b.value - a.value).map(({ id, events, value }, index) => ({
-      id,
-      name: runtime.projectNames[id] ?? `프로젝트 ${id.slice(-6).toUpperCase()}`,
-      source: runtime.projectNameOverrides[id] ? "사용자 지정 이름" : id.startsWith("git_") ? "Git 저장소 이름" : "프로젝트 폴더 이름",
-      value: formatTokens(value), rawValue: value, share: Math.round(value / max * 100), color: (["ink", "violet", "lime", "blue"] as const)[index % 4],
-      events: events.length,
-      devices: new Set(events.map((event) => event.deviceId)).size,
-      providers: new Set(events.map((event) => event.provider)).size,
+    const max = Math.max(...accountUsage.projects.map((project) => project.totals.totalTokens), 1);
+    return accountUsage.projects.map((project, index) => ({
+      id: project.projectId,
+      name: runtime.projectNames[project.projectId] ?? `프로젝트 ${project.projectId.slice(-6).toUpperCase()}`,
+      source: runtime.projectNameOverrides[project.projectId] || runtime.remoteProjectNames[project.projectId] ? "계정에 저장된 이름" : project.projectId.startsWith("git_") ? "Git 저장소 이름" : "프로젝트 폴더 이름",
+      value: formatTokens(project.totals.totalTokens), rawValue: project.totals.totalTokens, share: Math.round(project.totals.totalTokens / max * 100), color: (["ink", "violet", "lime", "blue"] as const)[index % 4],
+      events: project.totals.requestCount,
+      devices: project.devices.length,
+      providers: project.totals.providerCount,
+      deviceBreakdown: project.devices.map((cell) => {
+        const device = runtime.devices.find((candidate) => candidate.id === cell.deviceId);
+        return {
+          ...cell,
+          name: device?.name ?? `기기 ${cell.deviceId.slice(-6).toUpperCase()}`,
+          current: cell.deviceId === currentDeviceId,
+        };
+      }),
     }));
-  }, [projectDeviceEvents, runtime.projectNameOverrides, runtime.projectNames]);
+  }, [accountUsage.projects, currentDeviceId, runtime.devices, runtime.projectNameOverrides, runtime.projectNames, runtime.remoteProjectNames]);
 
-  const deviceUsage = useMemo(() => runtime.devices.map((device) => {
-    const events = projectDeviceEvents.filter((event) => event.deviceId === device.id);
-    const byProvider = displayProviders.map((provider) => ({
-      provider,
-      value: events.filter((event) => event.provider === provider).reduce((sum, event) => sum + tokenTotal(event.tokens), 0),
-    }));
-    return {
-      ...device,
-      current: device.id === currentDeviceId,
-      total: events.reduce((sum, event) => sum + tokenTotal(event.tokens), 0),
-      eventCount: events.length,
-      projectCount: new Set(events.map((event) => event.projectId)).size,
-      byProvider,
-    };
-  }).sort((a, b) => b.total - a.total), [currentDeviceId, displayProviders, projectDeviceEvents, runtime.devices]);
+  const deviceUsage = useMemo(() => {
+    const deviceById = new Map(runtime.devices.map((device) => [device.id, device]));
+    const ids = new Set([...runtime.devices.map((device) => device.id), ...accountUsage.devices.map((device) => device.deviceId)]);
+    return [...ids].map((deviceId) => {
+      const registered = deviceById.get(deviceId);
+      const aggregate = accountUsage.devices.find((device) => device.deviceId === deviceId);
+      const snapshot = runtime.deviceInventories
+        .filter((item) => item.deviceId === deviceId)
+        .sort((left, right) => (right.updatedAt ?? right.capturedAt) - (left.updatedAt ?? left.capturedAt))[0];
+      const deviceEvents = projectDeviceEvents.filter((event) => event.deviceId === deviceId);
+      return {
+        id: deviceId,
+        name: registered?.name ?? `기기 ${deviceId.slice(-6).toUpperCase()}`,
+        platform: registered?.platform ?? "windows",
+        appVersion: registered?.appVersion ?? "확인 불가",
+        lastSeenAt: registered?.lastSeenAt,
+        current: deviceId === currentDeviceId,
+        total: aggregate?.totals.totalTokens ?? 0,
+        eventCount: aggregate?.totals.requestCount ?? 0,
+        projectCount: aggregate?.projects.length ?? 0,
+        byProvider: displayProviders.map((provider) => ({ provider, value: aggregate?.totals.byProvider[provider].totalTokens ?? 0 })),
+        projects: aggregate?.projects.map((project) => ({
+          ...project,
+          name: runtime.projectNames[project.projectId] ?? `프로젝트 ${project.projectId.slice(-6).toUpperCase()}`,
+        })) ?? [],
+        lastUsageAt: deviceEvents.reduce<string | undefined>((latest, event) => !latest || event.occurredAt > latest ? event.occurredAt : latest, undefined),
+        inventoryCount: deviceId === currentDeviceId ? runtime.localInventory?.items.length ?? 0 : snapshot?.items.length ?? 0,
+        inventoryCapturedAt: deviceId === currentDeviceId ? runtime.localInventory?.capturedAt : snapshot?.capturedAt,
+      };
+    }).sort((left, right) => Number(right.current) - Number(left.current) || right.total - left.total || left.name.localeCompare(right.name, "ko"));
+  }, [accountUsage.devices, currentDeviceId, displayProviders, projectDeviceEvents, runtime.deviceInventories, runtime.devices, runtime.localInventory, runtime.projectNames]);
 
   const sessions = useMemo(() => {
     const latest = new Map<string, UsageEvent>();
@@ -208,6 +245,17 @@ export default function App() {
   const syncLabel = runtime.cloudSync.status === "syncing" || runtime.syncing ? "동기화 중" : runtime.cloudSync.status === "error" || runtime.error ? "수집 오류" : "실시간 수집 중";
 
   const runSync = () => void Promise.all([runtime.syncNow(), providerQuotas.refresh()]);
+  const chooseInventorySync = async (enabled: boolean) => {
+    setInventoryChoiceBusy(true);
+    setInventoryChoiceError("");
+    try {
+      await runtime.setInventorySyncEnabled(enabled);
+    } catch (cause) {
+      setInventoryChoiceError(cause instanceof Error ? cause.message : "기기 도구 목록 공유 설정을 저장하지 못했습니다.");
+    } finally {
+      setInventoryChoiceBusy(false);
+    }
+  };
   const changeWindowMode = async (enabled: boolean) => {
     try {
       await applyWindowMode(enabled, enabled && miniPinned);
@@ -241,17 +289,29 @@ export default function App() {
     window.localStorage.setItem(MINI_TOTAL_VISIBLE_KEY, String(next));
   };
   const continueLocally = () => {
+    runtime.cancelPendingAuth();
     window.localStorage.setItem(ONBOARDING_COMPLETE_KEY, "true");
     setOnboardingComplete(true);
   };
   const returnToLogin = async () => {
+    setEditingProjectId(undefined);
+    setProjectNameDraft("");
+    setProjectNameError("");
     await prepareLoginScreen(runtime.auth.status, runtime.signOut, window.localStorage);
     setSettingsOpen(false);
     setOnboardingComplete(false);
   };
   const startProjectNameEdit = (id: string, name: string) => { setEditingProjectId(id); setProjectNameDraft(name); };
   const cancelProjectNameEdit = () => { setEditingProjectId(undefined); setProjectNameDraft(""); };
-  const saveProjectName = async (id: string) => { await runtime.updateProjectName(id, projectNameDraft); cancelProjectNameEdit(); };
+  const saveProjectName = async (id: string) => {
+    try {
+      await runtime.updateProjectName(id, projectNameDraft);
+      setProjectNameError("");
+      cancelProjectNameEdit();
+    } catch (cause) {
+      setProjectNameError(cause instanceof Error ? cause.message : "프로젝트 이름을 저장하지 못했습니다.");
+    }
+  };
 
   if (!onboardingComplete && runtime.auth.status !== "authenticated") return <OnboardingScreen authEnabled={runtime.auth.enabled} authError={runtime.auth.error} onSignInWithGoogle={() => runtime.signInWithGoogle()} onSendMagicLink={(email) => runtime.sendMagicLink(email)} onContinueLocal={continueLocally} />;
 
@@ -276,23 +336,25 @@ export default function App() {
 
       <main id="main" className="dashboard">
         <header className="topbar">
-          <div><p className="kicker">{activeView === "overview" ? "통합 사용량 관제" : activeView === "projects" ? "프로젝트 분석" : "기기 분석"}</p><h1>{activeView === "overview" ? "토큰 흐름을 확인하세요." : activeView === "projects" ? "프로젝트별 사용량" : "기기별 사용량과 설정"}</h1><p>{activeView === "overview" ? "모든 AI 코딩 도구의 실제 사용 흐름을 한눈에 확인하세요." : activeView === "projects" ? "작업한 프로젝트마다 사용한 토큰과 참여 기기를 확인하세요." : "같은 계정의 기기별 토큰과 스킬·MCP·플러그인 차이를 비교하세요."}</p></div>
+          <div><p className="kicker">{activeView === "overview" ? "통합 사용량 관제" : activeView === "projects" ? "프로젝트 분석" : "기기 분석"}</p><h1>{activeView === "overview" ? "토큰 흐름을 확인하세요." : activeView === "projects" ? "프로젝트별 사용량" : "기기별 사용량과 설정"}</h1><p>{activeView === "overview" ? "같은 계정에 등록된 모든 기기의 실제 사용 흐름을 한눈에 확인하세요." : activeView === "projects" ? "각 프로젝트의 계정 총량과 기기별 사용량을 함께 확인하세요." : "같은 계정의 기기별 프로젝트 토큰과 스킬·MCP·플러그인 차이를 비교하세요."}</p></div>
           <div className="top-actions"><button className="mini-mode-entry" onClick={() => void changeWindowMode(true)}><Icon name="spark" /> 미니 모드</button><span className={`live-pill ${runtime.error ? "error" : ""}`}><i /> {syncLabel}</span><button className="icon-button" aria-label="지금 동기화" onClick={runSync}><Icon className={runtime.syncing ? "spin" : ""} name="refresh" /></button><button className="icon-button mobile-settings" aria-label="설정 열기" onClick={() => setSettingsOpen(true)}><Icon name="settings" /></button></div>
         </header>
 
-        {(runtime.error || runtime.cloudSync.error || providerQuotas.error || windowModeError) && <div className="error-banner" role="alert"><Icon name="warning" /><span>{runtime.error ?? runtime.cloudSync.error ?? providerQuotas.error ?? windowModeError}</span></div>}
+        {(runtime.error || runtime.cloudSync.error || providerQuotas.error || windowModeError || projectNameError || inventoryChoiceError) && <div className="error-banner" role="alert"><Icon name="warning" /><span>{runtime.error || runtime.cloudSync.error || providerQuotas.error || windowModeError || projectNameError || inventoryChoiceError}</span></div>}
+
+        {authenticated && !runtime.inventorySyncPreferenceSet && <section className="inventory-choice-banner" aria-labelledby="inventory-choice-title"><Icon name="device" /><div><strong id="inventory-choice-title">이 기기의 도구 목록을 추가로 공유할까요?</strong><p>켜면 목록 시각·비교 해시와 스킬·MCP·플러그인의 공급사·종류·ID·이름·버전, 설치·활성 상태, 출처·마켓플레이스, MCP 연결 방식, 비밀 설정 필요 여부와 가져오기 가능 여부·제한 사유 분류를 추가 저장합니다. 코드, 프롬프트·응답, 전체 경로, Git 원격 주소 원문, 스킬 본문, MCP 명령·인수·URL, 환경변수, API 키·OAuth 토큰과 비밀값은 전송하지 않습니다. 공유하지 않아도 사용량·프로젝트·기기 동기화는 계속됩니다.</p></div><div><button className="primary-button" type="button" disabled={inventoryChoiceBusy} onClick={() => void chooseInventorySync(true)}>목록 공유 켜기</button><button className="secondary-button" type="button" disabled={inventoryChoiceBusy} onClick={() => void chooseInventorySync(false)}>공유 안 함</button></div></section>}
 
         <section id="overview" className="hero-grid" aria-label="사용량 요약" hidden={activeView !== "overview"}>
           <article className="total-card">
-            <div className="card-topline"><span className="eyebrow">TOTAL TOKENS</span><div className="segmented" aria-label="조회 기간">{(["오늘", "7일", "30일"] as Period[]).map((item) => <button key={item} className={period === item ? "selected" : ""} aria-pressed={period === item} onClick={() => setPeriod(item)}>{item}</button>)}</div></div>
+            <div className="card-topline"><span className="eyebrow">ACCOUNT TOTAL TOKENS</span><div className="segmented" aria-label="조회 기간">{(["오늘", "7일", "30일"] as Period[]).map((item) => <button key={item} className={period === item ? "selected" : ""} aria-pressed={period === item} onClick={() => setPeriod(item)}>{item}</button>)}</div></div>
             <div className="total-number"><strong>{actualTotal.toLocaleString("ko-KR")}</strong><span>tokens</span></div>
-            <div className="delta"><Icon name="activity" /> 선택 기간에 <strong>{periodEvents.length.toLocaleString("ko-KR")}개</strong> 실제 이벤트 수집</div>
+            <div className="delta"><Icon name="activity" /> 등록 기기 {runtime.devices.length}대에서 <strong>{accountUsage.totals.requestCount.toLocaleString("ko-KR")}개</strong> 실제 이벤트 합산</div>
             <div className="pulse-orbit" aria-hidden="true"><span /><i /><b /></div>
           </article>
           <article className="status-card">
             <span className="eyebrow">SYNC HEALTH</span><div className="health-label"><strong>{connectionLabels.syncHealth}</strong></div>
             <p>최근 갱신 <strong>{runtime.syncing ? "진행 중" : runtime.updatedAt ? runtime.updatedAt.toLocaleTimeString("ko-KR") : "대기 중"}</strong></p>
-            <div className="status-row"><span><i className="ok" /> 현재 기기</span><strong>1</strong></div>
+            <div className="status-row"><span><i className="ok" /> 등록 기기</span><strong>{runtime.devices.length}</strong></div>
             <div className="status-row"><span><i className={connectedCount ? "ok" : ""} /> 수집 커넥터</span><strong>{connectedCount} / 3</strong></div>
           </article>
         </section>
@@ -324,24 +386,34 @@ export default function App() {
         <section className="lower-grid" hidden={activeView !== "overview"}>
           <article id="devices" className="panel device-panel">
             <SectionTitle eyebrow="DEVICES" title="연결된 기기" action={<span className="count-badge">{runtime.devices.length}대</span>} />
-            <div className="device-list">{runtime.devices.map((device) => <div className="device-row" key={device.id}><span className={`device-icon ${device.id === currentDeviceId ? "current" : ""}`}><Icon name={"device" as IconName} /></span><div><strong>{device.name}</strong><small>{device.platform} · {new Date(device.lastSeenAt).toLocaleString("ko-KR")}</small></div><span className="device-status"><i />{device.id === currentDeviceId ? "현재 기기" : "동기화됨"}</span></div>)}</div>
+            <div className="device-list">{runtime.devices.map((device) => <div className="device-row" key={device.id}><span className={`device-icon ${device.id === currentDeviceId ? "current" : ""}`}><Icon name={"device" as IconName} /></span><div><strong>{device.name}</strong><small>{device.platform} · v{device.appVersion} · ID {device.id.slice(-6).toUpperCase()} · {new Date(device.lastSeenAt).toLocaleString("ko-KR")}</small></div><span className="device-status"><i />{device.id === currentDeviceId ? "현재 기기" : "동기화됨"}</span></div>)}</div>
           </article>
           <article className="privacy-card">
-            <div className="privacy-icon"><Icon name="lock" /></div><div className="privacy-copy"><span className="eyebrow">PRIVACY GUARD</span><h2>코드는 기기 밖으로 나가지 않아요.</h2><p>토큰 수치와 익명 프로젝트 ID를 동기화하며, 동의를 켠 기기는 기기 식별자·수집 시각·내용 비교용 해시와 도구의 종류·공급사·ID·이름·버전·상태·출처 분류·마켓플레이스·연결 방식·자동 가져오기 가능 여부·제한 사유 분류를 추가합니다.</p><div className="privacy-meta"><Icon name="check" /> 전체 경로·프롬프트·비밀 설정·제한 사유 원문 수집 안 함</div></div>
-            <button className={`toggle ${privacy ? "on" : ""}`} role="switch" aria-checked={privacy} aria-label="개인정보 보호 안내 확인" onClick={() => setPrivacy(!privacy)}><span /></button>
+            <div className="privacy-icon"><Icon name="lock" /></div><div className="privacy-copy"><span className="eyebrow">PRIVACY GUARD</span><h2>코드는 기기 밖으로 나가지 않아요.</h2><p>로그인하면 AI 도구·모델, 토큰 수치·사용 시각, 익명 프로젝트·세션·기기 ID, 표시용 이름과 기기 상태를 동기화합니다. 도구 목록 공유를 켠 기기는 스킬·MCP·플러그인의 비교용 메타데이터도 저장합니다.</p><div className="privacy-meta"><Icon name="check" /> 코드·프롬프트·응답·전체 경로·Git 원격 원문·스킬 본문·MCP 명령·인수·URL·환경변수·API 키·OAuth 토큰 수집 안 함</div></div>
           </article>
         </section>
 
         <section className="detail-view" aria-label="프로젝트별 사용량" hidden={activeView !== "projects"}>
           <article className="panel detail-panel">
             <SectionTitle eyebrow="ALL PROJECTS" title={`${projects.length}개 프로젝트`} action={<div className="segmented" aria-label="프로젝트 조회 기간">{(["오늘", "7일", "30일"] as Period[]).map((item) => <button key={item} className={period === item ? "selected" : ""} aria-pressed={period === item} onClick={() => setPeriod(item)}>{item}</button>)}</div>} />
-            {projects.length ? <div className="detail-list">{projects.map((project, index) => <article className="detail-row" key={project.id}>
-              <span className="detail-rank">{String(index + 1).padStart(2, "0")}</span>
-              <div className="detail-main"><div className="detail-name"><span className={`project-dot ${project.color}`} /><ProjectNameEditor name={project.name} source={project.source} editing={editingProjectId === project.id} draft={projectNameDraft} onStart={() => startProjectNameEdit(project.id, project.name)} onDraftChange={setProjectNameDraft} onSave={() => void saveProjectName(project.id)} onCancel={cancelProjectNameEdit} /></div><div className="detail-meter"><i className={project.color} style={{ width: `${project.share}%` }} /></div></div>
-              <div className="detail-metrics primary"><strong>{project.value}</strong><small>토큰</small></div>
-              <div className="detail-metrics"><strong>{project.events.toLocaleString("ko-KR")}</strong><small>이벤트</small></div>
-              <div className="detail-metrics"><strong>{project.devices}</strong><small>기기</small></div>
-              <div className="detail-metrics"><strong>{project.providers}</strong><small>도구</small></div>
+            {projects.length ? <div className="detail-list">{projects.map((project, index) => <article className="project-detail-entry" key={project.id}>
+              <div className="detail-row">
+                <span className="detail-rank">{String(index + 1).padStart(2, "0")}</span>
+                <div className="detail-main"><div className="detail-name"><span className={`project-dot ${project.color}`} /><ProjectNameEditor name={project.name} source={project.source} editing={editingProjectId === project.id} draft={projectNameDraft} onStart={() => startProjectNameEdit(project.id, project.name)} onDraftChange={setProjectNameDraft} onSave={() => void saveProjectName(project.id)} onCancel={cancelProjectNameEdit} /></div><div className="detail-meter"><i className={project.color} style={{ width: `${project.share}%` }} /></div></div>
+                <div className="detail-metrics primary"><strong>{project.value}</strong><small>계정 총 토큰</small></div>
+                <div className="detail-metrics"><strong>{project.events.toLocaleString("ko-KR")}</strong><small>이벤트</small></div>
+                <div className="detail-metrics"><strong>{project.devices}</strong><small>기기</small></div>
+                <div className="detail-metrics"><strong>{project.providers}</strong><small>도구</small></div>
+              </div>
+              <div className="project-device-breakdown" aria-label={`${project.name} 기기별 사용량`}>
+                <div className="cross-breakdown-head"><span>기기별 사용량</span><small>합계 {project.rawValue.toLocaleString("ko-KR")} tokens</small></div>
+                {project.deviceBreakdown.map((device) => <div className="project-device-line" key={device.deviceId}>
+                  <span className={`device-icon ${device.current ? "current" : ""}`}><Icon name="device" /></span>
+                  <div className="cross-device-copy"><strong>{device.name}</strong><small>ID {device.deviceId.slice(-6).toUpperCase()}{device.current ? " · 현재 기기" : ""}</small></div>
+                  <div className="cross-provider-values">{displayProviders.filter((provider) => device.byProvider[provider].requestCount > 0).map((provider) => <span key={provider}>{providerInfo[provider].name} <b>{formatTokens(device.byProvider[provider].totalTokens)}</b></span>)}</div>
+                  <strong className="cross-total">{device.totalTokens.toLocaleString("ko-KR")}</strong>
+                </div>)}
+              </div>
             </article>)}</div> : <div className="panel-empty large"><Icon name="folder" /><strong>아직 프로젝트 사용량이 없습니다.</strong><p>Codex, Claude 또는 Gemini에서 작업하면 프로젝트별로 자동 분류됩니다.</p></div>}
           </article>
         </section>
@@ -350,10 +422,19 @@ export default function App() {
           <article className="panel detail-panel">
             <SectionTitle eyebrow="ACCOUNT DEVICES" title={`${runtime.devices.length}대 기기`} action={<div className="segmented" aria-label="기기 조회 기간">{(["오늘", "7일", "30일"] as Period[]).map((item) => <button key={item} className={period === item ? "selected" : ""} aria-pressed={period === item} onClick={() => setPeriod(item)}>{item}</button>)}</div>} />
             <div className="device-usage-grid">{deviceUsage.map((device) => <article className="device-usage-card" key={device.id}>
-              <div className="device-usage-head"><span className={`device-icon ${device.current ? "current" : ""}`}><Icon name="device" /></span><div><strong>{device.name}</strong><small>{device.platform} · 최근 연결 {new Date(device.lastSeenAt).toLocaleString("ko-KR")}</small></div><span className="device-status"><i />{device.current ? "현재 기기" : "동기화됨"}</span></div>
+              <div className="device-usage-head"><span className={`device-icon ${device.current ? "current" : ""}`}><Icon name="device" /></span><div><strong>{device.name}</strong><small>{device.platform} · 앱 {device.appVersion} · ID {device.id.slice(-6).toUpperCase()}</small></div><span className="device-status"><i />{device.current ? "현재 기기" : "등록됨"}</span></div>
               <div className="device-total"><strong>{device.total.toLocaleString("ko-KR")}</strong><span>tokens</span></div>
               <div className="device-provider-list">{device.byProvider.map((item) => <div key={item.provider}><span>{providerInfo[item.provider].name}</span><strong>{formatTokens(item.value)}</strong></div>)}</div>
-              <div className="device-foot"><span>{device.projectCount}개 프로젝트</span><span>{device.eventCount.toLocaleString("ko-KR")}개 이벤트</span></div>
+              <div className="device-sync-facts"><div><span>최근 연결</span><strong>{formatTimestamp(device.lastSeenAt)}</strong></div><div><span>최근 토큰</span><strong>{formatTimestamp(device.lastUsageAt)}</strong></div><div><span>전역 도구 목록</span><strong>{device.inventoryCount}개 · {formatTimestamp(device.inventoryCapturedAt)}</strong></div></div>
+              <div className="device-project-breakdown">
+                <div className="cross-breakdown-head"><span>이 기기의 프로젝트별 사용량</span><small>{device.projectCount}개 프로젝트</small></div>
+                {device.projects.length ? device.projects.map((project) => <div className="device-project-line" key={project.projectId}>
+                  <span className="project-dot ink" />
+                  <div><strong>{project.name}</strong><small>{displayProviders.filter((provider) => project.byProvider[provider].requestCount > 0).map((provider) => `${providerInfo[provider].name} ${formatTokens(project.byProvider[provider].totalTokens)}`).join(" · ")}</small></div>
+                  <b>{project.totalTokens.toLocaleString("ko-KR")}</b>
+                </div>) : <p className="cross-empty">선택 기간에 이 기기의 프로젝트 사용량이 없습니다.</p>}
+              </div>
+              <div className="device-foot"><span>{device.eventCount.toLocaleString("ko-KR")}개 이벤트</span><span>계정 전체에서 자동 합산</span></div>
             </article>)}</div>
           </article>
           <DeviceInventoryPanel
@@ -365,12 +446,12 @@ export default function App() {
             loading={runtime.inventorySync.loading}
             error={runtime.inventorySync.error}
             onEnableSync={() => runtime.setInventorySyncEnabled(true)}
-            onRefresh={async () => { if (runtime.inventorySyncEnabled) await runtime.refreshAndSyncDeviceInventory(); else await runtime.refreshDeviceInventory(); }}
+            onRefresh={async () => { if (runtime.auth.status === "authenticated") await runtime.refreshAndSyncDeviceInventory(); else await runtime.refreshDeviceInventory(); }}
             onApply={(sourceDeviceId, items) => runtime.applyDeviceInventoryItems(sourceDeviceId, items)}
           />
         </section>
 
-        <footer><span>Token Deck <b>v0.4.1</b></span><span><i /> {usageEvents.length ? "실제 사용량 연결됨" : "수집 이벤트 대기 중"}</span><span>마지막 갱신 · {runtime.syncing ? "동기화 중" : runtime.updatedAt?.toLocaleTimeString("ko-KR") ?? "대기 중"}</span></footer>
+        <footer><span>Token Deck <b>v0.5.0</b></span><span><i /> {usageEvents.length ? "실제 사용량 연결됨" : "수집 이벤트 대기 중"}</span><span>마지막 갱신 · {runtime.syncing ? "동기화 중" : runtime.updatedAt?.toLocaleTimeString("ko-KR") ?? "대기 중"}</span></footer>
       </main>
 
       <SettingsPanel

@@ -22,6 +22,7 @@ const MAX_LOG_FILES: usize = 10_000;
 const MAX_RAW_BYTES_PER_FILE_PER_SCAN: u64 = 8 * 1024 * 1024;
 const MAX_LOG_LINE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_TOTAL_SANITIZED_BYTES: usize = 64 * 1024 * 1024;
+const MAX_DEVICE_DISPLAY_NAME_CHARS: usize = 64;
 static CREDENTIAL_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static SCAN_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -150,6 +151,55 @@ struct LogDocument {
     project_name: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CurrentDeviceInfo {
+    name: Option<String>,
+    platform: String,
+}
+
+fn sanitize_device_display_name(value: &str) -> Option<String> {
+    let without_controls: String = value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    let normalized = without_controls
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let truncated: String = normalized
+        .chars()
+        .take(MAX_DEVICE_DISPLAY_NAME_CHARS)
+        .collect();
+    let trimmed = truncated.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+fn resolve_device_display_name(
+    computer_name: Option<&str>,
+    host_name: Option<&str>,
+) -> Option<String> {
+    computer_name
+        .and_then(sanitize_device_display_name)
+        .or_else(|| host_name.and_then(sanitize_device_display_name))
+}
+
+#[tauri::command]
+fn current_device_info() -> CurrentDeviceInfo {
+    let computer_name = std::env::var("COMPUTERNAME").ok();
+    let host_name = std::env::var("HOSTNAME").ok();
+    CurrentDeviceInfo {
+        name: resolve_device_display_name(computer_name.as_deref(), host_name.as_deref()),
+        platform: std::env::consts::OS.to_owned(),
+    }
+}
+
 fn git_remote_from_cwd(cwd: Option<PathBuf>) -> Option<String> {
     let mut directory = cwd?;
     loop {
@@ -200,8 +250,9 @@ fn git_config_path(directory: &Path) -> Option<PathBuf> {
 mod tests {
     use super::{
         collect_files, file_prefix_fingerprint, git_remote_from_cwd, read_json_value_chunk,
-        read_log_chunk, safe_git_remote, sanitized_log_records, secret_has_marker,
-        stable_local_identifier, ScanCursor, MAX_RAW_BYTES_PER_FILE_PER_SCAN, MAX_SCAN_DEPTH,
+        read_log_chunk, resolve_device_display_name, safe_git_remote, sanitize_device_display_name,
+        sanitized_log_records, secret_has_marker, stable_local_identifier, ScanCursor,
+        MAX_DEVICE_DISPLAY_NAME_CHARS, MAX_RAW_BYTES_PER_FILE_PER_SCAN, MAX_SCAN_DEPTH,
     };
     use std::{
         collections::HashMap,
@@ -209,6 +260,32 @@ mod tests {
         path::Path,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn device_display_name_prefers_sanitized_computer_name() {
+        assert_eq!(
+            resolve_device_display_name(Some("  WORK\nPC\0  "), Some("fallback-host")),
+            Some("WORK PC".to_owned())
+        );
+    }
+
+    #[test]
+    fn device_display_name_uses_hostname_when_computer_name_is_empty() {
+        assert_eq!(
+            resolve_device_display_name(Some("\0\n"), Some("  office-host  ")),
+            Some("office-host".to_owned())
+        );
+        assert_eq!(resolve_device_display_name(None, Some("\r\n")), None);
+    }
+
+    #[test]
+    fn device_display_name_removes_controls_and_limits_unicode_length() {
+        let input = format!("{}\u{7f}private", "가".repeat(80));
+        let sanitized = sanitize_device_display_name(&input).unwrap();
+
+        assert_eq!(sanitized.chars().count(), MAX_DEVICE_DISPLAY_NAME_CHARS);
+        assert!(sanitized.chars().all(|character| !character.is_control()));
+    }
 
     #[test]
     fn worktree_uses_common_repository_config() {
@@ -1758,6 +1835,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             scan_local_usage,
             integration_status,
+            current_device_info,
             device_inventory::collect_device_inventory,
             device_inventory::apply_device_inventory_items,
             store_provider_secret,

@@ -2,7 +2,7 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 import type { DeviceInventory, DeviceInventoryItem, DeviceInventorySnapshot, DeviceRegistration } from "../services/types";
-import { buildInventoryComparison, DeviceInventoryPanel, summarizeInventoryApplyResults } from "./DeviceInventoryPanel";
+import { buildDeviceToolkitSummaries, buildInventoryComparison, DeviceInventoryPanel, summarizeInventoryApplyResults } from "./DeviceInventoryPanel";
 
 function inventoryItem(overrides: Partial<DeviceInventoryItem> = {}): DeviceInventoryItem {
   return {
@@ -112,6 +112,15 @@ describe("DeviceInventoryPanel", () => {
     expect(summary.errorMessage).toBe("2개를 적용하지 못했습니다. 설치 실패 직접 설정 필요");
   });
 
+  it("등록 기기마다 마지막 스킬·MCP·플러그인 현황을 분리해 집계한다", () => {
+    const summaries = buildDeviceToolkitSummaries(devices, snapshots, "current-device", localInventory);
+
+    expect(summaries).toEqual(expect.arrayContaining([
+      expect.objectContaining({ deviceId: "current-device", current: true, plugins: 1, itemCount: 1 }),
+      expect.objectContaining({ deviceId: "remote-device", current: false, skills: 1, mcps: 1, plugins: 2, itemCount: 4 }),
+    ]));
+  });
+
   it("원본과 현재 기기, 종류 필터, 상태와 접근성 메시지를 렌더링한다", () => {
     const markup = renderToStaticMarkup(<DeviceInventoryPanel devices={devices} currentDeviceId="current-device" snapshots={snapshots} localInventory={localInventory} syncEnabled loading={false} error="원격 목록 오류" onEnableSync={vi.fn()} onRefresh={vi.fn()} onApply={vi.fn().mockResolvedValue([])} />);
     const installedInput = markup.match(/<input[^>]*aria-label="플러그인 A 이미 있음"[^>]*>/)?.[0] ?? "";
@@ -128,7 +137,7 @@ describe("DeviceInventoryPanel", () => {
     expect(transferableInput).not.toContain("disabled");
   });
 
-  it("동기화가 꺼져 있어도 현재 기기 목록과 수집 범위 안내를 보여준다", () => {
+  it("현재 기기 업로드가 꺼져 있어도 계정에 저장된 다른 기기 목록을 보여준다", () => {
     const markup = renderToStaticMarkup(<DeviceInventoryPanel devices={devices} currentDeviceId="current-device" snapshots={snapshots} localInventory={localInventory} syncEnabled={false} loading={false} onEnableSync={vi.fn()} onRefresh={vi.fn()} onApply={vi.fn().mockResolvedValue([])} />);
 
     expect(markup).toContain("이 기기의 새 목록 업로드가 꺼져 있습니다.");
@@ -140,6 +149,8 @@ describe("DeviceInventoryPanel", () => {
     expect(markup).toContain("목록 동기화 켜기");
     expect(markup).toContain("업무용 PC에서 감지");
     expect(markup).toContain("플러그인 A");
-    expect(markup).not.toContain("선택 항목 검토");
+    expect(markup).toContain("노트북");
+    expect(markup).toContain("기기별 전역 도구 현황");
+    expect(markup).toContain("선택 항목 검토");
   });
 });

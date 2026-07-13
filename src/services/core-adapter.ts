@@ -16,7 +16,7 @@ export function toSyncUsageEvent(event: CollectorUsageEvent): SyncUsageEvent {
     source: SOURCE_MAP[event.source],
     deviceId: event.deviceId,
     sessionId: event.sessionId ? stableId("sync-session", event.deviceId, event.provider, event.sessionId) : undefined,
-    projectId: event.projectId ? `project_${stableId("sync-project", event.provider, event.projectId)}` : undefined,
+    projectId: event.projectId ? toSyncProjectId(event.projectId) : undefined,
     model: event.model,
     occurredAt: event.occurredAt,
     inputTokens: event.tokens.input,
@@ -25,6 +25,18 @@ export function toSyncUsageEvent(event: CollectorUsageEvent): SyncUsageEvent {
     reasoningTokens: event.tokens.reasoning,
     toolTokens: event.tokens.tool,
   };
+}
+
+const SAFE_PROJECT_ID = /^(?:git|local|provider|project)_[0-9a-f]{64}$/;
+const CANONICAL_PROJECT_ID = /^(?:git|local|provider)_[0-9a-f]{64}$/;
+const LOCAL_PROVIDERS: CollectorUsageEvent["provider"][] = ["codex", "claude", "gemini"];
+
+/** 이미 익명화된 프로젝트 ID는 보존하고 그 밖의 값만 공급사와 무관하게 익명화합니다. */
+export function toSyncProjectId(projectId: string): string {
+  const normalized = projectId.trim();
+  return SAFE_PROJECT_ID.test(normalized)
+    ? normalized
+    : `project_${stableId("sync-project", normalized)}`;
 }
 
 export function toSyncUsageEvents(events: CollectorUsageEvent[]): SyncUsageEvent[] {
@@ -54,12 +66,32 @@ export function buildUsageViews(local: CollectorUsageEvent[], cloud: CollectorUs
   const localSessions = local.filter((event) => event.source !== "provider-api");
   const syncedSessions = cloud.filter((event) => event.source !== "provider-api");
   const accountProviderEvents = deduplicateProviderBuckets(cloud.filter((event) => event.source === "provider-api"));
-  const localSessionEvents = mergeCollectorUsageEvents(localSessions, syncedSessions);
+  const localSessionEvents = normalizeLegacyProjectAliases(mergeCollectorUsageEvents(localSessions, syncedSessions));
   return {
     localSessionEvents,
     accountProviderEvents,
     combinedEvents: localSessionEvents,
   };
+}
+
+/** 새 정규 ID가 함께 보이는 동안 이전 버전의 공급사별 프로젝트 ID를 화면에서 같은 프로젝트로 묶습니다. */
+export function normalizeLegacyProjectAliases(events: CollectorUsageEvent[]): CollectorUsageEvent[] {
+  const aliases = new Map<string, string>();
+  const ambiguous = new Set<string>();
+  for (const event of events) {
+    if (!CANONICAL_PROJECT_ID.test(event.projectId)) continue;
+    for (const provider of LOCAL_PROVIDERS) {
+      const legacyId = `project_${stableId("sync-project", provider, event.projectId)}`;
+      const current = aliases.get(legacyId);
+      if (current && current !== event.projectId) ambiguous.add(legacyId);
+      else aliases.set(legacyId, event.projectId);
+    }
+  }
+  ambiguous.forEach((id) => aliases.delete(id));
+  return events.map((event) => {
+    const canonicalId = aliases.get(event.projectId);
+    return canonicalId && canonicalId !== event.projectId ? { ...event, projectId: canonicalId } : event;
+  });
 }
 
 function deduplicateProviderBuckets(events: CollectorUsageEvent[]): CollectorUsageEvent[] {

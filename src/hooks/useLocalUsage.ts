@@ -77,5 +77,5 @@ export function useLocalUsage() {
     });
   }, []);
 
-  return { events, integrations, syncing, updatedAt, error, refresh, projectNames, projectNameOverrides, updateProjectName };
+  return { events, integrations, syncing, updatedAt, error, refresh, inferredProjectNames, projectNames, projectNameOverrides, updateProjectName };
 }

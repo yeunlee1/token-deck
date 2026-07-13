@@ -1,6 +1,6 @@
 // 로컬 수집, 계정 동기화, 공급사 사용량 조회를 하나의 앱 런타임으로 연결하는 훅
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { UsageEvent as LocalUsageEvent } from "../core";
+import { sanitizeProjectName, type UsageEvent as LocalUsageEvent } from "../core";
 import { stableId } from "../core/parse-utils";
 import { AUTH_PKCE_VERIFIER_KEY, AUTH_REDIRECT_URL, AUTH_STATE_KEY, authRedirectCode, authRedirectWithState, createPkcePair, listenForAuthDeepLinks, verifyAuthRedirectState } from "../platform/deep-link";
 import { openExternalBrowser } from "../platform/external-browser";
@@ -43,15 +43,18 @@ import {
   collectDeviceInventory,
   type DeviceInventoryApplyResult,
 } from "../platform/device-inventory";
+import { fallbackDeviceName, getCurrentDeviceInfo, type CurrentDeviceInfo } from "../platform/tauri";
 import { getOrCreateDeviceId, useLocalUsage } from "./useLocalUsage";
 
 const SESSION_KEY = "token-deck-supabase-session";
 const TITLES_KEY = "token-deck-session-titles";
 const TITLES_BY_OWNER_KEY = "token-deck-session-titles-by-owner";
+const PROJECT_NAMES_BY_OWNER_KEY = "token-deck-project-names-by-owner";
 const LOCAL_OWNERSHIP_KEY = "token-deck-local-session-owners";
 const CONFIG_KEY = "token-deck-supabase-config";
 const SESSION_TOMBSTONES_KEY = "token-deck-supabase-session-tombstones";
 const INVENTORY_SYNC_KEY = "token-deck-device-inventory-sync";
+const INVENTORY_SYNC_LOGIN_CONSENT_KEY = "token-deck-inventory-login-consent";
 const FULL_RECONCILE_INTERVAL_MS = 6 * 60 * 60 * 1_000;
 
 type AuthStatus = "local" | "signed_out" | "authenticated";
@@ -84,10 +87,13 @@ export function useAppRuntime() {
   const [providerUsage, setProviderUsage] = useState<ProviderUsageRecord[]>([]);
   const [remoteEvents, setRemoteEvents] = useState<LocalUsageEvent[]>([]);
   const [remoteAccountEvents, setRemoteAccountEvents] = useState<SyncUsageEvent[]>([]);
+  const [remoteProjectNames, setRemoteProjectNames] = useState<Record<string, string>>({});
+  const [accountProjectNameOverrides, setAccountProjectNameOverrides] = useState<Record<string, string>>({});
   const [devices, setDevices] = useState<DeviceRegistration[]>(() => [currentDevice()]);
   const [localInventory, setLocalInventory] = useState<DeviceInventory>();
   const [deviceInventories, setDeviceInventories] = useState<DeviceInventorySnapshot[]>([]);
   const [inventorySyncEnabled, setInventorySyncEnabledState] = useState(false);
+  const [inventorySyncPreferenceSet, setInventorySyncPreferenceSet] = useState(false);
   const [inventorySync, setInventorySync] = useState<{ status: InventorySyncStatus; loading: boolean; error?: string }>({
     status: "disabled",
     loading: true,
@@ -100,6 +106,7 @@ export function useAppRuntime() {
   const accountOwnerRef = useRef<string | undefined>(undefined);
   const providerEventsOwnerRef = useRef<string | undefined>(undefined);
   const localInventoryRef = useRef<DeviceInventory | undefined>(undefined);
+  const currentDeviceInfoRef = useRef<CurrentDeviceInfo>(fallbackCurrentDeviceInfo());
   const inventorySyncEnabledRef = useRef(false);
   const inventorySyncRevisionRef = useRef(0);
   const inventorySyncCompletedRevisionRef = useRef(-1);
@@ -109,6 +116,20 @@ export function useAppRuntime() {
   const credentialOwner = providerCredentialOwner(auth.status, auth.userId, client.config, getOrCreateDeviceId());
   const credentialOwnerRef = useRef<string | undefined>(credentialOwner);
   credentialOwnerRef.current = credentialOwner;
+
+  useEffect(() => {
+    const deviceId = getOrCreateDeviceId();
+    void getCurrentDeviceInfo(deviceId).then((info) => {
+      currentDeviceInfoRef.current = info;
+      setDevices((current) => {
+        const registration = currentDevice(info);
+        const found = current.some((device) => device.id === deviceId);
+        return found
+          ? current.map((device) => device.id === deviceId ? { ...device, ...registration, lastSeenAt: device.lastSeenAt } : device)
+          : [registration, ...current];
+      });
+    });
+  }, []);
 
   const clearAccountProviderState = useCallback(() => {
     providerEventsOwnerRef.current = undefined;
@@ -125,6 +146,7 @@ export function useAppRuntime() {
     inventorySyncErrorRef.current = undefined;
     inventorySyncEnabledRef.current = false;
     setInventorySyncEnabledState(false);
+    setInventorySyncPreferenceSet(false);
     setInventorySync({ status: client.enabled ? "signed_out" : "disabled", loading: false });
   }, [client.enabled]);
 
@@ -166,12 +188,18 @@ export function useAppRuntime() {
           clearAccountProviderState();
           setRemoteEvents([]);
           setRemoteAccountEvents([]);
-          setDevices([currentDevice()]);
+          setRemoteProjectNames({});
+          setAccountProjectNameOverrides(readAccountProjectNameOverrides(nextOwner));
+          setDevices([currentDevice(currentDeviceInfoRef.current)]);
           setSessionTitles(readSessionTitles(nextOwner));
           clearAccountInventoryState();
-          const enabled = readInventorySyncPreference(nextOwner);
+          const storedPreference = hasInventorySyncPreference(nextOwner);
+          const loginConsent = consumeInventoryLoginConsent();
+          const enabled = Boolean(nextOwner && (storedPreference ? readInventorySyncPreference(nextOwner) : loginConsent));
+          if (nextOwner && !storedPreference && loginConsent) writeInventorySyncPreference(nextOwner, true);
           inventorySyncEnabledRef.current = enabled;
           setInventorySyncEnabledState(enabled);
+          setInventorySyncPreferenceSet(Boolean(nextOwner && (storedPreference || loginConsent)));
           setInventorySync({ status: enabled ? "idle" : "disabled", loading: false });
         }
         clearSessionTombstone(scope);
@@ -239,11 +267,13 @@ export function useAppRuntime() {
     const { verifier, challenge } = await createPkcePair();
     window.localStorage.setItem(AUTH_STATE_KEY, state);
     window.localStorage.setItem(AUTH_PKCE_VERIFIER_KEY, verifier);
+    markInventoryLoginConsent();
     try {
       await authService.sendMagicLink(email, authRedirectWithState(state, redirectTo ?? AUTH_REDIRECT_URL), challenge);
     } catch (cause) {
       if (window.localStorage.getItem(AUTH_STATE_KEY) === state) window.localStorage.removeItem(AUTH_STATE_KEY);
       if (window.localStorage.getItem(AUTH_PKCE_VERIFIER_KEY) === verifier) window.localStorage.removeItem(AUTH_PKCE_VERIFIER_KEY);
+      clearInventoryLoginConsent();
       throw cause;
     }
   }, [authService, client.enabled]);
@@ -257,15 +287,21 @@ export function useAppRuntime() {
     const { verifier, challenge } = await createPkcePair();
     window.localStorage.setItem(AUTH_STATE_KEY, state);
     window.localStorage.setItem(AUTH_PKCE_VERIFIER_KEY, verifier);
+    markInventoryLoginConsent();
     try {
       const redirectTo = authRedirectWithState(state, AUTH_REDIRECT_URL);
       await openExternalBrowser(authService.createGoogleOAuthUrl(redirectTo, challenge));
     } catch (cause) {
       if (window.localStorage.getItem(AUTH_STATE_KEY) === state) window.localStorage.removeItem(AUTH_STATE_KEY);
       if (window.localStorage.getItem(AUTH_PKCE_VERIFIER_KEY) === verifier) window.localStorage.removeItem(AUTH_PKCE_VERIFIER_KEY);
+      clearInventoryLoginConsent();
       throw cause;
     }
   }, [authService, client.enabled]);
+
+  const cancelPendingAuth = useCallback(() => {
+    cancelPendingAuthAttempt(authAttemptGenerationRef, accountGenerationRef);
+  }, []);
 
   const acceptAuthRedirect = useCallback(async (url: string) => {
     const generation = accountGenerationRef.current;
@@ -276,12 +312,17 @@ export function useAppRuntime() {
     window.localStorage.removeItem(AUTH_STATE_KEY);
     window.localStorage.removeItem(AUTH_PKCE_VERIFIER_KEY);
     const code = requireOneTimeAuthCode(url);
-    const session = await authService.exchangeCodeForSession(code, codeVerifier);
-    await serializeSyncRef.current(() => (
-      attemptGeneration === authAttemptGenerationRef.current
-        ? activateSession(session, generation, scope, true)
-        : Promise.resolve(false)
-    ));
+    try {
+      const session = await authService.exchangeCodeForSession(code, codeVerifier);
+      await serializeSyncRef.current(() => (
+        attemptGeneration === authAttemptGenerationRef.current
+          ? activateSession(session, generation, scope, true)
+          : Promise.resolve(false)
+      ));
+    } catch (cause) {
+      clearInventoryLoginConsent();
+      throw cause;
+    }
   }, [activateSession, authService, client.config]);
 
   useEffect(() => {
@@ -320,10 +361,13 @@ export function useAppRuntime() {
     window.localStorage.removeItem(SESSION_KEY);
     window.localStorage.removeItem(AUTH_STATE_KEY);
     window.localStorage.removeItem(AUTH_PKCE_VERIFIER_KEY);
+    clearInventoryLoginConsent();
     setAuth({ enabled: client.enabled, status: client.enabled ? "signed_out" : "local" });
     setRemoteEvents([]);
     setRemoteAccountEvents([]);
-    setDevices([currentDevice()]);
+    setRemoteProjectNames({});
+    setAccountProjectNameOverrides({});
+    setDevices([currentDevice(currentDeviceInfoRef.current)]);
     setSessionTitles(readSessionTitles(undefined));
     setCloudSync({ status: client.enabled ? "signed_out" : "disabled", uploaded: 0, pending: 0 });
     const credentialRemoval = Promise.allSettled([removeProviderSecret("supabase")]).then(([outcome]) => outcome);
@@ -338,6 +382,70 @@ export function useAppRuntime() {
       setAuth({ enabled: client.enabled, status: client.enabled ? "signed_out" : "local", error: errors.join(" ") });
     }
   }, [authService, clearAccountInventoryState, clearAccountProviderState, client.config, client.enabled]);
+
+  const syncDeviceInventoriesForOwner = useCallback(async (
+    generation: number,
+    activeOwner: string,
+    currentPhysicalDeviceId: string,
+  ): Promise<void> => {
+    if (generation !== accountGenerationRef.current || activeOwner !== accountOwnerRef.current) return;
+    if (typeof navigator !== "undefined" && navigator.onLine === false) {
+      const error = "오프라인 상태라 기기 설정 목록을 동기화하지 못했습니다.";
+      inventorySyncErrorRef.current = error;
+      setInventorySync({ status: "error", loading: false, error });
+      return;
+    }
+
+    const uploadEnabled = inventorySyncEnabledRef.current;
+    const inventoryRevision = inventorySyncRevisionRef.current;
+    const errors: string[] = [];
+    let uploadCompleted = !uploadEnabled;
+    inventorySyncCompletedRevisionRef.current = -1;
+    inventorySyncErrorRef.current = undefined;
+    setInventorySync({ status: "syncing", loading: true });
+
+    if (uploadEnabled) {
+      try {
+        const cachedInventory = localInventoryRef.current;
+        const inventory = !cachedInventory || Date.now() - cachedInventory.capturedAt > 5 * 60 * 1_000
+          ? await refreshDeviceInventory()
+          : cachedInventory;
+        if (generation !== accountGenerationRef.current || activeOwner !== accountOwnerRef.current) return;
+        if (inventoryRevision === inventorySyncRevisionRef.current && inventorySyncEnabledRef.current) {
+          if (!inventory) throw new Error("현재 기기의 설정 목록을 수집하지 못했습니다.");
+          const result = await syncService.upsertDeviceInventorySnapshot(
+            createDeviceInventorySnapshot(currentPhysicalDeviceId, inventory),
+          );
+          if (generation !== accountGenerationRef.current || activeOwner !== accountOwnerRef.current) return;
+          if (result.error) throw new Error(result.error);
+          uploadCompleted = true;
+        }
+      } catch (cause) {
+        errors.push(inventorySyncErrorMessage(cause));
+      }
+    }
+
+    if (generation !== accountGenerationRef.current || activeOwner !== accountOwnerRef.current) return;
+    try {
+      const snapshots = await syncService.listDeviceInventorySnapshots();
+      if (generation !== accountGenerationRef.current || activeOwner !== accountOwnerRef.current) return;
+      setDeviceInventories(snapshots);
+    } catch (cause) {
+      errors.push(inventorySyncErrorMessage(cause));
+    }
+
+    if (generation !== accountGenerationRef.current || activeOwner !== accountOwnerRef.current) return;
+    if (uploadCompleted && uploadEnabled && inventoryRevision === inventorySyncRevisionRef.current) {
+      inventorySyncCompletedRevisionRef.current = inventoryRevision;
+    }
+    if (errors.length) {
+      const error = [...new Set(errors)].join(" ");
+      inventorySyncErrorRef.current = error;
+      setInventorySync({ status: "error", loading: false, error });
+    } else {
+      setInventorySync({ status: inventorySyncEnabledRef.current ? "idle" : "disabled", loading: false });
+    }
+  }, [refreshDeviceInventory, syncService]);
 
   const syncNow = useCallback(() => serializeSyncRef.current(async () => {
     const generation = accountGenerationRef.current;
@@ -392,103 +500,89 @@ export function useAppRuntime() {
     const cycleStartedAt = Date.now();
     const fullReconcile = shouldFullyReconcile(cache, cycleStartedAt);
     const currentPhysicalDeviceId = getOrCreateDeviceId();
+    const activeAccountIsCurrent = () => generation === accountGenerationRef.current && activeOwner === accountOwnerRef.current;
     setCloudSync((current) => ({ ...current, status: "syncing", pending: outgoing.length, error: undefined }));
+    let usageError: string | undefined;
+    let uploaded = 0;
+    let registrationError: string | undefined;
+    try {
+      const deviceInfo = await getCurrentDeviceInfo(currentPhysicalDeviceId);
+      if (!activeAccountIsCurrent()) return;
+      currentDeviceInfoRef.current = deviceInfo;
+      const deviceResult = await syncService.registerDevice(currentDevice(deviceInfo));
+      if (!activeAccountIsCurrent()) return;
+      if (deviceResult.error) registrationError = deviceResult.error;
+    } catch (cause) {
+      if (!activeAccountIsCurrent()) return;
+      registrationError = message(cause);
+    }
     try {
       const downloaded = await syncService.listUsageEvents(
         fullReconcile ? undefined : cache.cursor,
         fullReconcile ? undefined : currentPhysicalDeviceId,
       );
-      if (generation !== accountGenerationRef.current || activeOwner !== accountOwnerRef.current) return;
+      if (!activeAccountIsCurrent()) return;
       reconcileDownloadedUsage(cache, downloaded, fullReconcile, cycleStartedAt);
       const changed = selectChangedUsageEvents(cache, outgoing);
       setCloudSync((current) => ({ ...current, pending: changed.length }));
-      const deviceResult = await syncService.registerDevice({
-        id: currentPhysicalDeviceId,
-        name: typeof navigator !== "undefined" ? navigator.platform || "Windows 기기" : "Windows 기기",
-        platform: "windows",
-        appVersion: "0.4.1",
-        lastSeenAt: new Date().toISOString(),
-      });
-      if (deviceResult.error) throw new Error(deviceResult.error);
-      if (changed.some((event) => event.source === "provider_api" || event.source === "cloud_billing")) {
-        const accountDeviceResult = await syncService.registerDevice({
-          id: ACCOUNT_PROVIDER_DEVICE_ID,
-          name: "계정 API 집계",
-          platform: "account",
-          appVersion: "0.4.1",
-          lastSeenAt: new Date().toISOString(),
-        });
-        if (accountDeviceResult.error) throw new Error(accountDeviceResult.error);
-      }
-      const result = await syncService.upsertUsageEvents(changed);
-      if (result.error) throw new Error(result.error);
-      recordUploadedUsage(cache, changed);
-      const accountDevices = await syncService.listDevices();
-      if (generation !== accountGenerationRef.current || activeOwner !== accountOwnerRef.current) return;
       const combinedRemote = [...cache.remoteEvents.values()];
       setRemoteEvents(combinedRemote.flatMap(toLocalUsageEvent));
       setRemoteAccountEvents(combinedRemote.filter((event) => event.source === "provider_api" || event.source === "cloud_billing"));
       const mergedTitles = mergeSessionTitles(sessionTitles, combinedRemote);
       setSessionTitles(mergedTitles);
       writeSessionTitles(activeOwner, mergedTitles);
-      const physicalDevices = accountDevices.filter((device) => device.id !== ACCOUNT_PROVIDER_DEVICE_ID);
-      setDevices(physicalDevices.length ? physicalDevices : [currentDevice()]);
+      if (registrationError) throw new Error(`현재 기기 등록 실패. ${registrationError}`);
+      if (changed.some((event) => event.source === "provider_api" || event.source === "cloud_billing")) {
+        if (!activeAccountIsCurrent()) return;
+        const accountDeviceResult = await syncService.registerDevice({
+          id: ACCOUNT_PROVIDER_DEVICE_ID,
+          name: "계정 API 집계",
+          platform: "account",
+          appVersion: "0.5.0",
+          lastSeenAt: new Date().toISOString(),
+        });
+        if (!activeAccountIsCurrent()) return;
+        if (accountDeviceResult.error) throw new Error(accountDeviceResult.error);
+      }
+      if (!activeAccountIsCurrent()) return;
+      const result = await syncService.upsertUsageEvents(
+        changed,
+        mergeAccountProjectNames(local.inferredProjectNames, remoteProjectNames, accountProjectNameOverrides),
+      );
+      if (!activeAccountIsCurrent()) return;
+      if (result.error) throw new Error(result.error);
+      uploaded = result.uploaded;
+      recordUploadedUsage(cache, changed);
       setCloudSync({ status: "idle", uploaded: result.uploaded, pending: 0, lastSyncedAt: new Date() });
-      if (inventorySyncEnabledRef.current) {
-        const inventoryRevision = inventorySyncRevisionRef.current;
-        inventorySyncCompletedRevisionRef.current = -1;
-        inventorySyncErrorRef.current = undefined;
-        setInventorySync((current) => ({ ...current, status: "syncing", loading: true, error: undefined }));
-        inventoryUpdate: try {
-          const cachedInventory = localInventoryRef.current;
-          const inventory = !cachedInventory || Date.now() - cachedInventory.capturedAt > 5 * 60 * 1_000
-            ? await refreshDeviceInventory()
-            : cachedInventory;
-          if (generation !== accountGenerationRef.current || activeOwner !== accountOwnerRef.current) return;
-          if (inventoryRevision !== inventorySyncRevisionRef.current || !inventorySyncEnabledRef.current) {
-            setInventorySync({ status: "disabled", loading: false });
-            break inventoryUpdate;
-          }
-          if (!inventory) throw new Error("현재 기기의 설정 목록을 수집하지 못했습니다.");
-          const inventoryResult = await syncService.upsertDeviceInventorySnapshot(
-            createDeviceInventorySnapshot(currentPhysicalDeviceId, inventory),
-          );
-          if (inventoryResult.error) throw new Error(inventoryResult.error);
-          if (generation !== accountGenerationRef.current || activeOwner !== accountOwnerRef.current) return;
-          if (inventoryRevision !== inventorySyncRevisionRef.current || !inventorySyncEnabledRef.current) {
-            setInventorySync({ status: "disabled", loading: false });
-            break inventoryUpdate;
-          }
-          const snapshots = await syncService.listDeviceInventorySnapshots();
-          if (generation !== accountGenerationRef.current || activeOwner !== accountOwnerRef.current) return;
-          if (inventoryRevision !== inventorySyncRevisionRef.current || !inventorySyncEnabledRef.current) {
-            setInventorySync({ status: "disabled", loading: false });
-            break inventoryUpdate;
-          }
-          setDeviceInventories(snapshots);
-          inventorySyncCompletedRevisionRef.current = inventoryRevision;
-          setInventorySync({ status: "idle", loading: false });
-        } catch (cause) {
-          if (generation === accountGenerationRef.current && activeOwner === accountOwnerRef.current) {
-            const error = inventorySyncErrorMessage(cause);
-            inventorySyncErrorRef.current = error;
-            setInventorySync({ status: "error", loading: false, error });
-          }
-        }
-      } else {
-        setInventorySync({ status: "disabled", loading: false });
-      }
     } catch (cause) {
-      if (generation !== accountGenerationRef.current) return;
+      if (!activeAccountIsCurrent()) return;
       const offline = typeof navigator !== "undefined" && navigator.onLine === false;
-      setCloudSync((current) => ({ ...current, status: offline ? "offline" : "error", pending: outgoing.length, error: message(cause) }));
-      if (inventorySyncEnabledRef.current && activeOwner === accountOwnerRef.current) {
-        const error = offline ? "오프라인 상태라 기기 설정 목록을 동기화하지 못했습니다." : "기존 계정 동기화 오류로 기기 설정 목록 갱신을 완료하지 못했습니다.";
-        inventorySyncErrorRef.current = error;
-        setInventorySync({ status: "error", loading: false, error });
-      }
+      usageError = message(cause);
+      setCloudSync((current) => ({ ...current, status: offline ? "offline" : "error", pending: outgoing.length, error: usageError }));
     }
-  }), [activateSession, auth.status, authService, client, local.events, local.refresh, localOwnership, providerEvents, refreshDeviceInventory, sessionTitles, signOut, syncService]);
+
+    if (generation !== accountGenerationRef.current || activeOwner !== accountOwnerRef.current) return;
+    const [deviceList, projectList] = await Promise.allSettled([
+      syncService.listDevices(),
+      syncService.listProjects(),
+    ]);
+    if (generation !== accountGenerationRef.current || activeOwner !== accountOwnerRef.current) return;
+    if (deviceList.status === "fulfilled") {
+      const physicalDevices = deviceList.value.filter((device) => device.id !== ACCOUNT_PROVIDER_DEVICE_ID);
+      setDevices(physicalDevices.length ? physicalDevices : [currentDevice(currentDeviceInfoRef.current)]);
+    }
+    if (projectList.status === "fulfilled") {
+      setRemoteProjectNames(Object.fromEntries(projectList.value.map((project) => [project.id, project.name])));
+    }
+    const metadataErrors = [
+      deviceList.status === "rejected" ? `기기 목록 조회 실패. ${message(deviceList.reason)}` : "",
+      projectList.status === "rejected" ? `프로젝트 이름 조회 실패. ${message(projectList.reason)}` : "",
+    ].filter(Boolean);
+    if (!usageError && metadataErrors.length) {
+      setCloudSync((current) => ({ ...current, status: "error", uploaded, error: metadataErrors.join(" ") }));
+    }
+    await syncDeviceInventoriesForOwner(generation, activeOwner, currentPhysicalDeviceId);
+  }), [accountProjectNameOverrides, activateSession, auth.status, authService, client, local.events, local.inferredProjectNames, local.refresh, localOwnership, providerEvents, remoteProjectNames, sessionTitles, signOut, syncDeviceInventoriesForOwner, syncService]);
 
   const syncNowRef = useRef(syncNow);
   syncNowRef.current = syncNow;
@@ -505,7 +599,6 @@ export function useAppRuntime() {
     if (auth.status !== "authenticated" || !accountOwnerRef.current) {
       throw new Error("기기 설정 목록을 동기화하려면 먼저 계정에 로그인해 주세요.");
     }
-    if (!inventorySyncEnabledRef.current) throw new Error("이 기기의 도구 목록 자동 갱신을 먼저 켜 주세요.");
     if (typeof navigator !== "undefined" && navigator.onLine === false) {
       const error = "오프라인 상태라 기기 설정 목록을 동기화하지 못했습니다.";
       inventorySyncErrorRef.current = error;
@@ -515,6 +608,7 @@ export function useAppRuntime() {
     const generation = accountGenerationRef.current;
     const owner = accountOwnerRef.current;
     const revision = inventorySyncRevisionRef.current;
+    const uploadEnabled = inventorySyncEnabledRef.current;
     inventorySyncCompletedRevisionRef.current = -1;
     await refreshDeviceInventory();
     await syncNowRef.current();
@@ -522,7 +616,7 @@ export function useAppRuntime() {
       throw new Error("로그인 계정이 변경되어 기기 설정 목록 동기화를 중단했습니다.");
     }
     if (inventorySyncErrorRef.current) throw new Error(inventorySyncErrorRef.current);
-    if (inventorySyncCompletedRevisionRef.current !== revision) {
+    if (uploadEnabled && inventorySyncCompletedRevisionRef.current !== revision) {
       throw new Error("기기 설정 목록 동기화를 완료하지 못했습니다. 잠시 후 다시 시도해 주세요.");
     }
   }, [auth.status, refreshDeviceInventory]);
@@ -532,6 +626,7 @@ export function useAppRuntime() {
       throw new Error("기기 설정 목록을 동기화하려면 먼저 계정에 로그인해 주세요.");
     }
     writeInventorySyncPreference(accountOwnerRef.current, enabled);
+    setInventorySyncPreferenceSet(true);
     inventorySyncRevisionRef.current += 1;
     inventorySyncEnabledRef.current = enabled;
     setInventorySyncEnabledState(enabled);
@@ -618,6 +713,33 @@ export function useAppRuntime() {
     writeSessionTitles(auth.status === "authenticated" ? accountOwnerRef.current : undefined, next);
   }, [auth.status, sessionTitles]);
 
+  const updateProjectName = useCallback(async (projectId: string, name: string) => {
+    const normalized = sanitizeProjectName(name);
+    if (!normalized) throw new Error("프로젝트 이름은 1자 이상 80자 이하로 입력해 주세요.");
+    if (auth.status !== "authenticated") {
+      await local.updateProjectName(projectId, normalized);
+      return;
+    }
+    const generation = accountGenerationRef.current;
+    const owner = accountOwnerRef.current;
+    if (!owner || generation !== accountGenerationRef.current) {
+      throw new Error("로그인 계정이 변경되어 프로젝트 이름 동기화를 중단했습니다.");
+    }
+    const nextOverrides = { ...accountProjectNameOverrides, [projectId]: normalized };
+    writeAccountProjectNameOverrides(owner, nextOverrides);
+    setAccountProjectNameOverrides(nextOverrides);
+    setRemoteProjectNames((current) => ({ ...current, [projectId]: normalized }));
+    if (generation !== accountGenerationRef.current || owner !== accountOwnerRef.current) {
+      throw new Error("로그인 계정이 변경되어 프로젝트 이름 동기화를 중단했습니다.");
+    }
+    const result = await syncService.updateProjectName(projectId, normalized);
+    if (generation !== accountGenerationRef.current || owner !== accountOwnerRef.current) return;
+    if (result.error) {
+      setCloudSync((current) => ({ ...current, status: "error", error: `프로젝트 이름 동기화 실패. ${result.error}` }));
+      throw new Error(result.error);
+    }
+  }, [accountProjectNameOverrides, auth.status, local.updateProjectName, syncService]);
+
   const configureSupabase = useCallback(async (url: string, publishableKey: string) => {
     if (!import.meta.env.DEV) throw new Error("Supabase 서버 변경은 개발 모드에서만 가능합니다.");
     const normalizedUrl = url.trim().replace(/\/+$/, "");
@@ -639,7 +761,9 @@ export function useAppRuntime() {
     setRuntimeConfig(config);
     setRemoteEvents([]);
     setRemoteAccountEvents([]);
-    setDevices([currentDevice()]);
+    setRemoteProjectNames({});
+    setAccountProjectNameOverrides({});
+    setDevices([currentDevice(currentDeviceInfoRef.current)]);
     setSessionTitles(readSessionTitles(undefined));
     setAuth({ enabled: true, status: "signed_out", error: cleanupErrors.length ? cleanupErrors.join(" ") : undefined });
     setCloudSync({ status: "signed_out", uploaded: 0, pending: 0 });
@@ -667,7 +791,9 @@ export function useAppRuntime() {
     setRuntimeConfig(defaultConfig);
     setRemoteEvents([]);
     setRemoteAccountEvents([]);
-    setDevices([currentDevice()]);
+    setRemoteProjectNames({});
+    setAccountProjectNameOverrides({});
+    setDevices([currentDevice(currentDeviceInfoRef.current)]);
     setSessionTitles(readSessionTitles(undefined));
     setAuth({ enabled: Boolean(defaultConfig), status: defaultConfig ? "signed_out" : "local", error: cleanupErrors.length ? cleanupErrors.join(" ") : undefined });
     setCloudSync({ status: defaultConfig ? "signed_out" : "disabled", uploaded: 0, pending: 0 });
@@ -688,6 +814,12 @@ export function useAppRuntime() {
     () => mergeAccountProviderUsage(remoteAccountEvents, providerUsage),
     [providerUsage, remoteAccountEvents],
   );
+  const authenticatedProjectNames = useMemo(
+    () => mergeAccountProjectNames(local.inferredProjectNames, remoteProjectNames, accountProjectNameOverrides),
+    [accountProjectNameOverrides, local.inferredProjectNames, remoteProjectNames],
+  );
+  const projectNames = auth.status === "authenticated" ? authenticatedProjectNames : local.projectNames;
+  const projectNameOverrides = auth.status === "authenticated" ? accountProjectNameOverrides : local.projectNameOverrides;
 
   return {
     ...local,
@@ -703,10 +835,15 @@ export function useAppRuntime() {
     localInventory,
     deviceInventories,
     inventorySyncEnabled,
+    inventorySyncPreferenceSet,
     inventorySync,
+    projectNames,
+    projectNameOverrides,
+    remoteProjectNames,
     sessionTitles,
     sendMagicLink,
     signInWithGoogle,
+    cancelPendingAuth,
     acceptAuthRedirect,
     signOut,
     syncNow,
@@ -719,6 +856,7 @@ export function useAppRuntime() {
     refreshCredentialStatus,
     refreshProviderUsage: refreshProviderUsageForUi,
     updateSessionTitle,
+    updateProjectName,
     configureSupabase,
     clearSupabaseConfig,
   };
@@ -727,12 +865,17 @@ export function useAppRuntime() {
 function emptyCredentialStatus(): Record<CredentialProvider, CredentialStatus> {
   return { openai: { configured: false, checking: false }, anthropic: { configured: false, checking: false }, google: { configured: false, checking: false } };
 }
-function currentDevice(): DeviceRegistration {
+function fallbackCurrentDeviceInfo(): CurrentDeviceInfo {
+  const deviceId = getOrCreateDeviceId();
+  return { name: fallbackDeviceName(deviceId), platform: "windows" };
+}
+
+function currentDevice(info: CurrentDeviceInfo = fallbackCurrentDeviceInfo()): DeviceRegistration {
   return {
     id: getOrCreateDeviceId(),
-    name: typeof navigator !== "undefined" ? navigator.platform || "Windows 기기" : "Windows 기기",
-    platform: "windows",
-    appVersion: "0.4.1",
+    name: info.name,
+    platform: info.platform,
+    appVersion: "0.5.0",
     lastSeenAt: new Date().toISOString(),
   };
 }
@@ -1087,12 +1230,43 @@ export function readInventorySyncPreference(owner?: string, storage: Storage = w
   return Boolean(owner) && storage.getItem(inventoryPreferenceKey(owner)) === "true";
 }
 
+export function hasInventorySyncPreference(owner?: string, storage: Storage = window.localStorage): boolean {
+  return Boolean(owner) && storage.getItem(inventoryPreferenceKey(owner)) !== null;
+}
+
 export function writeInventorySyncPreference(owner: string, enabled: boolean, storage: Storage = window.localStorage): void {
   storage.setItem(inventoryPreferenceKey(owner), String(enabled));
 }
 
 function inventoryPreferenceKey(owner?: string): string {
   return `${INVENTORY_SYNC_KEY}:${stableId(owner)}`;
+}
+
+export function markInventoryLoginConsent(storage: Storage = window.sessionStorage): void {
+  storage.setItem(INVENTORY_SYNC_LOGIN_CONSENT_KEY, "true");
+}
+
+export function consumeInventoryLoginConsent(storage: Storage = window.sessionStorage): boolean {
+  const consented = storage.getItem(INVENTORY_SYNC_LOGIN_CONSENT_KEY) === "true";
+  storage.removeItem(INVENTORY_SYNC_LOGIN_CONSENT_KEY);
+  return consented;
+}
+
+export function clearInventoryLoginConsent(storage: Storage = window.sessionStorage): void {
+  storage.removeItem(INVENTORY_SYNC_LOGIN_CONSENT_KEY);
+}
+
+export function cancelPendingAuthAttempt(
+  authAttemptGeneration: { current: number },
+  accountGeneration: { current: number },
+  authStorage: Storage = window.localStorage,
+  consentStorage: Storage = window.sessionStorage,
+): void {
+  authAttemptGeneration.current += 1;
+  accountGeneration.current += 1;
+  authStorage.removeItem(AUTH_STATE_KEY);
+  authStorage.removeItem(AUTH_PKCE_VERIFIER_KEY);
+  clearInventoryLoginConsent(consentStorage);
 }
 
 function inventoryItemFingerprint(item: DeviceInventoryItem): string {
@@ -1139,6 +1313,45 @@ function writeSessionTitles(owner: string | undefined, titles: Record<string, st
   const byOwner = readJson<Record<string, Record<string, string>>>(TITLES_BY_OWNER_KEY, {});
   window.localStorage.setItem(TITLES_BY_OWNER_KEY, JSON.stringify({ ...byOwner, [owner]: titles }));
 }
+
+export function mergeAccountProjectNames(
+  inferred: Readonly<Record<string, string>>,
+  remote: Readonly<Record<string, string>>,
+  overrides: Readonly<Record<string, string>>,
+): Record<string, string> {
+  return { ...inferred, ...remote, ...overrides };
+}
+
+export function readAccountProjectNameOverrides(
+  owner: string | undefined,
+  storage: Storage = window.localStorage,
+): Record<string, string> {
+  if (!owner) return {};
+  const byOwner = readJsonFromStorage<Record<string, unknown>>(storage, PROJECT_NAMES_BY_OWNER_KEY, {});
+  return sanitizeProjectNameMap(byOwner[owner]);
+}
+
+export function writeAccountProjectNameOverrides(
+  owner: string,
+  names: Readonly<Record<string, string>>,
+  storage: Storage = window.localStorage,
+): void {
+  if (!owner) return;
+  const byOwner = readJsonFromStorage<Record<string, unknown>>(storage, PROJECT_NAMES_BY_OWNER_KEY, {});
+  storage.setItem(PROJECT_NAMES_BY_OWNER_KEY, JSON.stringify({
+    ...byOwner,
+    [owner]: sanitizeProjectNameMap(names),
+  }));
+}
+
+function sanitizeProjectNameMap(value: unknown): Record<string, string> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(Object.entries(value).flatMap(([projectId, name]) => {
+    const normalized = sanitizeProjectName(typeof name === "string" ? name : "");
+    return projectId && normalized ? [[projectId, normalized]] : [];
+  }));
+}
+
 function readJson<T>(key: string, fallback: T): T {
   return readJsonFromStorage(window.localStorage, key, fallback);
 }

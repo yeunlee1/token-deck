@@ -2,7 +2,7 @@
 import { describe, expect, it } from "vitest";
 import type { UsageEvent as CollectorUsageEvent } from "../core/types";
 import { stableId } from "../core/parse-utils";
-import { buildUsageViews, mergeCollectorUsageEvents, mergeSessionTitles, mergeUsageWithProviderAuthority, toSyncUsageEvent } from "./core-adapter";
+import { buildUsageViews, mergeCollectorUsageEvents, mergeSessionTitles, mergeUsageWithProviderAuthority, normalizeLegacyProjectAliases, toSyncProjectId, toSyncUsageEvent } from "./core-adapter";
 
 describe("toSyncUsageEvent", () => {
   it.each([
@@ -18,7 +18,7 @@ describe("toSyncUsageEvent", () => {
       source: expectedSource,
       deviceId: "device-1",
       sessionId: stableId("sync-session", "device-1", "claude", "session-1"),
-      projectId: `project_${stableId("sync-project", "claude", "project-1")}`,
+      projectId: `project_${stableId("sync-project", "project-1")}`,
       model: "claude-opus",
       occurredAt: "2026-07-11T00:00:00.000Z",
       inputTokens: 11,
@@ -41,6 +41,26 @@ describe("toSyncUsageEvent", () => {
     expect(serialized).not.toContain("project-1");
   });
 
+  it.each(["git", "local", "provider", "project"])("이미 익명화된 %s 프로젝트 ID를 그대로 보존한다", (prefix) => {
+    const safeId = `${prefix}_${"a".repeat(64)}`;
+
+    expect(toSyncProjectId(safeId)).toBe(safeId);
+  });
+
+  it("익명화되지 않은 같은 프로젝트는 공급사와 관계없이 같은 ID를 사용한다", () => {
+    const claude = toSyncUsageEvent(localEvent("local-jsonl"));
+    const codex = toSyncUsageEvent({ ...localEvent("local-jsonl"), provider: "codex" });
+
+    expect(claude.projectId).toBe(`project_${stableId("sync-project", "project-1")}`);
+    expect(codex.projectId).toBe(claude.projectId);
+  });
+
+  it("형식이 불완전한 익명 ID는 그대로 신뢰하지 않고 다시 익명화한다", () => {
+    const malformed = `git_${"a".repeat(63)}`;
+
+    expect(toSyncProjectId(malformed)).toBe(`project_${stableId("sync-project", malformed)}`);
+  });
+
   it("로컬과 다른 기기 이벤트를 ID 기준으로 합치고 로컬 값을 우선한다", () => {
     const remoteDuplicate = { ...localEvent("local-jsonl"), deviceId: "remote-device", tokens: { input: 1, cached: 0, output: 0, reasoning: 0, tool: 0 } };
     const remoteOnly = { ...localEvent("local-jsonl"), id: "event-2", deviceId: "remote-device" };
@@ -50,6 +70,18 @@ describe("toSyncUsageEvent", () => {
     expect(result).toHaveLength(2);
     expect(result.find((event) => event.id === "event-1")?.deviceId).toBe("device-1");
     expect(result.find((event) => event.id === "event-2")?.deviceId).toBe("remote-device");
+  });
+
+  it("새 정규 ID가 있으면 이전 공급사별 프로젝트 ID의 과거 사용량을 같은 프로젝트로 묶는다", () => {
+    const canonicalId = `git_${"c".repeat(64)}`;
+    const legacyId = `project_${stableId("sync-project", "claude", canonicalId)}`;
+    const current = { ...localEvent("local-jsonl"), id: "current", projectId: canonicalId };
+    const legacy = { ...localEvent("local-jsonl"), id: "legacy", deviceId: "device-2", projectId: legacyId };
+
+    const normalized = normalizeLegacyProjectAliases([legacy, current]);
+
+    expect(normalized.map((event) => event.projectId)).toEqual([canonicalId, canonicalId]);
+    expect(legacy.projectId).toBe(legacyId);
   });
 
   it("다른 기기의 세션 제목을 기존 제목 맵에 병합한다", () => {

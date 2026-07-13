@@ -27,6 +27,18 @@ export interface DeviceInventoryPanelProps {
   onApply: (sourceDeviceId: string, items: DeviceInventoryItem[]) => Promise<DeviceInventoryApplyResult[]>;
 }
 
+export interface DeviceToolkitSummary {
+  deviceId: string;
+  name: string;
+  current: boolean;
+  capturedAt?: number;
+  itemCount: number;
+  skills: number;
+  mcps: number;
+  plugins: number;
+  providers: DeviceInventoryItem["provider"][];
+}
+
 const categoryLabels: Record<InventoryCategory, string> = {
   all: "전체",
   skill: "스킬",
@@ -123,6 +135,36 @@ function deviceLabel(deviceId: string, devices: DeviceRegistration[]): string {
   return devices.find((device) => device.id === deviceId)?.name ?? `기기 ${deviceId.slice(-6).toUpperCase()}`;
 }
 
+export function buildDeviceToolkitSummaries(
+  devices: DeviceRegistration[],
+  snapshots: DeviceInventorySnapshot[],
+  currentDeviceId: string,
+  localInventory: DeviceInventory,
+): DeviceToolkitSummary[] {
+  const latestByDevice = new Map<string, DeviceInventorySnapshot>();
+  snapshots.forEach((snapshot) => {
+    const current = latestByDevice.get(snapshot.deviceId);
+    if (!current || (snapshot.updatedAt ?? snapshot.capturedAt) > (current.updatedAt ?? current.capturedAt)) latestByDevice.set(snapshot.deviceId, snapshot);
+  });
+  const deviceIds = new Set([...devices.map((device) => device.id), ...latestByDevice.keys(), currentDeviceId]);
+  return [...deviceIds].map((deviceId) => {
+    const current = deviceId === currentDeviceId;
+    const snapshot = latestByDevice.get(deviceId);
+    const items = current ? localInventory.items : snapshot?.items ?? [];
+    return {
+      deviceId,
+      name: deviceLabel(deviceId, devices),
+      current,
+      capturedAt: current ? localInventory.capturedAt || undefined : snapshot?.capturedAt,
+      itemCount: items.length,
+      skills: items.filter((item) => item.kind === "skill").length,
+      mcps: items.filter((item) => item.kind === "mcp").length,
+      plugins: items.filter((item) => item.kind === "plugin").length,
+      providers: [...new Set(items.map((item) => item.provider))].sort(),
+    };
+  }).sort((left, right) => Number(right.current) - Number(left.current) || right.itemCount - left.itemCount || left.name.localeCompare(right.name, "ko"));
+}
+
 export function DeviceInventoryPanel(props: DeviceInventoryPanelProps) {
   const remoteSnapshots = useMemo(() => {
     const latestByDevice = new Map<string, DeviceInventorySnapshot>();
@@ -149,6 +191,10 @@ export function DeviceInventoryPanel(props: DeviceInventoryPanelProps) {
   const selectableKeys = useMemo(() => new Set(comparison.filter((entry) => entry.status === "transferable").map((entry) => entry.selectionKey)), [comparison]);
   const selectedEntries = comparison.filter((entry) => entry.status === "transferable" && selectedKeys.has(entry.selectionKey));
   const currentDeviceName = deviceLabel(props.currentDeviceId, props.devices);
+  const toolkitSummaries = useMemo(
+    () => buildDeviceToolkitSummaries(props.devices, props.snapshots, props.currentDeviceId, props.localInventory),
+    [props.currentDeviceId, props.devices, props.localInventory, props.snapshots],
+  );
   const busy = props.loading || Boolean(action);
 
   useEffect(() => {
@@ -233,13 +279,24 @@ export function DeviceInventoryPanel(props: DeviceInventoryPanelProps) {
         <button className="secondary-button inventory-refresh" type="button" disabled={busy} onClick={() => void runAction("refresh", props.onRefresh)}><Icon className={action === "refresh" ? "spin" : ""} name="refresh" />{action === "refresh" ? "확인 중…" : "목록 다시 확인"}</button>
       </header>
 
+      <section className="toolkit-device-section" aria-labelledby="toolkit-device-title">
+        <div className="toolkit-device-title"><div><strong id="toolkit-device-title">기기별 전역 도구 현황</strong><small>같은 계정에 등록된 각 기기의 마지막 스킬·MCP·플러그인 목록입니다.</small></div><span>{toolkitSummaries.length}대</span></div>
+        <div className="toolkit-device-grid">{toolkitSummaries.map((summary) => <article className={`toolkit-device-card ${summary.current ? "current" : ""}`} key={summary.deviceId}>
+          <div className="toolkit-device-head"><span className={`device-icon ${summary.current ? "current" : ""}`}><Icon name="device" /></span><div><strong>{summary.name}</strong><small>ID {summary.deviceId.slice(-6).toUpperCase()} · {summary.current ? "현재 기기" : summary.capturedAt ? `목록 저장 ${formatCapturedAt(summary.capturedAt)}` : "저장된 목록 없음"}</small></div></div>
+          <div className="toolkit-device-counts"><span><b>{summary.skills}</b>스킬</span><span><b>{summary.mcps}</b>MCP</span><span><b>{summary.plugins}</b>플러그인</span></div>
+          <div className="toolkit-device-providers">{summary.providers.length ? summary.providers.map((provider) => <span key={provider}>{providerLabels[provider]}</span>) : <span className="empty">아직 감지된 도구 없음</span>}</div>
+        </article>)}</div>
+      </section>
+
       <details className="local-inventory-details">
         <summary><span><strong>{currentDeviceName}에서 감지</strong><small>{props.localInventory.items.length}개 항목 · 스킬 {props.localInventory.items.filter((item) => item.kind === "skill").length} · MCP {props.localInventory.items.filter((item) => item.kind === "mcp").length} · 플러그인 {props.localInventory.items.filter((item) => item.kind === "plugin").length}</small></span><span>현재 목록 보기</span></summary>
         {props.localInventory.items.length ? <div className="local-inventory-list">{props.localInventory.items.map((item) => <div key={selectionKey(item)}><span className={`inventory-kind ${item.kind}`}>{categoryLabels[item.kind]}</span><span><strong>{item.displayName}</strong><small>{[providerLabels[item.provider], item.version ? `v${item.version}` : undefined, item.enabled ? "활성" : "비활성"].filter(Boolean).join(" · ")}</small></span></div>)}</div> : <p className="local-inventory-empty">{props.loading ? "현재 기기의 도구 목록을 확인하고 있습니다." : "현재 기기에서 감지된 설정 항목이 없습니다."}</p>}
         {props.localInventory.warnings.length > 0 && <p className="local-inventory-warning">안전 검사로 건너뛴 설정 위치가 {props.localInventory.warnings.length}개 있습니다.</p>}
       </details>
 
-      {!props.syncEnabled ? <div className="inventory-consent"><Icon name="lock" /><div><strong>이 기기의 새 목록 업로드가 꺼져 있습니다.</strong><p>기기 식별자, 목록 스키마 버전, 수집·갱신 시각, 내용 비교용 해시와 도구의 종류, 공급사, 항목 ID·이름, 버전, 설치·활성 상태, 수집 출처 분류, 마켓플레이스 식별자, 연결 방식, 비밀 설정 필요 여부, 자동 가져오기 가능 여부와 제한 사유 분류만 동기화합니다. 비밀값, 명령, 제한 사유의 원문과 전체 경로는 전송하지 않으며 마지막 스냅샷은 계정 비교용으로 유지됩니다.</p></div><button className="primary-button" type="button" disabled={busy} onClick={() => void runAction("enable", props.onEnableSync)}>{action === "enable" ? "켜는 중…" : "목록 동기화 켜기"}</button></div> : remoteSnapshots.length === 0 ? <div className="panel-empty inventory-empty"><Icon name="device" /><strong>비교할 다른 기기 목록이 아직 없습니다.</strong><p>같은 계정으로 연결된 다른 기기에서 Token Deck을 실행하면 자동으로 표시됩니다.</p></div> : <>
+      {!props.syncEnabled && <div className="inventory-consent"><Icon name="lock" /><div><strong>이 기기의 새 목록 업로드가 꺼져 있습니다.</strong><p>기기 식별자, 목록 스키마 버전, 수집·갱신 시각, 내용 비교용 해시와 도구의 종류, 공급사, 항목 ID·이름, 버전, 설치·활성 상태, 수집 출처 분류, 마켓플레이스 식별자, 연결 방식, 비밀 설정 필요 여부, 자동 가져오기 가능 여부와 제한 사유 분류만 동기화합니다. 비밀값, 명령, 제한 사유의 원문과 전체 경로는 전송하지 않으며 마지막 스냅샷은 계정 비교용으로 유지됩니다.</p></div><button className="primary-button" type="button" disabled={busy} onClick={() => void runAction("enable", props.onEnableSync)}>{action === "enable" ? "켜는 중…" : "목록 동기화 켜기"}</button></div>}
+
+      {remoteSnapshots.length === 0 ? <div className="panel-empty inventory-empty"><Icon name="device" /><strong>비교할 다른 기기 목록이 아직 없습니다.</strong><p>같은 계정으로 연결된 다른 기기에서 Token Deck을 실행하면 자동으로 표시됩니다.</p></div> : <>
         <div className="inventory-toolbar">
           <label htmlFor="inventory-source-device">가져올 원본 기기<select id="inventory-source-device" value={sourceDeviceId} onChange={(event) => changeSource(event.target.value)}>{remoteSnapshots.map((snapshot) => <option key={snapshot.deviceId} value={snapshot.deviceId}>{deviceLabel(snapshot.deviceId, props.devices)}</option>)}</select><small>{sourceSnapshot ? `최근 확인 ${formatCapturedAt(sourceSnapshot.capturedAt)}` : "목록 대기 중"}</small></label>
           <div className="inventory-direction" aria-label={`원본 기기에서 현재 기기 ${currentDeviceName}(으)로 가져오기`}><span>{sourceSnapshot ? deviceLabel(sourceSnapshot.deviceId, props.devices) : "원본 기기"}</span><Icon name="chevron" /><div><strong>{currentDeviceName}</strong><small>현재 기기</small></div></div>
