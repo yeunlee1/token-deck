@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   release:
-    name: 설치 파일 빌드와 판올림 초안 생성
+    name: 설치 파일 빌드와 판올림 게시
     if: github.ref == 'refs/heads/main'
     environment: 판올림-서명
     runs-on: windows-latest
@@ -22,6 +22,65 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
+
+      - name: 버전 일치와 기존 판올림 상태 확인
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $packageVersion = (Get-Content -Raw package.json | ConvertFrom-Json).version
+          $tauriVersion = (Get-Content -Raw src-tauri/tauri.conf.json | ConvertFrom-Json).version
+          $cargoText = Get-Content -Raw src-tauri/Cargo.toml
+          $cargoVersion = [regex]::Match($cargoText, '(?ms)^\[package\].*?^version\s*=\s*"([^"]+)"').Groups[1].Value
+          if ([string]::IsNullOrWhiteSpace($cargoVersion)) {
+            throw "Cargo.toml의 앱 버전을 확인할 수 없습니다."
+          }
+          if ($packageVersion -ne $tauriVersion -or $packageVersion -ne $cargoVersion) {
+            throw "앱 버전이 일치하지 않습니다. package.json=$packageVersion, tauri.conf.json=$tauriVersion, Cargo.toml=$cargoVersion"
+          }
+
+          $version = $tauriVersion
+          $tag = "판올림-$version"
+          $encodedTag = [Uri]::EscapeDataString($tag)
+
+          $releaseResponse = gh api --paginate --slurp "repos/$env:GITHUB_REPOSITORY/releases?per_page=100"
+          if ($LASTEXITCODE -ne 0) {
+            throw "기존 판올림 목록 확인에 실패했습니다."
+          }
+          $releasePages = @($releaseResponse | ConvertFrom-Json)
+          $releases = @($releasePages | ForEach-Object { $_ } | Where-Object { $_.tag_name -eq $tag })
+          if ($releases.Count -gt 1) {
+            throw "$tag 이름의 판올림이 여러 개라 안전하게 배포할 수 없습니다."
+          }
+          $release = $releases | Select-Object -First 1
+          if ($release -and -not $release.draft) {
+            throw "이미 게시된 $tag 판올림이 있어 같은 버전의 설치 파일을 덮어쓸 수 없습니다. 버전을 올린 뒤 다시 실행하세요."
+          }
+          if ($release -and $release.target_commitish -ne $env:GITHUB_SHA) {
+            throw "기존 $tag 초안이 현재 커밋과 다른 소스를 가리켜 재사용할 수 없습니다."
+          }
+
+          $response = gh api "repos/$env:GITHUB_REPOSITORY/git/matching-refs/tags/$encodedTag"
+          if ($LASTEXITCODE -ne 0) {
+            throw "기존 판올림 태그 확인에 실패했습니다."
+          }
+          $refs = @($response | ConvertFrom-Json)
+          $tagRef = $refs | Where-Object { $_.ref -eq "refs/tags/$tag" } | Select-Object -First 1
+          if ($tagRef -and -not $release) {
+            throw "$tag 태그는 있지만 연결된 판올림 초안이 없어 안전하게 재배포할 수 없습니다."
+          }
+          if ($tagRef -and $tagRef.object.type -ne 'commit') {
+            throw "$tag 태그가 직접 커밋을 가리키지 않아 안전하게 재배포할 수 없습니다."
+          }
+          if ($tagRef -and $tagRef.object.sha -ne $env:GITHUB_SHA) {
+            throw "$tag 태그가 현재 커밋과 다른 소스를 가리켜 재배포할 수 없습니다."
+          }
+
+          if ($release) {
+            Write-Host "현재 커밋의 기존 $tag 초안을 이어서 완성합니다."
+          } else {
+            Write-Host "$tag 신규 판올림을 준비합니다."
+          }
 
       - name: 러스트 도구 설치
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
@@ -38,6 +97,10 @@ jobs:
       - name: 운영 공개 설정 검증 테스트
         shell: pwsh
         run: ./scripts/validate-release-config.test.ps1
+
+      - name: 자동 배포 워크플로 검증 테스트
+        shell: pwsh
+        run: ./scripts/validate-release-workflow.test.ps1
 
       - name: 운영 공개 설정 확인
         shell: pwsh
@@ -56,6 +119,7 @@ jobs:
         run: npm run build
 
       - name: 서명된 설치 파일과 판올림 초안 만들기
+        id: tauri_release
         uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -66,9 +130,112 @@ jobs:
         with:
           tagName: 판올림-__VERSION__
           releaseName: Token Deck __VERSION__ 판올림
+          releaseCommitish: ${{ github.sha }}
           releaseBody: |
             새 버전 설치 파일과 자동 업데이트 파일입니다.
-            검증을 마친 뒤 이 초안을 게시하면 설치된 앱이 새 버전을 감지합니다.
+            자동 검증을 통과한 판올림이며 설치된 앱이 새 버전을 감지합니다.
           releaseDraft: true
           prerelease: false
           includeUpdaterJson: true
+
+      - name: 판올림 자산 검증 뒤 게시
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ steps.tauri_release.outputs.releaseId }}
+          APP_VERSION: ${{ steps.tauri_release.outputs.appVersion }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RELEASE_ID)) {
+            throw "생성된 판올림 식별자를 확인할 수 없습니다."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:APP_VERSION)) {
+            throw "빌드된 앱 버전을 확인할 수 없습니다."
+          }
+
+          $releaseResponse = gh api "repos/$env:GITHUB_REPOSITORY/releases/$env:RELEASE_ID"
+          if ($LASTEXITCODE -ne 0) {
+            throw "판올림 초안 조회에 실패했습니다."
+          }
+          $release = $releaseResponse | ConvertFrom-Json
+          $expectedTag = "판올림-$env:APP_VERSION"
+          if (-not $release.draft) {
+            throw "자산 검증 전에 판올림이 이미 게시되어 중단합니다."
+          }
+          if ($release.tag_name -ne $expectedTag) {
+            throw "판올림 태그가 빌드 버전과 일치하지 않습니다."
+          }
+          if ($release.target_commitish -ne $env:GITHUB_SHA) {
+            throw "판올림 초안이 현재 빌드 커밋과 다른 소스를 가리킵니다."
+          }
+
+          $assets = @($release.assets)
+          $latestAssets = @($assets | Where-Object { $_.name -eq 'latest.json' })
+          $installers = @($assets | Where-Object { $_.name -match '(?i)(?:_|-)setup\.exe$' })
+          if ($latestAssets.Count -ne 1) {
+            throw "latest.json 자산이 정확히 하나여야 합니다."
+          }
+          if ($installers.Count -ne 1) {
+            throw "윈도우 설치 파일 자산이 정확히 하나여야 합니다."
+          }
+          $latestAsset = $latestAssets[0]
+          $installer = $installers[0]
+          $signatureAssets = @($assets | Where-Object { $_.name -eq "$($installer.name).sig" })
+          if ($signatureAssets.Count -ne 1) {
+            throw "설치 파일과 짝이 맞는 서명 자산이 정확히 하나여야 합니다."
+          }
+          $signatureAsset = $signatureAssets[0]
+          if ($latestAsset.size -le 0 -or $installer.size -le 0 -or $signatureAsset.size -le 0) {
+            throw "필수 판올림 자산 중 내용이 비어 있는 파일이 있습니다."
+          }
+
+          $headers = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = 'application/octet-stream'
+            'X-GitHub-Api-Version' = '2022-11-28'
+          }
+          $latestPath = Join-Path $env:RUNNER_TEMP 'token-deck-latest.json'
+          $signaturePath = Join-Path $env:RUNNER_TEMP 'token-deck-installer.sig'
+          Invoke-WebRequest -Headers $headers -Uri $latestAsset.url -OutFile $latestPath
+          Invoke-WebRequest -Headers $headers -Uri $signatureAsset.url -OutFile $signaturePath
+
+          $updater = Get-Content -Raw $latestPath | ConvertFrom-Json
+          if ($updater.version -ne $env:APP_VERSION) {
+            throw "latest.json 버전이 빌드된 앱 버전과 일치하지 않습니다."
+          }
+          $signature = (Get-Content -Raw $signaturePath).Trim()
+          $platforms = @($updater.platforms.PSObject.Properties)
+          if ($platforms.Count -eq 0) {
+            throw "latest.json에 자동 업데이트 플랫폼 정보가 없습니다."
+          }
+          $expectedPath = "/$env:GITHUB_REPOSITORY/releases/download/$expectedTag/$($installer.name)"
+          foreach ($platform in $platforms) {
+            $entry = $platform.Value
+            $downloadUri = $null
+            if ([string]::IsNullOrWhiteSpace($entry.url) -or
+                -not [Uri]::TryCreate([string]$entry.url, [UriKind]::Absolute, [ref]$downloadUri)) {
+              throw "latest.json의 $($platform.Name) 설치 주소가 올바른 절대 주소가 아닙니다."
+            }
+            if (-not $downloadUri.Scheme.Equals('https', [StringComparison]::OrdinalIgnoreCase) -or
+                -not $downloadUri.Host.Equals('github.com', [StringComparison]::OrdinalIgnoreCase) -or
+                -not [string]::IsNullOrEmpty($downloadUri.Query) -or
+                -not [string]::IsNullOrEmpty($downloadUri.Fragment)) {
+              throw "latest.json의 $($platform.Name) 설치 주소가 GitHub의 안전한 다운로드 주소가 아닙니다."
+            }
+            $decodedPath = [Uri]::UnescapeDataString($downloadUri.AbsolutePath)
+            if (-not $decodedPath.Equals($expectedPath, [StringComparison]::Ordinal)) {
+              throw "latest.json 설치 주소가 현재 판올림 태그와 저장소의 검증된 설치 파일을 가리키지 않습니다."
+            }
+            if ([string]::IsNullOrWhiteSpace($entry.signature) -or $entry.signature.Trim() -ne $signature) {
+              throw "latest.json 서명과 설치 파일 서명 자산이 일치하지 않습니다."
+            }
+          }
+
+          $publishedResponse = gh api --method PATCH "repos/$env:GITHUB_REPOSITORY/releases/$env:RELEASE_ID" -F draft=false -f make_latest=true
+          if ($LASTEXITCODE -ne 0) {
+            throw "검증된 판올림 게시에 실패했습니다."
+          }
+          $published = $publishedResponse | ConvertFrom-Json
+          if ($published.draft) {
+            throw "판올림 게시 뒤에도 초안 상태로 남아 있습니다."
+          }
+          Write-Host "$expectedTag 판올림 자산 검증과 게시를 완료했습니다."
