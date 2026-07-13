@@ -1467,7 +1467,8 @@ fn child_command(program: &str) -> Command {
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
     }
     command
 }
@@ -1475,7 +1476,7 @@ fn child_command(program: &str) -> Command {
 #[cfg(windows)]
 fn terminate_child_tree(child: &mut std::process::Child) {
     let pid = child.id().to_string();
-    let mut taskkill = Command::new("taskkill")
+    let mut taskkill = child_command("taskkill")
         .args(["/PID", &pid, "/T", "/F"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())

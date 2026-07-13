@@ -191,8 +191,18 @@ fn is_telemetry_configured(settings: Option<&Value>, outfile: &Path) -> bool {
 }
 
 #[cfg(windows)]
+fn hidden_command(program: &str) -> Command {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let mut command = Command::new(program);
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
+}
+
+#[cfg(windows)]
 fn gemini_command_output(arguments: &[&str]) -> Option<String> {
-    let output = Command::new("cmd")
+    let output = hidden_command("cmd")
         .args(["/D", "/C", "gemini"])
         .args(arguments)
         .output()
@@ -214,7 +224,7 @@ fn gemini_command_output(arguments: &[&str]) -> Option<String> {
 
 #[cfg(windows)]
 fn gemini_executable_path() -> Option<String> {
-    let output = Command::new("where.exe").arg("gemini").output().ok()?;
+    let output = hidden_command("where.exe").arg("gemini").output().ok()?;
     if !output.status.success() {
         return None;
     }
