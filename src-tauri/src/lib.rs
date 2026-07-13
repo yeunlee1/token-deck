@@ -28,6 +28,18 @@ static SCAN_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 type BoundedLine = (Option<Vec<u8>>, usize, bool);
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum UsageProvider {
+    Codex,
+    Claude,
+    Gemini,
+}
+
+fn provider_selected(providers: Option<&[UsageProvider]>, provider: UsageProvider) -> bool {
+    providers.is_none_or(|selected| selected.contains(&provider))
+}
+
 #[derive(Clone, Copy, Default, Deserialize, Serialize)]
 struct ScanCursor {
     offset: u64,
@@ -249,10 +261,11 @@ fn git_config_path(directory: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_files, file_prefix_fingerprint, git_remote_from_cwd, read_json_value_chunk,
-        read_log_chunk, resolve_device_display_name, safe_git_remote, sanitize_device_display_name,
-        sanitized_log_records, secret_has_marker, stable_local_identifier, ScanCursor,
-        MAX_DEVICE_DISPLAY_NAME_CHARS, MAX_RAW_BYTES_PER_FILE_PER_SCAN, MAX_SCAN_DEPTH,
+        collect_files, file_prefix_fingerprint, git_remote_from_cwd, provider_selected,
+        read_json_value_chunk, read_log_chunk, resolve_device_display_name, safe_git_remote,
+        sanitize_device_display_name, sanitized_log_records, secret_has_marker,
+        stable_local_identifier, ScanCursor, UsageProvider, MAX_DEVICE_DISPLAY_NAME_CHARS,
+        MAX_RAW_BYTES_PER_FILE_PER_SCAN, MAX_SCAN_DEPTH,
     };
     use std::{
         collections::HashMap,
@@ -267,6 +280,16 @@ mod tests {
             resolve_device_display_name(Some("  WORK\nPC\0  "), Some("fallback-host")),
             Some("WORK PC".to_owned())
         );
+    }
+
+    #[test]
+    fn provider_selection_defaults_to_all_and_honors_explicit_choices() {
+        assert!(provider_selected(None, UsageProvider::Codex));
+        let selected = [UsageProvider::Codex, UsageProvider::Gemini];
+        assert!(provider_selected(Some(&selected), UsageProvider::Codex));
+        assert!(!provider_selected(Some(&selected), UsageProvider::Claude));
+        assert!(provider_selected(Some(&selected), UsageProvider::Gemini));
+        assert!(!provider_selected(Some(&[]), UsageProvider::Codex));
     }
 
     #[test]
@@ -1711,7 +1734,10 @@ fn collect_files(
     }
 }
 
-fn scan_local_usage_blocking(modified_since: Option<u64>) -> Vec<LogDocument> {
+fn scan_local_usage_blocking(
+    modified_since: Option<u64>,
+    providers: Option<Vec<UsageProvider>>,
+) -> Vec<LogDocument> {
     let _scan_guard = SCAN_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -1727,62 +1753,73 @@ fn scan_local_usage_blocking(modified_since: Option<u64>) -> Vec<LogDocument> {
     let mut files_seen = 0;
     let mut output_bytes = 0;
     let mut cursors = load_scan_cursors(&home, modified_since.is_none());
-    collect_files(
-        &home.join(".codex").join("sessions"),
-        "jsonl",
-        "codex",
-        since,
-        &mut documents,
-        0,
-        &mut files_seen,
-        &mut output_bytes,
-        &mut cursors,
-    );
-    files_seen = 0;
-    collect_files(
-        &home.join(".claude").join("projects"),
-        "jsonl",
-        "claude",
-        since,
-        &mut documents,
-        0,
-        &mut files_seen,
-        &mut output_bytes,
-        &mut cursors,
-    );
-    files_seen = 0;
-    collect_files(
-        &home.join(".gemini"),
-        "log",
-        "gemini",
-        since,
-        &mut documents,
-        0,
-        &mut files_seen,
-        &mut output_bytes,
-        &mut cursors,
-    );
+    if provider_selected(providers.as_deref(), UsageProvider::Codex) {
+        collect_files(
+            &home.join(".codex").join("sessions"),
+            "jsonl",
+            "codex",
+            since,
+            &mut documents,
+            0,
+            &mut files_seen,
+            &mut output_bytes,
+            &mut cursors,
+        );
+    }
+    if provider_selected(providers.as_deref(), UsageProvider::Claude) {
+        files_seen = 0;
+        collect_files(
+            &home.join(".claude").join("projects"),
+            "jsonl",
+            "claude",
+            since,
+            &mut documents,
+            0,
+            &mut files_seen,
+            &mut output_bytes,
+            &mut cursors,
+        );
+    }
+    if provider_selected(providers.as_deref(), UsageProvider::Gemini) {
+        files_seen = 0;
+        collect_files(
+            &home.join(".gemini"),
+            "log",
+            "gemini",
+            since,
+            &mut documents,
+            0,
+            &mut files_seen,
+            &mut output_bytes,
+            &mut cursors,
+        );
+    }
     save_scan_cursors(&home, &cursors);
     documents.sort_by_key(|document| std::cmp::Reverse(document.modified_at));
     documents
 }
 
 #[tauri::command]
-async fn scan_local_usage(modified_since: Option<u64>) -> Result<Vec<LogDocument>, String> {
-    tauri::async_runtime::spawn_blocking(move || scan_local_usage_blocking(modified_since))
-        .await
-        .map_err(|error| format!("로컬 사용량 수집 작업을 완료하지 못했습니다. {error}"))
+async fn scan_local_usage(
+    modified_since: Option<u64>,
+    providers: Option<Vec<UsageProvider>>,
+) -> Result<Vec<LogDocument>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        scan_local_usage_blocking(modified_since, providers)
+    })
+    .await
+    .map_err(|error| format!("로컬 사용량 수집 작업을 완료하지 못했습니다. {error}"))
 }
 
 #[tauri::command]
-fn integration_status() -> serde_json::Value {
+fn integration_status(providers: Option<Vec<UsageProvider>>) -> serde_json::Value {
     let home = std::env::var_os("USERPROFILE")
         .map(PathBuf::from)
         .unwrap_or_default();
     serde_json::json!({
-        "codex": home.join(".codex").join("sessions").exists(),
-        "claude": home.join(".claude").join("projects").exists(),
-        "gemini": home.join(".gemini").exists()
+        "codex": provider_selected(providers.as_deref(), UsageProvider::Codex) && home.join(".codex").join("sessions").exists(),
+        "claude": provider_selected(providers.as_deref(), UsageProvider::Claude) && home.join(".claude").join("projects").exists(),
+        "gemini": provider_selected(providers.as_deref(), UsageProvider::Gemini) && home.join(".gemini").exists()
     })
 }
 
@@ -1847,6 +1884,7 @@ pub fn run() {
             native_integration::gemini_status,
             native_integration::configure_gemini_telemetry,
             native_integration::quota_statuses,
+            native_integration::set_collection_providers,
             native_integration::claude_quota_capture_status,
             native_integration::configure_claude_quota_capture,
         ])

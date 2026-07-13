@@ -1,6 +1,6 @@
 [package]
 name = "token-deck"
-version = "0.5.1"
+version = "0.5.2"
 description = "Codex, Claude, Gemini 토큰 사용량 통합 대시보드"
 authors = ["Token Deck"]
 edition = "2021"

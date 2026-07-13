@@ -7,6 +7,7 @@ import { quotaStatusLabel, quotaWindowLabel, remainingTone, type ProviderQuotaSt
 interface MiniDashboardProps {
   quotas: ProviderQuotaStatus[];
   providers: Provider[];
+  availableProviders?: Provider[];
   showTotal: boolean;
   totalTokens: number;
   totalPeriod: string;
@@ -24,6 +25,10 @@ const names: Record<Provider, string> = { codex: "Codex", claude: "Claude", gemi
 
 export function MiniDashboard(props: MiniDashboardProps) {
   const quotaByProvider = useMemo(() => new Map(props.quotas.map((quota) => [quota.provider, quota])), [props.quotas]);
+  const availableProviderValues = props.availableProviders ?? options.map((item) => item.value);
+  const availableOptions = options.filter((option) => availableProviderValues.includes(option.value));
+  const selectedAvailableProviders = props.providers.filter((provider) => availableProviderValues.includes(provider));
+  const visibleProviders = selectedAvailableProviders.length ? selectedAvailableProviders : availableOptions.slice(0, 1).map((option) => option.value);
   const compactTotal = new Intl.NumberFormat("ko-KR", { notation: props.totalTokens > 9999 ? "compact" : "standard", maximumFractionDigits: 1 }).format(props.totalTokens);
 
   return <main className="mini-dashboard" aria-label="Token Deck 미니 모드">
@@ -32,9 +37,12 @@ export function MiniDashboard(props: MiniDashboardProps) {
       {props.showTotal && <div className="mini-total" aria-label={`${props.totalPeriod} 총 토큰 ${props.totalTokens.toLocaleString("ko-KR")}`} aria-live="polite" data-tauri-drag-region><span data-tauri-drag-region>{props.totalPeriod} TOTAL</span><div data-tauri-drag-region><strong data-tauri-drag-region>{compactTotal}</strong><small data-tauri-drag-region>tokens</small></div></div>}
       <div className="mini-actions"><button className={props.pinned ? "pinned" : ""} aria-label={props.pinned ? "창 고정 해제" : "창 항상 위에 고정"} aria-pressed={Boolean(props.pinned)} onClick={props.onTogglePinned}><Icon name={props.pinned ? "pin" : "pinOff"} /></button><button aria-label="일반 모드로 전환" onClick={props.onExit}>↗</button></div>
     </header>
-    <div className="mini-selector" aria-label="표시할 공급사">{options.map((option) => <button key={option.value} aria-pressed={props.providers.includes(option.value)} onClick={() => props.onToggleProvider(option.value)}>{option.label}</button>)}</div>
+    <div className="mini-selector" role="group" aria-label="표시할 공급사">{availableOptions.map((option) => {
+      const selected = visibleProviders.includes(option.value);
+      return <button key={option.value} aria-pressed={selected} disabled={selected && visibleProviders.length === 1} onClick={() => props.onToggleProvider(option.value)}>{option.label}</button>;
+    })}</div>
     <div className="mini-columns" aria-hidden="true"><span>공급사</span><span>5시간 잔여</span><span>주간 잔여</span></div>
-    <section className="mini-provider-rows" aria-live="polite">{props.providers.map((provider) => {
+    <section className="mini-provider-rows" aria-live="polite">{visibleProviders.map((provider) => {
       const quota = quotaByProvider.get(provider);
       return <article key={provider} className={provider}>
         <div><i /><strong>{names[provider]}</strong><small>{quotaStatusLabel(quota)}</small></div>

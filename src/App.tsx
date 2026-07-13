@@ -1,5 +1,5 @@
 // AI 도구별 실제 토큰 사용량과 계정 연결 상태를 통합해 보여주는 데스크톱 대시보드
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { buildUsageChart, type ChartPeriod } from "./components/chart-data";
 import { selectProjectDeviceEvents } from "./components/dashboard-usage";
 import { DeviceInventoryPanel } from "./components/DeviceInventoryPanel";
@@ -18,6 +18,7 @@ import { useAppRuntime } from "./hooks/useAppRuntime";
 import { getOrCreateDeviceId } from "./hooks/useLocalUsage";
 import { useNativeSettings } from "./hooks/useNativeSettings";
 import { useProviderQuotas } from "./hooks/useProviderQuotas";
+import { setCollectionProviders } from "./platform/tauri";
 import { applyWindowMode, setWindowPinned } from "./platform/window-mode";
 import { applyTheme, readTheme, storeTheme, type ThemeId } from "./theme";
 import "./styles.css";
@@ -29,12 +30,12 @@ const MINI_PROVIDERS_KEY = "token-deck-mini-providers";
 const MINI_PINNED_KEY = "token-deck-mini-pinned";
 const MINI_TOTAL_VISIBLE_KEY = "token-deck-mini-total-visible";
 const DASHBOARD_PERIOD_KEY = "token-deck-dashboard-period";
-const DISPLAY_PROVIDERS_KEY = "token-deck-display-providers";
+const COLLECTION_PROVIDERS_KEY = "token-deck-collection-providers";
 const ALL_PROVIDERS: Provider[] = ["codex", "claude", "gemini"];
 const EMPTY_DEVICE_INVENTORY = { schemaVersion: 1 as const, capturedAt: 0, items: [], warnings: [] };
 
 const providerInfo = {
-  codex: { name: "Codex", model: "앱 + CLI", tone: "ink", monogram: "CX" },
+  codex: { name: "OpenAI Codex", model: "Codex 앱 + CLI", tone: "ink", monogram: "CX" },
   claude: { name: "Claude", model: "Claude Code", tone: "lime", monogram: "CL" },
   gemini: { name: "Gemini", model: "Gemini CLI", tone: "violet", monogram: "GM" },
 } as const;
@@ -90,14 +91,14 @@ export function dashboardConnectionLabels(
 
 export default function App() {
   useAutoUpdater();
-  const runtime = useAppRuntime();
-  const nativeSettings = useNativeSettings();
-  const providerQuotas = useProviderQuotas();
+  const [enabledProviders, setEnabledProviders] = useState<Provider[]>(() => readProviderList(COLLECTION_PROVIDERS_KEY, ALL_PROVIDERS));
+  const runtime = useAppRuntime(enabledProviders);
+  const nativeSettings = useNativeSettings(enabledProviders.includes("gemini"));
+  const providerQuotas = useProviderQuotas(enabledProviders);
   const [currentDeviceId] = useState(() => getOrCreateDeviceId());
   const [period, setPeriod] = useState<Period>(() => readPeriod());
   const [activeView, setActiveView] = useState<ActiveView>("overview");
   const [miniMode, setMiniMode] = useState(() => window.localStorage.getItem(ONBOARDING_COMPLETE_KEY) === "true" && window.localStorage.getItem(MINI_MODE_KEY) === "true");
-  const [displayProviders, setDisplayProviders] = useState<Provider[]>(() => readProviderList(DISPLAY_PROVIDERS_KEY, ALL_PROVIDERS));
   const [miniProviders, setMiniProviders] = useState<Provider[]>(() => readProviderList(MINI_PROVIDERS_KEY, ["codex", "claude"]));
   const [miniPinned, setMiniPinned] = useState(() => window.localStorage.getItem(MINI_PINNED_KEY) === "true");
   const [miniTotalVisible, setMiniTotalVisible] = useState(() => window.localStorage.getItem(MINI_TOTAL_VISIBLE_KEY) !== "false");
@@ -110,14 +111,28 @@ export default function App() {
   const [windowModeError, setWindowModeError] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [theme, setTheme] = useState<ThemeId>(() => readTheme());
+  const collectionProvidersRef = useRef(enabledProviders);
+  const collectionPolicyWrites = useRef<Promise<void>>(Promise.resolve());
   const usageEvents = runtime.combinedEvents;
-  const visibleEvents = useMemo(() => usageEvents.filter((event) => displayProviders.includes(event.provider)), [displayProviders, usageEvents]);
+  const visibleEvents = useMemo(() => usageEvents.filter((event) => enabledProviders.includes(event.provider)), [enabledProviders, usageEvents]);
   const periodEvents = useMemo(() => usageInPeriod(visibleEvents, period), [visibleEvents, period]);
-  const projectDeviceEvents = useMemo(() => selectProjectDeviceEvents(runtime.localSessionEvents, displayProviders, periodStart(period)), [displayProviders, period, runtime.localSessionEvents]);
+  const projectDeviceEvents = useMemo(() => selectProjectDeviceEvents(runtime.localSessionEvents, enabledProviders, periodStart(period)), [enabledProviders, period, runtime.localSessionEvents]);
   const accountUsage = useMemo(() => buildAccountUsageMatrix(projectDeviceEvents), [projectDeviceEvents]);
   const actualTotal = accountUsage.totals.totalTokens;
   const miniTotal = useMemo(() => usageInPeriod(usageEvents.filter((event) => miniProviders.includes(event.provider)), period).reduce((sum, event) => sum + tokenTotal(event.tokens), 0), [miniProviders, period, usageEvents]);
   const chartData = useMemo(() => buildUsageChart(visibleEvents, period), [visibleEvents, period]);
+
+  const writeCollectionPolicy = (providers: Provider[]): Promise<void> => {
+    const task = collectionPolicyWrites.current.catch(() => undefined).then(() => setCollectionProviders(providers));
+    collectionPolicyWrites.current = task.catch(() => undefined);
+    return task;
+  };
+
+  useEffect(() => {
+    void writeCollectionPolicy(enabledProviders).catch((cause) => {
+      setWindowModeError(cause instanceof Error ? cause.message : "수집 서비스 설정을 네이티브 수집기에 전달하지 못했습니다.");
+    });
+  }, []);
 
   useEffect(() => {
     if (!settingsOpen) return;
@@ -131,6 +146,16 @@ export default function App() {
     setProjectNameDraft("");
     setProjectNameError("");
   }, [runtime.auth.status, runtime.auth.userId]);
+
+  useEffect(() => {
+    setMiniProviders((current) => {
+      const available = current.filter((provider) => enabledProviders.includes(provider));
+      const next = available.length ? available : [enabledProviders[0]];
+      if (next.length === current.length && next.every((provider, index) => provider === current[index])) return current;
+      window.localStorage.setItem(MINI_PROVIDERS_KEY, JSON.stringify(next));
+      return next;
+    });
+  }, [enabledProviders]);
 
   useEffect(() => {
     window.localStorage.setItem(DASHBOARD_PERIOD_KEY, period);
@@ -157,7 +182,7 @@ export default function App() {
   }, []);
 
   const providers = useMemo(() => {
-    const totals = displayProviders.map((provider) => ({
+    const totals = enabledProviders.map((provider) => ({
       provider,
       tokens: periodEvents.filter((event) => event.provider === provider).reduce((sum, event) => sum + tokenTotal(event.tokens), 0),
     }));
@@ -168,7 +193,7 @@ export default function App() {
       status: runtime.integrations[provider] ? (tokens ? "수집됨" : "연결됨") : "미감지",
       quota: providerQuotas.quotas[provider],
     }));
-  }, [actualTotal, displayProviders, periodEvents, providerQuotas.quotas, runtime.integrations]);
+  }, [actualTotal, enabledProviders, periodEvents, providerQuotas.quotas, runtime.integrations]);
 
   const projects = useMemo(() => {
     const max = Math.max(...accountUsage.projects.map((project) => project.totals.totalTokens), 1);
@@ -211,7 +236,7 @@ export default function App() {
         total: aggregate?.totals.totalTokens ?? 0,
         eventCount: aggregate?.totals.requestCount ?? 0,
         projectCount: aggregate?.projects.length ?? 0,
-        byProvider: displayProviders.map((provider) => ({ provider, value: aggregate?.totals.byProvider[provider].totalTokens ?? 0 })),
+        byProvider: enabledProviders.map((provider) => ({ provider, value: aggregate?.totals.byProvider[provider].totalTokens ?? 0 })),
         projects: aggregate?.projects.map((project) => ({
           ...project,
           name: runtime.projectNames[project.projectId] ?? `프로젝트 ${project.projectId.slice(-6).toUpperCase()}`,
@@ -221,7 +246,7 @@ export default function App() {
         inventoryCapturedAt: deviceId === currentDeviceId ? runtime.localInventory?.capturedAt : snapshot?.capturedAt,
       };
     }).sort((left, right) => Number(right.current) - Number(left.current) || right.total - left.total || left.name.localeCompare(right.name, "ko"));
-  }, [accountUsage.devices, currentDeviceId, displayProviders, projectDeviceEvents, runtime.deviceInventories, runtime.devices, runtime.localInventory, runtime.projectNames]);
+  }, [accountUsage.devices, currentDeviceId, enabledProviders, projectDeviceEvents, runtime.deviceInventories, runtime.devices, runtime.localInventory, runtime.projectNames]);
 
   const sessions = useMemo(() => {
     const latest = new Map<string, UsageEvent>();
@@ -237,7 +262,7 @@ export default function App() {
     }));
   }, [usageEvents, runtime.sessionTitles]);
 
-  const connectedCount = Object.values(runtime.integrations).filter(Boolean).length;
+  const connectedCount = enabledProviders.filter((provider) => runtime.integrations[provider]).length;
   const authenticated = runtime.auth.status === "authenticated";
   const connectionLabels = dashboardConnectionLabels(onboardingComplete, runtime.auth.status, runtime.auth.enabled, runtime.cloudSync.status);
   const accountName = authenticated ? "동기화 계정" : "로컬 사용자";
@@ -267,10 +292,27 @@ export default function App() {
     }
   };
   const toggleProvider = (provider: Provider, current: Provider[], setCurrent: (providers: Provider[]) => void, storageKey: string) => {
-    const next = current.includes(provider) ? current.filter((item) => item !== provider) : ALL_PROVIDERS.filter((item) => current.includes(item) || item === provider);
+    const next = toggledProviderList(provider, current);
     if (!next.length) return;
     setCurrent(next);
     window.localStorage.setItem(storageKey, JSON.stringify(next));
+  };
+  const updateCollectionProvider = async (provider: Provider) => {
+    const task = collectionPolicyWrites.current.catch(() => undefined).then(async () => {
+      const next = toggledProviderList(provider, collectionProvidersRef.current);
+      if (!next.length) return;
+      await setCollectionProviders(next);
+      collectionProvidersRef.current = next;
+      setEnabledProviders(next);
+      window.localStorage.setItem(COLLECTION_PROVIDERS_KEY, JSON.stringify(next));
+    });
+    collectionPolicyWrites.current = task.catch(() => undefined);
+    try {
+      await task;
+      setWindowModeError("");
+    } catch (cause) {
+      setWindowModeError(cause instanceof Error ? cause.message : "수집 서비스 설정을 저장하지 못했습니다.");
+    }
   };
   const toggleMiniPinned = async () => {
     const next = !miniPinned;
@@ -315,7 +357,7 @@ export default function App() {
 
   if (!onboardingComplete && runtime.auth.status !== "authenticated") return <OnboardingScreen authEnabled={runtime.auth.enabled} authError={runtime.auth.error} onSignInWithGoogle={() => runtime.signInWithGoogle()} onSendMagicLink={(email) => runtime.sendMagicLink(email)} onContinueLocal={continueLocally} />;
 
-  if (miniMode) return <MiniDashboard quotas={Object.values(providerQuotas.quotas)} providers={miniProviders} showTotal={miniTotalVisible} totalTokens={miniTotal} totalPeriod={period} updatedAt={providerQuotas.updatedAt} syncing={providerQuotas.loading || providerQuotas.busy} error={providerQuotas.error} pinned={miniPinned} onToggleProvider={(provider) => toggleProvider(provider, miniProviders, setMiniProviders, MINI_PROVIDERS_KEY)} onTogglePinned={() => void toggleMiniPinned()} onExit={() => void changeWindowMode(false)} />;
+  if (miniMode) return <MiniDashboard quotas={Object.values(providerQuotas.quotas)} providers={miniProviders} availableProviders={enabledProviders} showTotal={miniTotalVisible} totalTokens={miniTotal} totalPeriod={period} updatedAt={providerQuotas.updatedAt} syncing={providerQuotas.loading || providerQuotas.busy} error={providerQuotas.error} pinned={miniPinned} onToggleProvider={(provider) => toggleProvider(provider, miniProviders, setMiniProviders, MINI_PROVIDERS_KEY)} onTogglePinned={() => void toggleMiniPinned()} onExit={() => void changeWindowMode(false)} />;
 
   return (
     <div className="app-shell">
@@ -355,7 +397,7 @@ export default function App() {
             <span className="eyebrow">SYNC HEALTH</span><div className="health-label"><strong>{connectionLabels.syncHealth}</strong></div>
             <p>최근 갱신 <strong>{runtime.syncing ? "진행 중" : runtime.updatedAt ? runtime.updatedAt.toLocaleTimeString("ko-KR") : "대기 중"}</strong></p>
             <div className="status-row"><span><i className="ok" /> 등록 기기</span><strong>{runtime.devices.length}</strong></div>
-            <div className="status-row"><span><i className={connectedCount ? "ok" : ""} /> 수집 커넥터</span><strong>{connectedCount} / 3</strong></div>
+            <div className="status-row"><span><i className={connectedCount ? "ok" : ""} /> 수집 커넥터</span><strong>{connectedCount} / {enabledProviders.length}</strong></div>
           </article>
         </section>
 
@@ -374,7 +416,7 @@ export default function App() {
 
         <section className="content-grid" hidden={activeView !== "overview"}>
           <article className="panel trend-panel">
-            <SectionTitle eyebrow="ACTIVITY" title="실제 사용량 추이" action={<div className="legend">{displayProviders.map((provider) => <span className={provider} key={provider}>{providerInfo[provider].name}</span>)}</div>} />
+            <SectionTitle eyebrow="ACTIVITY" title="실제 사용량 추이" action={<div className="legend">{enabledProviders.map((provider) => <span className={provider} key={provider}>{providerInfo[provider].name}</span>)}</div>} />
             <UsageChart data={chartData} />
           </article>
           <article id="projects" className="panel project-panel">
@@ -410,7 +452,7 @@ export default function App() {
                 {project.deviceBreakdown.map((device) => <div className="project-device-line" key={device.deviceId}>
                   <span className={`device-icon ${device.current ? "current" : ""}`}><Icon name="device" /></span>
                   <div className="cross-device-copy"><strong>{device.name}</strong><small>ID {device.deviceId.slice(-6).toUpperCase()}{device.current ? " · 현재 기기" : ""}</small></div>
-                  <div className="cross-provider-values">{displayProviders.filter((provider) => device.byProvider[provider].requestCount > 0).map((provider) => <span key={provider}>{providerInfo[provider].name} <b>{formatTokens(device.byProvider[provider].totalTokens)}</b></span>)}</div>
+                  <div className="cross-provider-values">{enabledProviders.filter((provider) => device.byProvider[provider].requestCount > 0).map((provider) => <span key={provider}>{providerInfo[provider].name} <b>{formatTokens(device.byProvider[provider].totalTokens)}</b></span>)}</div>
                   <strong className="cross-total">{device.totalTokens.toLocaleString("ko-KR")}</strong>
                 </div>)}
               </div>
@@ -430,7 +472,7 @@ export default function App() {
                 <div className="cross-breakdown-head"><span>이 기기의 프로젝트별 사용량</span><small>{device.projectCount}개 프로젝트</small></div>
                 {device.projects.length ? device.projects.map((project) => <div className="device-project-line" key={project.projectId}>
                   <span className="project-dot ink" />
-                  <div><strong>{project.name}</strong><small>{displayProviders.filter((provider) => project.byProvider[provider].requestCount > 0).map((provider) => `${providerInfo[provider].name} ${formatTokens(project.byProvider[provider].totalTokens)}`).join(" · ")}</small></div>
+                  <div><strong>{project.name}</strong><small>{enabledProviders.filter((provider) => project.byProvider[provider].requestCount > 0).map((provider) => `${providerInfo[provider].name} ${formatTokens(project.byProvider[provider].totalTokens)}`).join(" · ")}</small></div>
                   <b>{project.totalTokens.toLocaleString("ko-KR")}</b>
                 </div>) : <p className="cross-empty">선택 기간에 이 기기의 프로젝트 사용량이 없습니다.</p>}
               </div>
@@ -451,7 +493,7 @@ export default function App() {
           />
         </section>
 
-        <footer><span>Token Deck <b>v0.5.1</b></span><span><i /> {usageEvents.length ? "실제 사용량 연결됨" : "수집 이벤트 대기 중"}</span><span>마지막 갱신 · {runtime.syncing ? "동기화 중" : runtime.updatedAt?.toLocaleTimeString("ko-KR") ?? "대기 중"}</span></footer>
+        <footer><span>Token Deck <b>v0.5.2</b></span><span><i /> {usageEvents.length ? "실제 사용량 연결됨" : "수집 이벤트 대기 중"}</span><span>마지막 갱신 · {runtime.syncing ? "동기화 중" : runtime.updatedAt?.toLocaleTimeString("ko-KR") ?? "대기 중"}</span></footer>
       </main>
 
       <SettingsPanel
@@ -465,7 +507,7 @@ export default function App() {
         nativeMessage={nativeSettings.message}
         providerUsage={runtime.providerUsage}
         sessions={sessions}
-        displayProviders={displayProviders}
+        enabledProviders={enabledProviders}
         miniTotalVisible={miniTotalVisible}
         miniTotalPeriod={period}
         inventorySyncEnabled={runtime.inventorySyncEnabled}
@@ -484,7 +526,7 @@ export default function App() {
         onUpdateSessionTitle={(sessionId, title) => runtime.updateSessionTitle(sessionId, title)}
         onSetAutostart={(enabled) => nativeSettings.toggleAutostart(enabled)}
         onConfigureGemini={() => nativeSettings.enableGeminiTelemetry()}
-        onToggleDisplayProvider={(provider) => toggleProvider(provider, displayProviders, setDisplayProviders, DISPLAY_PROVIDERS_KEY)}
+        onToggleProvider={(provider) => void updateCollectionProvider(provider)}
         onToggleMiniTotal={toggleMiniTotal}
         onSelectTheme={setTheme}
         onConfigureClaudeQuota={() => providerQuotas.enableClaudeCapture()}
@@ -492,6 +534,12 @@ export default function App() {
       />
     </div>
   );
+}
+
+function toggledProviderList(provider: Provider, current: Provider[]): Provider[] {
+  return current.includes(provider)
+    ? current.filter((item) => item !== provider)
+    : ALL_PROVIDERS.filter((item) => current.includes(item) || item === provider);
 }
 
 function readProviderList(key: string, fallback: Provider[]): Provider[] {

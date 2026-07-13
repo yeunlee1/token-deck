@@ -49,4 +49,20 @@ describe("mini quota display", () => {
     expect(markup).toContain("현재 미제공");
     expect(markup).toContain("81%");
   });
+
+  it("전역 수집이 꺼진 공급사는 미니모드 선택지에서 제외한다", () => {
+    const markup = renderToStaticMarkup(<MiniDashboard quotas={[quota]} providers={["codex"]} availableProviders={["codex"]} showTotal={false} totalTokens={0} totalPeriod="7일" syncing={false} pinned={false} onToggleProvider={vi.fn()} onTogglePinned={vi.fn()} onExit={vi.fn()} />);
+
+    expect(markup).toContain("Codex");
+    expect(markup).not.toContain(">Claude<");
+    expect(markup).not.toContain(">Gemini<");
+  });
+
+  it("저장된 미니 선택이 수집 대상과 다르면 활성 공급사를 즉시 표시한다", () => {
+    const markup = renderToStaticMarkup(<MiniDashboard quotas={[quota]} providers={["claude"]} availableProviders={["codex"]} showTotal={false} totalTokens={0} totalPeriod="7일" syncing={false} pinned={false} onToggleProvider={vi.fn()} onTogglePinned={vi.fn()} onExit={vi.fn()} />);
+
+    expect(markup).toContain("Codex");
+    expect(markup).not.toContain("Claude");
+    expect(markup).toContain("disabled");
+  });
 });

@@ -24,6 +24,7 @@ export interface GeminiConfigurationResult {
 }
 
 export type QuotaProvider = "codex" | "claude" | "gemini";
+const ALL_QUOTA_PROVIDERS: QuotaProvider[] = ["codex", "claude", "gemini"];
 
 export interface QuotaWindowStatus {
   usedPercent: number;
@@ -85,8 +86,8 @@ export async function configureGeminiTelemetry(): Promise<GeminiConfigurationRes
   return invoke<GeminiConfigurationResult>("configure_gemini_telemetry");
 }
 
-export function unsupportedQuotaStatuses(): ProviderQuotaStatus[] {
-  return (["codex", "claude", "gemini"] as QuotaProvider[]).map((provider) => ({
+export function unsupportedQuotaStatuses(providers: QuotaProvider[] = ALL_QUOTA_PROVIDERS): ProviderQuotaStatus[] {
+  return providers.map((provider) => ({
     provider,
     supported: false,
     planType: null,
@@ -98,9 +99,9 @@ export function unsupportedQuotaStatuses(): ProviderQuotaStatus[] {
   }));
 }
 
-export async function getQuotaStatuses(): Promise<ProviderQuotaStatus[]> {
-  if (!isTauriRuntime()) return unsupportedQuotaStatuses();
-  return invoke<ProviderQuotaStatus[]>("quota_statuses");
+export async function getQuotaStatuses(providers: QuotaProvider[] = ALL_QUOTA_PROVIDERS): Promise<ProviderQuotaStatus[]> {
+  if (!isTauriRuntime()) return unsupportedQuotaStatuses(providers);
+  return invoke<ProviderQuotaStatus[]>("quota_statuses", { providers });
 }
 
 export async function getClaudeQuotaCaptureStatus(): Promise<ClaudeQuotaCaptureStatus> {

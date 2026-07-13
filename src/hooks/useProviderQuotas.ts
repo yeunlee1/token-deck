@@ -1,5 +1,5 @@
 // 공급사별 구독 한도와 Claude 상태 표시 수집 설정을 주기적으로 갱신하는 React 훅
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   configureClaudeQuotaCapture,
   getClaudeQuotaCaptureStatus,
@@ -17,34 +17,93 @@ const EMPTY_CAPTURE: ClaudeQuotaCaptureStatus = {
   hasData: false,
   existingStatusLine: false,
 };
+const ALL_PROVIDERS: QuotaProvider[] = ["codex", "claude", "gemini"];
 
-export function quotaRecord(statuses: ProviderQuotaStatus[]): Record<QuotaProvider, ProviderQuotaStatus> {
-  const fallback = unsupportedQuotaStatuses();
-  const byProvider = new Map([...fallback, ...statuses].map((status) => [status.provider, status]));
-  return Object.fromEntries((["codex", "claude", "gemini"] as QuotaProvider[]).map((provider) => [provider, byProvider.get(provider)!])) as Record<QuotaProvider, ProviderQuotaStatus>;
+function collectionDisabledStatus(provider: QuotaProvider): ProviderQuotaStatus {
+  return {
+    provider,
+    supported: false,
+    planType: null,
+    fiveHour: null,
+    weekly: null,
+    daily: null,
+    message: "설정에서 수집이 꺼져 있습니다.",
+    updatedAt: null,
+  };
 }
 
-export function useProviderQuotas(pollIntervalMs = 30_000) {
-  const [quotas, setQuotas] = useState(() => quotaRecord([]));
+export function quotaRecord(statuses: ProviderQuotaStatus[], enabledProviders: QuotaProvider[] = ALL_PROVIDERS): Record<QuotaProvider, ProviderQuotaStatus> {
+  const fallback = new Map(unsupportedQuotaStatuses(enabledProviders).map((status) => [status.provider, status]));
+  const received = new Map(statuses.filter((status) => enabledProviders.includes(status.provider)).map((status) => [status.provider, status]));
+  return Object.fromEntries(ALL_PROVIDERS.map((provider) => [
+    provider,
+    received.get(provider) ?? fallback.get(provider) ?? collectionDisabledStatus(provider),
+  ])) as Record<QuotaProvider, ProviderQuotaStatus>;
+}
+
+export function pendingQuotaRecord(enabledProviders: QuotaProvider[]): Record<QuotaProvider, ProviderQuotaStatus> {
+  return Object.fromEntries(ALL_PROVIDERS.map((provider) => [
+    provider,
+    enabledProviders.includes(provider) ? {
+      provider,
+      supported: false,
+      planType: null,
+      fiveHour: null,
+      weekly: null,
+      daily: null,
+      message: "잔여 한도를 확인 중입니다.",
+      updatedAt: null,
+    } : collectionDisabledStatus(provider),
+  ])) as Record<QuotaProvider, ProviderQuotaStatus>;
+}
+
+export function useProviderQuotas(enabledProviders: QuotaProvider[] = ALL_PROVIDERS, pollIntervalMs = 30_000) {
+  const providerKey = enabledProviders.join("|");
+  const currentProviderKey = useRef(providerKey);
+  const refreshes = useRef(new Map<string, Promise<void>>());
+  currentProviderKey.current = providerKey;
+  const [quotas, setQuotas] = useState(() => pendingQuotaRecord(enabledProviders));
   const [claudeCapture, setClaudeCapture] = useState<ClaudeQuotaCaptureStatus>(EMPTY_CAPTURE);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
   const [updatedAt, setUpdatedAt] = useState<Date>();
 
-  const refresh = useCallback(async () => {
-    try {
-      const [statuses, capture] = await Promise.all([getQuotaStatuses(), getClaudeQuotaCaptureStatus()]);
-      setQuotas(quotaRecord(statuses));
-      setClaudeCapture(capture);
-      setUpdatedAt(new Date());
-      setError(undefined);
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "공급사 한도 상태를 확인하지 못했습니다.");
-    } finally {
-      setLoading(false);
-    }
-  }, []);
+  const refresh = useCallback((): Promise<void> => {
+    const existing = refreshes.current.get(providerKey);
+    if (existing) return existing;
+    setLoading(true);
+    const run = (async () => {
+      if (currentProviderKey.current !== providerKey) return;
+      try {
+        const [statuses, capture] = await Promise.all([
+          getQuotaStatuses(enabledProviders),
+          enabledProviders.includes("claude") ? getClaudeQuotaCaptureStatus() : Promise.resolve(EMPTY_CAPTURE),
+        ]);
+        if (currentProviderKey.current !== providerKey) return;
+        setQuotas(quotaRecord(statuses, enabledProviders));
+        setClaudeCapture(capture);
+        setUpdatedAt(new Date());
+        setError(undefined);
+      } catch (cause) {
+        if (currentProviderKey.current !== providerKey) return;
+        setError(cause instanceof Error ? cause.message : "공급사 한도 상태를 확인하지 못했습니다.");
+      }
+    })();
+    const task = run.finally(() => {
+      if (refreshes.current.get(providerKey) === task) refreshes.current.delete(providerKey);
+      if (currentProviderKey.current === providerKey) setLoading(false);
+    });
+    refreshes.current.set(providerKey, task);
+    return task;
+  }, [enabledProviders, providerKey]);
+
+  useEffect(() => {
+    setQuotas(pendingQuotaRecord(enabledProviders));
+    setClaudeCapture((current) => enabledProviders.includes("claude") ? current : EMPTY_CAPTURE);
+    setError(undefined);
+    setLoading(true);
+  }, [enabledProviders, providerKey]);
 
   useEffect(() => {
     void refresh();
@@ -59,9 +118,12 @@ export function useProviderQuotas(pollIntervalMs = 30_000) {
   }, [pollIntervalMs, refresh]);
 
   const enableClaudeCapture = useCallback(async () => {
+    if (!enabledProviders.includes("claude")) throw new Error("Claude 수집을 먼저 활성화해 주세요.");
     setBusy(true);
     try {
       setClaudeCapture(await configureClaudeQuotaCapture());
+      const currentRefresh = refreshes.current.get(providerKey);
+      if (currentRefresh) await currentRefresh;
       await refresh();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Claude 한도 수집을 설정하지 못했습니다.");
@@ -69,7 +131,7 @@ export function useProviderQuotas(pollIntervalMs = 30_000) {
     } finally {
       setBusy(false);
     }
-  }, [refresh]);
+  }, [enabledProviders, providerKey, refresh]);
 
   return { quotas, claudeCapture, loading, busy, error, updatedAt, refresh, enableClaudeCapture };
 }

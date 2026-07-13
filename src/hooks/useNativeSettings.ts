@@ -12,20 +12,23 @@ import {
 const EMPTY_AUTOSTART: AutostartStatus = { supported: false, enabled: false, launchCommand: null };
 const EMPTY_GEMINI: GeminiStatus = { installed: false, version: null, executablePath: null, settingsPath: "", settingsExists: false, telemetryConfigured: false, telemetryOutfile: "" };
 
-export function useNativeSettings() {
+export function useNativeSettings(geminiEnabled = true) {
   const [autostart, setAutostartState] = useState(EMPTY_AUTOSTART);
   const [gemini, setGemini] = useState(EMPTY_GEMINI);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   const refresh = useCallback(async () => {
     try {
-      const [autostartStatus, geminiStatus] = await Promise.all([getAutostartStatus(), getGeminiStatus()]);
+      const [autostartStatus, geminiStatus] = await Promise.all([
+        getAutostartStatus(),
+        geminiEnabled ? getGeminiStatus() : Promise.resolve(EMPTY_GEMINI),
+      ]);
       setAutostartState(autostartStatus);
       setGemini(geminiStatus);
     } catch (cause) {
       setMessage(cause instanceof Error ? cause.message : "네이티브 설정을 확인하지 못했습니다.");
     }
-  }, []);
+  }, [geminiEnabled]);
   useEffect(() => { void refresh(); }, [refresh]);
   const toggleAutostart = useCallback(async (enabled: boolean) => {
     setBusy(true);
@@ -37,6 +40,10 @@ export function useNativeSettings() {
     } finally { setBusy(false); }
   }, []);
   const enableGeminiTelemetry = useCallback(async () => {
+    if (!geminiEnabled) {
+      setMessage("Gemini 수집을 먼저 활성화해 주세요.");
+      return;
+    }
     setBusy(true);
     try {
       const result = await configureGeminiTelemetry();
@@ -45,6 +52,6 @@ export function useNativeSettings() {
     } catch (cause) {
       setMessage(cause instanceof Error ? cause.message : "Gemini 수집 설정을 변경하지 못했습니다.");
     } finally { setBusy(false); }
-  }, []);
+  }, [geminiEnabled]);
   return { autostart, gemini, busy, message, refresh, toggleAutostart, enableGeminiTelemetry };
 }

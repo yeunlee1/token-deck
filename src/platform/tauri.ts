@@ -1,5 +1,6 @@
 // Tauri 백엔드의 로컬 로그 탐색 명령을 안전하게 호출하는 어댑터
 import { invoke } from "@tauri-apps/api/core";
+import type { Provider } from "../core";
 
 export interface LocalLogDocument {
   provider: "codex" | "claude" | "gemini";
@@ -31,14 +32,19 @@ function isTauriRuntime(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
-export async function scanLocalUsage(modifiedSince?: number): Promise<LocalLogDocument[]> {
+export async function scanLocalUsage(providers: Provider[], modifiedSince?: number): Promise<LocalLogDocument[]> {
   if (!isTauriRuntime()) return [];
-  return invoke<LocalLogDocument[]>("scan_local_usage", { modifiedSince });
+  return invoke<LocalLogDocument[]>("scan_local_usage", { modifiedSince, providers });
 }
 
-export async function getIntegrationStatus(): Promise<IntegrationStatus> {
+export async function getIntegrationStatus(providers: Provider[]): Promise<IntegrationStatus> {
   if (!isTauriRuntime()) return { codex: false, claude: false, gemini: false };
-  return invoke<IntegrationStatus>("integration_status");
+  return invoke<IntegrationStatus>("integration_status", { providers });
+}
+
+export async function setCollectionProviders(providers: Provider[]): Promise<void> {
+  if (!isTauriRuntime()) return;
+  await invoke("set_collection_providers", { providers });
 }
 
 export function fallbackDeviceName(deviceId: string): string {

@@ -33,7 +33,7 @@ interface SettingsPanelProps {
   nativeMessage: string;
   providerUsage: ProviderUsageRecord[];
   sessions: SessionOption[];
-  displayProviders: Provider[];
+  enabledProviders: Provider[];
   miniTotalVisible: boolean;
   miniTotalPeriod: ChartPeriod;
   inventorySyncEnabled: boolean;
@@ -52,7 +52,7 @@ interface SettingsPanelProps {
   onUpdateSessionTitle: (sessionId: string, title: string) => Promise<void>;
   onSetAutostart: (enabled: boolean) => Promise<void>;
   onConfigureGemini: () => Promise<void>;
-  onToggleDisplayProvider: (provider: Provider) => void;
+  onToggleProvider: (provider: Provider) => void;
   onToggleMiniTotal: () => void;
   onSelectTheme: (theme: ThemeId) => void;
   onConfigureClaudeQuota: () => Promise<void>;
@@ -64,10 +64,18 @@ const providerLabels: Record<CredentialProvider, string> = {
   anthropic: "Anthropic",
   google: "Google Cloud",
 };
+const usageProviderByCredential: Record<CredentialProvider, Provider> = { openai: "codex", anthropic: "claude", google: "gemini" };
+const credentialProviders: CredentialProvider[] = ["openai", "anthropic", "google"];
+const collectionOptions: Array<{ provider: Provider; label: string; detail: string }> = [
+  { provider: "codex", label: "OpenAI Codex", detail: "토큰 사용량 · 주간 잔여 한도" },
+  { provider: "claude", label: "Claude", detail: "토큰 사용량 · 5시간·주간 잔여" },
+  { provider: "gemini", label: "Gemini", detail: "토큰 사용량 · 공식 잔여율 미제공" },
+];
 
-function CredentialForm({ provider, state, onSave, onRemove, onRefresh }: {
+function CredentialForm({ provider, state, collectionEnabled, onSave, onRemove, onRefresh }: {
   provider: CredentialProvider;
   state: CredentialState;
+  collectionEnabled: boolean;
   onSave: SettingsPanelProps["onSaveCredential"];
   onRemove: SettingsPanelProps["onRemoveCredential"];
   onRefresh: SettingsPanelProps["onRefreshProvider"];
@@ -121,8 +129,8 @@ function CredentialForm({ provider, state, onSave, onRemove, onRefresh }: {
   return (
     <form className="credential-form" onSubmit={submit}>
       <div className="setting-row-heading">
-        <div><strong>{providerLabels[provider]}</strong><small>{state.configured ? "이 기기에 자격 증명 저장됨" : "연결되지 않음"}</small></div>
-        <span className={`connection-badge ${state.configured ? "connected" : ""}`}><i />{state.checking ? "확인 중" : state.configured ? "연결됨" : "대기"}</span>
+        <div><strong>{providerLabels[provider]}</strong><small>{collectionEnabled ? state.configured ? "이 기기에 자격 증명 저장됨" : "연결되지 않음" : state.configured ? "자격 증명 저장됨 · 수집 꺼짐" : "수집 꺼짐"}</small></div>
+        <span className={`connection-badge ${state.configured ? "connected" : ""}`}><i />{state.checking ? "확인 중" : state.configured ? collectionEnabled ? "연결됨" : "보관됨" : "대기"}</span>
       </div>
       <div className="credential-fields">
         {provider === "openai" && <><label>Admin API key<input name="adminApiKey" type="password" autoComplete="off" required placeholder="sk-admin-…" /></label><label>Organization ID <em>선택</em><input name="organizationId" autoComplete="off" placeholder="org-…" /></label></>}
@@ -131,9 +139,9 @@ function CredentialForm({ provider, state, onSave, onRemove, onRefresh }: {
       </div>
       <div className="setting-actions">
         <button className="primary-button" disabled={busy || state.checking}>{busy ? "처리 중…" : "저장"}</button>
-        {state.configured && <><button type="button" className="secondary-button" disabled={busy} onClick={() => void refresh()}>사용량 새로고침</button><button type="button" className="danger-button" disabled={busy} onClick={() => void remove()}>삭제</button></>}
+        {state.configured && <><button type="button" className="secondary-button" disabled={busy || !collectionEnabled} onClick={() => void refresh()}>사용량 새로고침</button><button type="button" className="danger-button" disabled={busy} onClick={() => void remove()}>삭제</button></>}
       </div>
-      <p className={`form-message ${state.error ? "error" : ""}`} aria-live="polite">{state.error ?? message}</p>
+      <p className={`form-message ${state.error ? "error" : ""}`} aria-live="polite">{state.error ?? (message || (!collectionEnabled ? "수집을 켜기 전까지 사용량 새로고침은 중지되며, 저장된 자격 증명은 삭제할 수 있습니다." : ""))}</p>
     </form>
   );
 }
@@ -218,10 +226,14 @@ export function SettingsPanel(props: SettingsPanelProps) {
             <div className="setting-toggle-row"><div><strong>이 기기의 도구 목록 공유</strong><small>목록 스키마 버전, 수집·갱신 시각, 내용 비교용 해시와 도구의 종류, 공급사, 항목 ID·이름, 버전, 설치·활성 상태, 수집 출처 분류, 마켓플레이스, MCP 전송 방식, 비밀 설정 필요 여부, 자동 가져오기 가능 여부와 제한 사유 분류만 공유합니다. 비밀값, 명령·인수·URL, 제한 사유의 원문과 전체 경로는 제외됩니다. 공유를 꺼도 사용량·프로젝트·기기 동기화는 계속되며 마지막 도구 목록 스냅샷은 계정 비교용으로 유지됩니다.</small></div><button className={`toggle setting-switch ${props.inventorySyncEnabled ? "on" : ""}`} type="button" role="switch" aria-checked={props.inventorySyncEnabled} aria-label="이 기기의 도구 목록 공유" disabled={props.auth.status !== "authenticated" || props.inventorySyncBusy} onClick={() => void toggleInventorySync()}><span /></button></div>
           </section>
 
-          <section className="setting-section" aria-labelledby="display-title">
-            <div className="setting-section-title"><span className="setting-icon"><Icon name="activity" /></span><div><h3 id="display-title">대시보드 표시 항목</h3><p>개요, 프로젝트와 기기 화면에서 보고 싶은 공급사를 선택합니다.</p></div></div>
-            <div className="provider-visibility" aria-label="대시보드에 표시할 공급사">{(["codex", "claude", "gemini"] as Provider[]).map((provider) => <button key={provider} type="button" aria-pressed={props.displayProviders.includes(provider)} onClick={() => props.onToggleDisplayProvider(provider)}><span className={`project-dot ${provider === "claude" ? "lime" : provider === "gemini" ? "violet" : "ink"}`} /><strong>{provider === "codex" ? "Codex" : provider === "claude" ? "Claude" : "Gemini"}</strong><small>{props.displayProviders.includes(provider) ? "표시 중" : "숨김"}</small></button>)}</div>
-            <p className="setting-hint">최소 한 개는 항상 표시됩니다. 수집과 동기화는 선택과 관계없이 계속됩니다.</p>
+          <section className="setting-section" aria-labelledby="collection-title">
+            <div className="setting-section-title"><span className="setting-icon"><Icon name="activity" /></span><div><h3 id="collection-title">수집할 AI 서비스</h3><p>이 기기에서 사용량과 제공되는 잔여 한도를 확인할 서비스만 선택합니다.</p></div><span className="collection-count">{props.enabledProviders.length}개 수집 중</span></div>
+            <div className="provider-visibility provider-collection" role="group" aria-label="사용량과 잔여 한도를 수집할 AI 서비스">{collectionOptions.map((option) => {
+              const enabled = props.enabledProviders.includes(option.provider);
+              const required = enabled && props.enabledProviders.length === 1;
+              return <button key={option.provider} type="button" aria-pressed={enabled} aria-describedby="collection-rule" disabled={required} onClick={() => props.onToggleProvider(option.provider)}><span className={`project-dot ${option.provider === "claude" ? "lime" : option.provider === "gemini" ? "violet" : "ink"}`} /><span><strong>{option.label}</strong><small>{option.detail}</small></span><em>{enabled ? "수집 중" : "수집 안 함"}</em></button>;
+            })}</div>
+            <p className="setting-hint" id="collection-rule">최소 한 개는 항상 활성화됩니다. 선택한 서비스만 새 로컬 로그와 잔여 한도를 읽고 계정에 동기화하며, 해제해도 원본 로그와 기존 기록은 삭제하지 않습니다.</p>
             <div className="setting-toggle-row"><div><strong>미니모드 총 토큰</strong><small>미니모드에서 선택한 공급사의 {props.miniTotalPeriod} 사용량 합계를 표시합니다.</small></div><button className={`toggle setting-switch ${props.miniTotalVisible ? "on" : ""}`} type="button" role="switch" aria-checked={props.miniTotalVisible} aria-label="미니모드 총 토큰 표시" onClick={props.onToggleMiniTotal}><span /></button></div>
           </section>
 
@@ -244,22 +256,23 @@ export function SettingsPanel(props: SettingsPanelProps) {
           </section>
 
           <section className="setting-section" aria-labelledby="quota-title">
-            <div className="setting-section-title"><span className="setting-icon"><Icon name="activity" /></span><div><h3 id="quota-title">정액제 잔여 한도</h3><p>Codex와 Claude가 제공하는 5시간·주간 잔여 퍼센트를 표시합니다.</p></div><span className={`connection-badge ${props.claudeQuotaCapture.hasData ? "connected" : ""}`}><i />{props.claudeQuotaCapture.hasData ? "Claude 연결됨" : "Claude 설정 필요"}</span></div>
-            {props.claudeQuotaCapture.configured ? <div className="signed-in-card"><div><span className="avatar">CL</span><div><strong>Claude 한도 수집 활성</strong><small>{props.claudeQuotaCapture.hasData ? "최근 정액제 한도 데이터를 받았습니다." : "Claude Code를 한 번 실행하면 한도 정보가 표시됩니다."}</small></div></div></div> : <div className="setting-notice"><Icon name="warning" /><div><strong>{props.claudeQuotaCapture.existingStatusLine ? "기존 Claude 상태 표시 설정이 있습니다." : "Claude 한도 연동이 꺼져 있습니다."}</strong><p>{props.claudeQuotaCapture.existingStatusLine ? "기존 설정을 보호하기 위해 자동으로 덮어쓰지 않습니다." : "Claude Code 상태 표시에서 토큰 내용 없이 잔여 퍼센트만 로컬로 전달합니다."}</p>{!props.claudeQuotaCapture.existingStatusLine && <button className="primary-button inline-action" disabled={props.quotaBusy} onClick={() => void props.onConfigureClaudeQuota()}>{props.quotaBusy ? "설정 중…" : "Claude 한도 연동"}</button>}</div></div>}
+            <div className="setting-section-title"><span className="setting-icon"><Icon name="activity" /></span><div><h3 id="quota-title">정액제 잔여 한도</h3><p>선택한 서비스가 공식적으로 제공하는 잔여 퍼센트를 개요와 미니모드에 표시합니다.</p></div>{props.enabledProviders.includes("claude") && <span className={`connection-badge ${props.claudeQuotaCapture.hasData ? "connected" : ""}`}><i />{props.claudeQuotaCapture.hasData ? "Claude 연결됨" : "Claude 설정 필요"}</span>}</div>
+            {props.enabledProviders.includes("claude") && (props.claudeQuotaCapture.configured ? <div className="signed-in-card"><div><span className="avatar">CL</span><div><strong>Claude 한도 수집 활성</strong><small>{props.claudeQuotaCapture.hasData ? "최근 정액제 한도 데이터를 받았습니다." : "Claude Code를 한 번 실행하면 한도 정보가 표시됩니다."}</small></div></div></div> : <div className="setting-notice"><Icon name="warning" /><div><strong>{props.claudeQuotaCapture.existingStatusLine ? "기존 Claude 상태 표시 설정이 있습니다." : "Claude 한도 연동이 꺼져 있습니다."}</strong><p>{props.claudeQuotaCapture.existingStatusLine ? "기존 설정을 보호하기 위해 자동으로 덮어쓰지 않습니다." : "Claude Code 상태 표시에서 토큰 내용 없이 잔여 퍼센트만 로컬로 전달합니다."}</p>{!props.claudeQuotaCapture.existingStatusLine && <button className="primary-button inline-action" disabled={props.quotaBusy} onClick={() => void props.onConfigureClaudeQuota()}>{props.quotaBusy ? "설정 중…" : "Claude 한도 연동"}</button>}</div></div>)}
+            <p className="setting-hint">Codex는 현재 주간 잔여율만 전달하며, Gemini CLI는 공식 5시간·주간 잔여율을 제공하지 않습니다. 제공되지 않는 값은 추정하지 않습니다.</p>
           </section>
 
           <section className="setting-section" aria-labelledby="providers-title">
             <div className="setting-section-title"><span className="setting-icon"><Icon name="lock" /></span><div><h3 id="providers-title">공급사 자격 증명</h3><p>비밀 값은 Windows Credential Manager에만 저장됩니다.</p></div></div>
-            <div className="credential-stack">{(["openai", "anthropic", "google"] as CredentialProvider[]).map((provider) => <CredentialForm key={provider} provider={provider} state={props.credentials[provider]} onSave={props.onSaveCredential} onRemove={props.onRemoveCredential} onRefresh={props.onRefreshProvider} />)}</div>
+            <div className="credential-stack">{credentialProviders.map((provider) => <CredentialForm key={provider} provider={provider} state={props.credentials[provider]} collectionEnabled={props.enabledProviders.includes(usageProviderByCredential[provider])} onSave={props.onSaveCredential} onRemove={props.onRemoveCredential} onRefresh={props.onRefreshProvider} />)}</div>
             <div className="sync-summary"><span><b>{props.providerUsage.length}</b>개 API 집계</span><span><b>{providerTokens.toLocaleString("ko-KR")}</b> tokens</span><span><b>{providerCost.toFixed(2)}</b> 비용 합계</span></div>
           </section>
 
-          <section className="setting-section" aria-labelledby="gemini-title">
+          {props.enabledProviders.includes("gemini") && <section className="setting-section" aria-labelledby="gemini-title">
             <div className="setting-section-title"><span className="setting-icon"><Icon name="code" /></span><div><h3 id="gemini-title">Gemini CLI 수집</h3><p>로컬 OpenTelemetry 사용 이벤트에서 토큰 수치만 읽습니다.</p></div><span className={`connection-badge ${props.gemini.telemetryConfigured ? "connected" : ""}`}><i />{props.gemini.telemetryConfigured ? "사용자 설정 완료" : props.gemini.installed ? "설정 필요" : "설치 필요"}</span></div>
             {!props.gemini.installed ? <div className="setting-notice"><Icon name="warning" /><div><strong>Gemini CLI를 찾지 못했습니다.</strong><p>Gemini CLI 설치 후 다시 확인하세요.</p><code>npm install -g @google/gemini-cli</code></div></div> : <div className="signed-in-card"><div><span className="avatar">GM</span><div><strong>Gemini CLI {props.gemini.version ?? ""}</strong><small>{props.gemini.telemetryConfigured ? "사용자 설정에서 프롬프트 로깅 제외" : "토큰 텔레메트리 설정 필요"}</small></div></div>{!props.gemini.telemetryConfigured && <button className="primary-button" disabled={props.nativeBusy} onClick={() => void props.onConfigureGemini()}>안전 수집 활성화</button>}</div>}
             {props.gemini.telemetryConfigured && <div className="setting-notice"><Icon name="warning" /><div><strong>사용자 설정 기준 상태입니다.</strong><p>프로젝트 설정이나 환경 변수가 Gemini 설정을 덮어쓸 수 있습니다. Token Deck은 동기화할 때 토큰 수치만 전송합니다.</p></div></div>}
             <p className="form-message" aria-live="polite">{props.nativeMessage}</p>
-          </section>
+          </section>}
 
           <section className="setting-section" aria-labelledby="startup-title">
             <div className="setting-section-title"><span className="setting-icon"><Icon name="device" /></span><div><h3 id="startup-title">Windows 자동 시작</h3><p>로그인할 때 창을 띄우지 않고 트레이에서 수집을 시작합니다.</p></div></div>

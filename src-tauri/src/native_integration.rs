@@ -487,6 +487,38 @@ fn claude_paths() -> Result<(PathBuf, PathBuf), String> {
     ))
 }
 
+fn collection_policy_path() -> Result<PathBuf, String> {
+    Ok(user_home()?
+        .join(".token-deck")
+        .join("collection-providers.json"))
+}
+
+fn collection_policy_allows(content: &str, provider: crate::UsageProvider) -> bool {
+    serde_json::from_str::<Vec<crate::UsageProvider>>(content)
+        .ok()
+        .is_some_and(|providers| providers.contains(&provider))
+}
+
+fn collection_policy_allows_provider(provider: crate::UsageProvider) -> bool {
+    collection_policy_path()
+        .ok()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .is_some_and(|content| collection_policy_allows(&content, provider))
+}
+
+#[tauri::command]
+pub fn set_collection_providers(providers: Vec<crate::UsageProvider>) -> Result<(), String> {
+    let path = collection_policy_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    fs::write(
+        path,
+        serde_json::to_vec(&providers).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())
+}
+
 fn claude_capture_status_inner() -> Result<ClaudeQuotaCaptureStatus, String> {
     let (settings_path, data_path) = claude_paths()?;
     let settings = match fs::read_to_string(&settings_path) {
@@ -607,56 +639,74 @@ fn claude_quota_from_file(path: &Path) -> Option<ProviderQuotaStatus> {
         .and_then(|content| serde_json::from_str(&content).ok())
 }
 
-fn quota_statuses_blocking() -> Result<Vec<ProviderQuotaStatus>, String> {
+fn quota_statuses_blocking(
+    providers: Option<Vec<crate::UsageProvider>>,
+) -> Result<Vec<ProviderQuotaStatus>, String> {
     let _scan_guard = QUOTA_SCAN_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let home = user_home()?;
-    let codex = newest_codex_quota(&home.join(".codex").join("sessions")).unwrap_or_else(|| {
-        ProviderQuotaStatus {
-            provider: "codex".to_owned(),
+    let mut statuses = Vec::new();
+    if crate::provider_selected(providers.as_deref(), crate::UsageProvider::Codex) {
+        let home = user_home()?;
+        statuses.push(
+            newest_codex_quota(&home.join(".codex").join("sessions")).unwrap_or_else(|| {
+                ProviderQuotaStatus {
+                    provider: "codex".to_owned(),
+                    supported: false,
+                    plan_type: None,
+                    five_hour: None,
+                    weekly: None,
+                    daily: None,
+                    message: Some("Codex 한도 이벤트를 기다리는 중입니다".to_owned()),
+                    updated_at: None,
+                }
+            }),
+        );
+    }
+    if crate::provider_selected(providers.as_deref(), crate::UsageProvider::Claude) {
+        let (_, claude_data) = claude_paths()?;
+        statuses.push(claude_quota_from_file(&claude_data).unwrap_or_else(|| {
+            ProviderQuotaStatus {
+                provider: "claude".to_owned(),
+                supported: false,
+                plan_type: None,
+                five_hour: None,
+                weekly: None,
+                daily: None,
+                message: Some("설정에서 Claude 한도 연동을 활성화하세요".to_owned()),
+                updated_at: None,
+            }
+        }));
+    }
+    if crate::provider_selected(providers.as_deref(), crate::UsageProvider::Gemini) {
+        statuses.push(ProviderQuotaStatus {
+            provider: "gemini".to_owned(),
             supported: false,
             plan_type: None,
             five_hour: None,
             weekly: None,
             daily: None,
-            message: Some("Codex 한도 이벤트를 기다리는 중입니다".to_owned()),
+            message: Some("Gemini CLI 정액제는 5시간·주간 한도를 제공하지 않습니다".to_owned()),
             updated_at: None,
-        }
-    });
-    let (_, claude_data) = claude_paths()?;
-    let claude = claude_quota_from_file(&claude_data).unwrap_or_else(|| ProviderQuotaStatus {
-        provider: "claude".to_owned(),
-        supported: false,
-        plan_type: None,
-        five_hour: None,
-        weekly: None,
-        daily: None,
-        message: Some("설정에서 Claude 한도 연동을 활성화하세요".to_owned()),
-        updated_at: None,
-    });
-    let gemini = ProviderQuotaStatus {
-        provider: "gemini".to_owned(),
-        supported: false,
-        plan_type: None,
-        five_hour: None,
-        weekly: None,
-        daily: None,
-        message: Some("Gemini CLI 정액제는 5시간·주간 한도를 제공하지 않습니다".to_owned()),
-        updated_at: None,
-    };
-    Ok(vec![codex, claude, gemini])
+        });
+    }
+    Ok(statuses)
 }
 
 #[tauri::command]
-pub async fn quota_statuses() -> Result<Vec<ProviderQuotaStatus>, String> {
-    tauri::async_runtime::spawn_blocking(quota_statuses_blocking)
+pub async fn quota_statuses(
+    providers: Option<Vec<crate::UsageProvider>>,
+) -> Result<Vec<ProviderQuotaStatus>, String> {
+    tauri::async_runtime::spawn_blocking(move || quota_statuses_blocking(providers))
         .await
         .map_err(|error| format!("한도 상태 수집 작업을 완료하지 못했습니다. {error}"))?
 }
 
 pub fn run_claude_statusline_capture() -> Result<(), String> {
+    if !collection_policy_allows_provider(crate::UsageProvider::Claude) {
+        return Ok(());
+    }
     let mut input = String::new();
     std::io::stdin()
         .read_to_string(&mut input)
@@ -722,8 +772,8 @@ fn claude_quota_from_statusline(
 mod tests {
     use super::{
         autostart_launch_command, claude_quota_from_statusline, claude_statusline_command,
-        is_telemetry_configured, merge_claude_statusline, merge_telemetry_settings,
-        parse_codex_quota, read_file_tail,
+        collection_policy_allows, is_telemetry_configured, merge_claude_statusline,
+        merge_telemetry_settings, parse_codex_quota, quota_statuses_blocking, read_file_tail,
     };
     use serde_json::json;
     use std::{
@@ -754,6 +804,28 @@ mod tests {
 
         assert!(is_telemetry_configured(Some(&safe), outfile));
         assert!(!is_telemetry_configured(Some(&unsafe_settings), outfile));
+    }
+
+    #[test]
+    fn collection_policy_only_allows_explicit_providers() {
+        let policy = r#"["codex","gemini"]"#;
+
+        assert!(collection_policy_allows(
+            policy,
+            crate::UsageProvider::Codex
+        ));
+        assert!(!collection_policy_allows(
+            policy,
+            crate::UsageProvider::Claude
+        ));
+        assert!(collection_policy_allows(
+            policy,
+            crate::UsageProvider::Gemini
+        ));
+        assert!(!collection_policy_allows(
+            "not-json",
+            crate::UsageProvider::Codex
+        ));
     }
 
     #[test]
@@ -832,6 +904,17 @@ mod tests {
 
         assert_eq!(quota.five_hour.unwrap().remaining_percent, 65.0);
         assert_eq!(quota.weekly.unwrap().remaining_percent, 88.0);
+    }
+
+    #[test]
+    fn quota_collection_only_returns_selected_providers() {
+        let gemini = quota_statuses_blocking(Some(vec![crate::UsageProvider::Gemini])).unwrap();
+
+        assert_eq!(gemini.len(), 1);
+        assert_eq!(gemini[0].provider, "gemini");
+        assert!(quota_statuses_blocking(Some(Vec::new()))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 // 로컬 수집, 계정 동기화, 공급사 사용량 조회를 하나의 앱 런타임으로 연결하는 훅
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { sanitizeProjectName, type UsageEvent as LocalUsageEvent } from "../core";
+import { sanitizeProjectName, type Provider, type UsageEvent as LocalUsageEvent } from "../core";
 import { stableId } from "../core/parse-utils";
 import { AUTH_PKCE_VERIFIER_KEY, AUTH_REDIRECT_URL, AUTH_STATE_KEY, authRedirectCode, authRedirectWithState, createPkcePair, listenForAuthDeepLinks, verifyAuthRedirectState } from "../platform/deep-link";
 import { openExternalBrowser } from "../platform/external-browser";
@@ -56,6 +56,11 @@ const SESSION_TOMBSTONES_KEY = "token-deck-supabase-session-tombstones";
 const INVENTORY_SYNC_KEY = "token-deck-device-inventory-sync";
 const INVENTORY_SYNC_LOGIN_CONSENT_KEY = "token-deck-inventory-login-consent";
 const FULL_RECONCILE_INTERVAL_MS = 6 * 60 * 60 * 1_000;
+const ALL_USAGE_PROVIDERS: Provider[] = ["codex", "claude", "gemini"];
+const ALL_CREDENTIAL_PROVIDERS: CredentialProvider[] = ["openai", "anthropic", "google"];
+const CREDENTIAL_PROVIDER_BY_USAGE: Record<Provider, CredentialProvider> = { codex: "openai", claude: "anthropic", gemini: "google" };
+const USAGE_PROVIDER_BY_CREDENTIAL: Record<CredentialProvider, Provider> = { openai: "codex", anthropic: "claude", google: "gemini" };
+const USAGE_PROVIDER_BY_SYNC: Record<string, Provider> = { openai: "codex", anthropic: "claude", google: "gemini", codex: "codex", claude: "claude", gemini: "gemini" };
 
 type AuthStatus = "local" | "signed_out" | "authenticated";
 type CloudSyncStatus = "disabled" | "signed_out" | "idle" | "syncing" | "offline" | "error";
@@ -63,8 +68,15 @@ type InventorySyncStatus = "disabled" | "signed_out" | "idle" | "syncing" | "err
 
 interface CredentialStatus { configured: boolean; checking: boolean; error?: string }
 
-export function useAppRuntime() {
-  const local = useLocalUsage();
+export function useAppRuntime(enabledProviders: Provider[] = ALL_USAGE_PROVIDERS) {
+  const providerKey = enabledProviders.join("|");
+  const currentProviderKey = useRef(providerKey);
+  currentProviderKey.current = providerKey;
+  const selectedCredentialProviders = useMemo(
+    () => enabledProviders.map((provider) => CREDENTIAL_PROVIDER_BY_USAGE[provider]),
+    [providerKey],
+  );
+  const local = useLocalUsage(enabledProviders);
   const [runtimeConfig, setRuntimeConfig] = useState<SupabaseConfig | null>(() => {
     const allowOverride = import.meta.env.DEV;
     const saved = allowOverride ? readJson<SupabaseConfig | null>(CONFIG_KEY, null) : null;
@@ -213,13 +225,15 @@ export function useAppRuntime() {
   }, [authService, clearAccountInventoryState, clearAccountProviderState, client.config]);
 
   const refreshCredentialStatus = useCallback(async () => {
-    const providers: CredentialProvider[] = ["openai", "anthropic", "google"];
+    const providers = ALL_CREDENTIAL_PROVIDERS;
     const generation = accountGenerationRef.current;
     if (!credentialOwner) {
       setCredentials(emptyCredentialStatus());
       return;
     }
-    setCredentials((current) => Object.fromEntries(providers.map((provider) => [provider, { ...current[provider], checking: true }])) as Record<CredentialProvider, CredentialStatus>);
+    const checking = emptyCredentialStatus();
+    providers.forEach((provider) => { checking[provider] = { configured: false, checking: true }; });
+    setCredentials(checking);
     const results = await Promise.all(providers.map(async (provider) => {
       try {
         return [provider, { configured: Boolean(await loadOwnedProviderSecret(provider, credentialOwner)), checking: false }] as const;
@@ -228,7 +242,9 @@ export function useAppRuntime() {
       }
     }));
     if (generation !== accountGenerationRef.current || credentialOwnerRef.current !== credentialOwner) return;
-    setCredentials(Object.fromEntries(results) as Record<CredentialProvider, CredentialStatus>);
+    const next = emptyCredentialStatus();
+    results.forEach(([provider, status]) => { next[provider] = status; });
+    setCredentials(next);
   }, [credentialOwner]);
 
   useEffect(() => { void refreshCredentialStatus(); }, [refreshCredentialStatus]);
@@ -449,8 +465,9 @@ export function useAppRuntime() {
 
   const syncNow = useCallback(() => serializeSyncRef.current(async () => {
     const generation = accountGenerationRef.current;
+    const selectedProviderKey = providerKey;
     await local.refresh();
-    if (generation !== accountGenerationRef.current) return;
+    if (generation !== accountGenerationRef.current || selectedProviderKey !== currentProviderKey.current) return;
     if (!client.enabled) {
       setCloudSync({ status: "disabled", uploaded: 0, pending: 0 });
       return;
@@ -483,7 +500,9 @@ export function useAppRuntime() {
       setCloudSync((current) => ({ ...current, status: "error", error: "동기화할 계정 소유자를 확인할 수 없습니다." }));
       return;
     }
-    const ownedProviderEvents = providerEventsForOwner(providerEvents, providerEventsOwnerRef.current, activeOwner);
+    if (selectedProviderKey !== currentProviderKey.current) return;
+    const ownedProviderEvents = providerEventsForOwner(providerEvents, providerEventsOwnerRef.current, activeOwner)
+      .filter((event) => syncEventProviderEnabled(event, enabledProviders));
     const localClaim = claimAccountLocalEvents(localOwnership, local.events, activeOwner);
     if (localClaim.ownership !== localOwnership) {
       setLocalOwnership(localClaim.ownership);
@@ -500,7 +519,9 @@ export function useAppRuntime() {
     const cycleStartedAt = Date.now();
     const fullReconcile = shouldFullyReconcile(cache, cycleStartedAt);
     const currentPhysicalDeviceId = getOrCreateDeviceId();
-    const activeAccountIsCurrent = () => generation === accountGenerationRef.current && activeOwner === accountOwnerRef.current;
+    const activeAccountIsCurrent = () => generation === accountGenerationRef.current
+      && activeOwner === accountOwnerRef.current
+      && selectedProviderKey === currentProviderKey.current;
     setCloudSync((current) => ({ ...current, status: "syncing", pending: outgoing.length, error: undefined }));
     let usageError: string | undefined;
     let uploaded = 0;
@@ -538,7 +559,7 @@ export function useAppRuntime() {
           id: ACCOUNT_PROVIDER_DEVICE_ID,
           name: "계정 API 집계",
           platform: "account",
-          appVersion: "0.5.1",
+          appVersion: "0.5.2",
           lastSeenAt: new Date().toISOString(),
         });
         if (!activeAccountIsCurrent()) return;
@@ -582,7 +603,7 @@ export function useAppRuntime() {
       setCloudSync((current) => ({ ...current, status: "error", uploaded, error: metadataErrors.join(" ") }));
     }
     await syncDeviceInventoriesForOwner(generation, activeOwner, currentPhysicalDeviceId);
-  }), [accountProjectNameOverrides, activateSession, auth.status, authService, client, local.events, local.inferredProjectNames, local.refresh, localOwnership, providerEvents, remoteProjectNames, sessionTitles, signOut, syncDeviceInventoriesForOwner, syncService]);
+  }), [accountProjectNameOverrides, activateSession, auth.status, authService, client, enabledProviders, local.events, local.inferredProjectNames, local.refresh, localOwnership, providerEvents, providerKey, remoteProjectNames, sessionTitles, signOut, syncDeviceInventoriesForOwner, syncService]);
 
   const syncNowRef = useRef(syncNow);
   syncNowRef.current = syncNow;
@@ -593,7 +614,7 @@ export function useAppRuntime() {
     const timer = window.setInterval(retry, 60_000);
     void syncNowRef.current();
     return () => { window.removeEventListener("online", retry); window.clearInterval(timer); };
-  }, [auth.status]);
+  }, [auth.status, providerKey]);
 
   const refreshAndSyncDeviceInventory = useCallback(async (): Promise<void> => {
     if (auth.status !== "authenticated" || !accountOwnerRef.current) {
@@ -686,19 +707,23 @@ export function useAppRuntime() {
   }), [credentialOwner, refreshCredentialStatus]);
 
   const refreshProviderUsage = useCallback(async (provider: CredentialProvider, query: UsageQuery = defaultQuery()) => {
+    if (!enabledProviders.includes(USAGE_PROVIDER_BY_CREDENTIAL[provider])) {
+      throw new Error("설정에서 해당 AI 서비스의 수집을 먼저 활성화해 주세요.");
+    }
     const generation = accountGenerationRef.current;
     const owner = auth.status === "authenticated" ? accountOwner(sessionScope(client.config), client.currentSession) : undefined;
     if (!credentialOwner || credentialOwnerRef.current !== credentialOwner) throw new Error("로그인 계정이 변경되었습니다. 자격 증명 상태를 다시 확인해 주세요.");
     const records = await fetchStoredProviderUsage(provider, credentialOwner, query);
     if (generation !== accountGenerationRef.current
       || credentialOwnerRef.current !== credentialOwner
-      || owner !== (auth.status === "authenticated" ? accountOwnerRef.current : undefined)) return [];
+      || owner !== (auth.status === "authenticated" ? accountOwnerRef.current : undefined)
+      || providerKey !== currentProviderKey.current) return [];
     const converted = providerRecordsToUsageEvents(records, getOrCreateDeviceId());
     providerEventsOwnerRef.current = owner;
     setProviderUsage((current) => [...current.filter((item) => item.provider !== provider), ...records]);
     setProviderEvents((current) => deduplicateSyncEvents([...current.filter((item) => item.provider !== provider), ...converted]));
     return converted;
-  }, [auth.status, client, credentialOwner]);
+  }, [auth.status, client, credentialOwner, enabledProviders, providerKey]);
 
   const refreshProviderUsageForUi = useCallback(async (provider: CredentialProvider, query?: UsageQuery): Promise<void> => {
     await refreshProviderUsage(provider, query);
@@ -807,12 +832,16 @@ export function useAppRuntime() {
     const activeOwner = auth.status === "authenticated" ? accountOwnerRef.current : undefined;
     const visibleLocalEvents = activeOwner ? filterAccountLocalEvents(local.events, localOwnership, activeOwner) : local.events;
     const currentProviderEvents = providerEventsForOwner(providerEvents, providerEventsOwnerRef.current, activeOwner).flatMap(toLocalUsageEvent);
-    const cloudEvents = [...remoteEvents, ...currentProviderEvents];
+    const cloudEvents = [...remoteEvents, ...currentProviderEvents]
+      .filter((event) => enabledProviders.includes(event.provider));
     return buildUsageViews(visibleLocalEvents, cloudEvents);
-  }, [auth.status, local.events, localOwnership, providerEvents, remoteEvents]);
+  }, [auth.status, enabledProviders, local.events, localOwnership, providerEvents, providerKey, remoteEvents]);
   const accountProviderUsage = useMemo(
-    () => mergeAccountProviderUsage(remoteAccountEvents, providerUsage),
-    [providerUsage, remoteAccountEvents],
+    () => mergeAccountProviderUsage(
+      remoteAccountEvents.filter((event) => syncEventProviderEnabled(event, enabledProviders)),
+      providerUsage.filter((record) => selectedCredentialProviders.includes(record.provider)),
+    ),
+    [enabledProviders, providerKey, providerUsage, remoteAccountEvents, selectedCredentialProviders],
   );
   const authenticatedProjectNames = useMemo(
     () => mergeAccountProjectNames(local.inferredProjectNames, remoteProjectNames, accountProjectNameOverrides),
@@ -875,7 +904,7 @@ function currentDevice(info: CurrentDeviceInfo = fallbackCurrentDeviceInfo()): D
     id: getOrCreateDeviceId(),
     name: info.name,
     platform: info.platform,
-    appVersion: "0.5.1",
+    appVersion: "0.5.2",
     lastSeenAt: new Date().toISOString(),
   };
 }
@@ -1363,6 +1392,10 @@ function jwtSubject(token: string): string | undefined {
 }
 function message(cause: unknown): string { return cause instanceof Error ? cause.message : String(cause); }
 function deduplicateSyncEvents(events: SyncUsageEvent[]): SyncUsageEvent[] { return [...new Map(events.map((event) => [event.eventId, event])).values()]; }
+function syncEventProviderEnabled(event: SyncUsageEvent, enabledProviders: Provider[]): boolean {
+  const provider = USAGE_PROVIDER_BY_SYNC[event.provider];
+  return Boolean(provider && enabledProviders.includes(provider));
+}
 export function mergeAccountProviderUsage(remote: SyncUsageEvent[], current: ProviderUsageRecord[]): ProviderUsageRecord[] {
   const byBucket = new Map<string, { record: ProviderUsageRecord; priority: number }>();
   for (const event of remote) {
@@ -1398,7 +1431,7 @@ function providerUsageBucketKey(record: ProviderUsageRecord): string {
 }
 function toLocalUsageEvent(event: SyncUsageEvent): LocalUsageEvent[] {
   if (event.source === "cloud_billing") return [];
-  const provider = ({ openai: "codex", anthropic: "claude", google: "gemini", codex: "codex", claude: "claude", gemini: "gemini" } as const)[event.provider];
+  const provider = USAGE_PROVIDER_BY_SYNC[event.provider];
   const tokenCount = event.inputTokens + event.cachedTokens + event.outputTokens + event.reasoningTokens + event.toolTokens;
   if (!provider || tokenCount === 0) return [];
   return [{

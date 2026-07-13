@@ -6,7 +6,11 @@ import { SettingsPanel } from "./SettingsPanel";
 
 type SettingsProps = ComponentProps<typeof SettingsPanel>;
 
-function renderSettings(auth: SettingsProps["auth"], allowSupabaseOverride = false): string {
+function renderSettings(
+  auth: SettingsProps["auth"],
+  allowSupabaseOverride = false,
+  overrides: Partial<SettingsProps> = {},
+): string {
   const asyncAction = vi.fn(async () => undefined);
   const props: SettingsProps = {
     open: true,
@@ -31,7 +35,7 @@ function renderSettings(auth: SettingsProps["auth"], allowSupabaseOverride = fal
     nativeMessage: "",
     providerUsage: [],
     sessions: [],
-    displayProviders: ["codex", "claude", "gemini"],
+    enabledProviders: ["codex", "claude", "gemini"],
     miniTotalVisible: true,
     miniTotalPeriod: "오늘",
     inventorySyncEnabled: false,
@@ -50,11 +54,12 @@ function renderSettings(auth: SettingsProps["auth"], allowSupabaseOverride = fal
     onUpdateSessionTitle: asyncAction,
     onSetAutostart: asyncAction,
     onConfigureGemini: asyncAction,
-    onToggleDisplayProvider: vi.fn(),
+    onToggleProvider: vi.fn(),
     onToggleMiniTotal: vi.fn(),
     onSelectTheme: vi.fn(),
     onConfigureClaudeQuota: asyncAction,
     onSetInventorySyncEnabled: asyncAction,
+    ...overrides,
   };
 
   return renderToStaticMarkup(<SettingsPanel {...props} />);
@@ -101,5 +106,31 @@ describe("SettingsPanel 계정 진입 경로", () => {
     expect(markup).toContain("모던 블루");
     expect((markup.match(/type="radio"/g) ?? [])).toHaveLength(6);
     expect((markup.match(/checked=""/g) ?? [])).toHaveLength(1);
+  });
+
+  it("세 인공지능 서비스를 실제 수집 대상으로 선택할 수 있게 표시한다", () => {
+    const markup = renderSettings({ enabled: true, status: "signed_out" });
+
+    expect(markup).toContain("수집할 AI 서비스");
+    expect(markup).toContain("OpenAI Codex");
+    expect(markup).toContain("Claude");
+    expect(markup).toContain("Gemini");
+    expect((markup.match(/aria-pressed="true"/g) ?? [])).toHaveLength(3);
+    expect(markup).toContain("선택한 서비스만 새 로컬 로그와 잔여 한도를 읽고 계정에 동기화");
+  });
+
+  it("코덱스만 선택하면 Claude와 Gemini의 추가 수집 설정을 숨긴다", () => {
+    const markup = renderSettings(
+      { enabled: true, status: "signed_out" },
+      false,
+      { enabledProviders: ["codex"] },
+    );
+
+    expect((markup.match(/aria-pressed="true"/g) ?? [])).toHaveLength(1);
+    expect((markup.match(/aria-pressed="false"/g) ?? [])).toHaveLength(2);
+    expect((markup.match(/class="credential-form"/g) ?? [])).toHaveLength(3);
+    expect(markup).toContain("disabled");
+    expect(markup).not.toContain("Claude 한도 연동이 꺼져 있습니다");
+    expect(markup).not.toContain("Gemini CLI 수집");
   });
 });
