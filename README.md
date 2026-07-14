@@ -52,6 +52,6 @@ npm run build
 npm run desktop:build
 ```
 
-Windows 설치 파일은 `src-tauri/target/release/bundle/nsis/Token Deck_0.5.3_x64-setup.exe`에 생성됩니다.
+Windows 설치 파일은 `src-tauri/target/release/bundle/nsis/Token Deck_0.5.4_x64-setup.exe`에 생성됩니다.
 
 자동 업데이트가 처음 포함된 `0.3.0`은 사용자가 설치 파일로 한 번 설치해야 합니다. 이후 게시되는 더 높은 버전부터 앱 안에서 업데이트할 수 있습니다.
