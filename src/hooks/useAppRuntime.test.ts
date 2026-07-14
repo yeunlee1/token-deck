@@ -284,7 +284,7 @@ describe("증분 계정 동기화", () => {
     const cache = createUsageSyncCache("scope\nuser-a");
 
     expect(shouldFullyReconcile(cache, now)).toBe(true);
-    reconcileDownloadedUsage(cache, [], true, now);
+    expect(reconcileDownloadedUsage(cache, [], true, now)).toBe(true);
     const firstUpload = selectChangedUsageEvents(cache, events);
     expect(firstUpload).toHaveLength(80_000);
     recordUploadedUsage(cache, firstUpload);
@@ -294,7 +294,7 @@ describe("증분 계정 동기화", () => {
     expect(shouldFullyReconcile(cache, secondSyncAt)).toBe(false);
     const incrementalResponse = events.filter((item) => item.deviceId !== physicalDeviceId);
     expect(incrementalResponse).toEqual([]);
-    reconcileDownloadedUsage(cache, incrementalResponse, false, secondSyncAt);
+    expect(reconcileDownloadedUsage(cache, incrementalResponse, false, secondSyncAt)).toBe(false);
     expect(selectChangedUsageEvents(cache, events)).toEqual([]);
     expect(shouldFullyReconcile(cache, now + 6 * 60 * 60 * 1_000)).toBe(true);
   });
@@ -307,7 +307,7 @@ describe("증분 계정 동기화", () => {
       deviceId: physicalDeviceId,
       createdAt: "2026-07-12T00:00:00.000Z",
     });
-    reconcileDownloadedUsage(cache, [seed], true, Date.parse("2026-07-12T00:00:00.000Z"));
+    expect(reconcileDownloadedUsage(cache, [seed], true, Date.parse("2026-07-12T00:00:00.000Z"))).toBe(true);
 
     const remoteR = syncEvent({
       eventId: "remote-r",
@@ -321,8 +321,19 @@ describe("증분 계정 동기화", () => {
     const nextIncrementalResponse = [seed, remoteR, localL]
       .filter((item) => item.createdAt && item.createdAt >= (cache.cursor ?? ""))
       .filter((item) => item.deviceId !== physicalDeviceId);
-    reconcileDownloadedUsage(cache, nextIncrementalResponse, false, Date.parse("2026-07-12T00:01:00.000Z"));
+    expect(reconcileDownloadedUsage(cache, nextIncrementalResponse, false, Date.parse("2026-07-12T00:01:00.000Z"))).toBe(true);
     expect(cache.remoteEvents.get("remote-r")).toEqual(remoteR);
+  });
+
+  it("같은 원격 이벤트가 증분 조회에 다시 포함되면 화면용 참조를 바꾸지 않는다", () => {
+    const cache = createUsageSyncCache("scope\nuser-a");
+    const original = syncEvent({ eventId: "remote-a", createdAt: "2026-07-12T00:00:00.000Z" });
+    expect(reconcileDownloadedUsage(cache, [original], true)).toBe(true);
+
+    const duplicate = { ...original };
+
+    expect(reconcileDownloadedUsage(cache, [duplicate], false)).toBe(false);
+    expect(cache.remoteEvents.get(original.eventId)).toBe(original);
   });
 
   it("계정 전환용 새 캐시는 이전 계정 fingerprint와 원격 이벤트를 물려받지 않는다", () => {

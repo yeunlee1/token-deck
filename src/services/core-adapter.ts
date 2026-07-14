@@ -78,13 +78,16 @@ export function buildUsageViews(local: CollectorUsageEvent[], cloud: CollectorUs
 export function normalizeLegacyProjectAliases(events: CollectorUsageEvent[]): CollectorUsageEvent[] {
   const aliases = new Map<string, string>();
   const ambiguous = new Set<string>();
+  const canonicalProjectIds = new Set<string>();
   for (const event of events) {
-    if (!CANONICAL_PROJECT_ID.test(event.projectId)) continue;
+    if (CANONICAL_PROJECT_ID.test(event.projectId)) canonicalProjectIds.add(event.projectId);
+  }
+  for (const projectId of canonicalProjectIds) {
     for (const provider of LOCAL_PROVIDERS) {
-      const legacyId = `project_${stableId("sync-project", provider, event.projectId)}`;
+      const legacyId = `project_${stableId("sync-project", provider, projectId)}`;
       const current = aliases.get(legacyId);
-      if (current && current !== event.projectId) ambiguous.add(legacyId);
-      else aliases.set(legacyId, event.projectId);
+      if (current && current !== projectId) ambiguous.add(legacyId);
+      else aliases.set(legacyId, projectId);
     }
   }
   ambiguous.forEach((id) => aliases.delete(id));

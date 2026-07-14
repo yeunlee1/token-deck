@@ -84,6 +84,27 @@ describe("toSyncUsageEvent", () => {
     expect(legacy.projectId).toBe(legacyId);
   });
 
+  it("같은 정규 프로젝트가 대량으로 반복되어도 별칭 해시를 프로젝트별로 한 번만 계산한다", () => {
+    const canonicalId = `git_${"d".repeat(64)}`;
+    const legacyId = `project_${stableId("sync-project", "claude", canonicalId)}`;
+    const repeatedEvent = {
+      ...localEvent("local-jsonl"),
+      id: "current",
+      projectId: canonicalId,
+    };
+    const repeated = Array.from({ length: 100_000 }, () => repeatedEvent);
+    const startedAt = performance.now();
+
+    const normalized = normalizeLegacyProjectAliases([
+      { ...localEvent("local-jsonl"), id: "legacy", projectId: legacyId },
+      ...repeated,
+    ]);
+
+    expect(normalized[0].projectId).toBe(canonicalId);
+    expect(normalized.at(-1)).toBe(repeatedEvent);
+    expect(performance.now() - startedAt).toBeLessThan(2_000);
+  });
+
   it("다른 기기의 세션 제목을 기존 제목 맵에 병합한다", () => {
     const synced = toSyncUsageEvent(localEvent("local-jsonl"));
     expect(mergeSessionTitles({ old: "기존 제목" }, [{ ...synced, sessionTitle: "원격 제목" }]))

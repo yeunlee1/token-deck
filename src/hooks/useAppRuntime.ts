@@ -276,6 +276,8 @@ export function useAppRuntime(enabledProviders: Provider[] = ALL_USAGE_PROVIDERS
   });
   const [providerEvents, setProviderEvents] = useState<SyncUsageEvent[]>([]);
   const [sessionTitles, setSessionTitles] = useState<Record<string, string>>(() => readSessionTitles(undefined));
+  const sessionTitlesRef = useRef(sessionTitles);
+  sessionTitlesRef.current = sessionTitles;
   const accountGenerationRef = useRef(0);
   const authAttemptGenerationRef = useRef(0);
   const accountOwnerRef = useRef<string | undefined>(undefined);
@@ -667,9 +669,8 @@ export function useAppRuntime(enabledProviders: Provider[] = ALL_USAGE_PROVIDERS
     }
   }, [refreshDeviceInventory, syncService]);
 
-  const syncNow = useCallback(() => serializeSyncRef.current(async () => {
-    const generation = accountGenerationRef.current;
-    const selectedProviderKey = providerKey;
+  const enqueueSync = useCallback((generation: number, selectedProviderKey: string) => serializeSyncRef.current(async () => {
+    if (generation !== accountGenerationRef.current || selectedProviderKey !== currentProviderKey.current) return;
     if (!local.cacheReady) return;
     if (!await local.refresh()) return;
     if (generation !== accountGenerationRef.current || selectedProviderKey !== currentProviderKey.current) return;
@@ -732,7 +733,7 @@ export function useAppRuntime(enabledProviders: Provider[] = ALL_USAGE_PROVIDERS
       setCloudSync((current) => ({ ...current, status: "error", error }));
       return;
     }
-    const titled = localEventsToTitledSyncEvents(ownedLocalEvents, sessionTitles);
+    const titled = localEventsToTitledSyncEvents(ownedLocalEvents, sessionTitlesRef.current);
     const outgoing = deduplicateSyncEvents([...titled, ...ownedProviderEvents]);
     if (typeof navigator !== "undefined" && navigator.onLine === false) {
       setCloudSync((current) => ({ ...current, status: "offline", pending: outgoing.length, error: "네트워크가 복구되면 자동으로 다시 시도합니다." }));
@@ -753,6 +754,18 @@ export function useAppRuntime(enabledProviders: Provider[] = ALL_USAGE_PROVIDERS
     let usageError: string | undefined;
     let uploaded = 0;
     let registrationError: string | undefined;
+    let downloadedUsageChanged = false;
+    let remoteUsagePublished = false;
+    const publishRemoteUsage = () => {
+      const combinedRemote = [...cache.remoteEvents.values()];
+      setRemoteEvents(combinedRemote.flatMap(toLocalUsageEvent));
+      setRemoteAccountEvents(combinedRemote.filter((event) => event.source === "provider_api" || event.source === "cloud_billing"));
+      const mergedTitles = mergeSessionTitles(sessionTitlesRef.current, combinedRemote);
+      sessionTitlesRef.current = mergedTitles;
+      setSessionTitles(mergedTitles);
+      writeSessionTitles(activeOwner, mergedTitles);
+      remoteUsagePublished = true;
+    };
     try {
       const deviceInfo = await getCurrentDeviceInfo(currentPhysicalDeviceId);
       if (!activeAccountIsCurrent()) return;
@@ -772,15 +785,10 @@ export function useAppRuntime(enabledProviders: Provider[] = ALL_USAGE_PROVIDERS
         activeAccountIsCurrent,
       );
       if (!activeAccountIsCurrent()) return;
-      reconcileDownloadedUsage(cache, downloaded, fullReconcile, cycleStartedAt);
+      downloadedUsageChanged = reconcileDownloadedUsage(cache, downloaded, fullReconcile, cycleStartedAt);
       const changed = selectChangedUsageEvents(cache, outgoing);
       setCloudSync((current) => ({ ...current, pending: changed.length }));
-      const combinedRemote = [...cache.remoteEvents.values()];
-      setRemoteEvents(combinedRemote.flatMap(toLocalUsageEvent));
-      setRemoteAccountEvents(combinedRemote.filter((event) => event.source === "provider_api" || event.source === "cloud_billing"));
-      const mergedTitles = mergeSessionTitles(sessionTitles, combinedRemote);
-      setSessionTitles(mergedTitles);
-      writeSessionTitles(activeOwner, mergedTitles);
+      if (downloadedUsageChanged && changed.length === 0) publishRemoteUsage();
       if (registrationError) throw new Error(`현재 기기 등록 실패. ${registrationError}`);
       if (changed.some((event) => event.source === "provider_api" || event.source === "cloud_billing")) {
         if (!activeAccountIsCurrent()) return;
@@ -804,9 +812,11 @@ export function useAppRuntime(enabledProviders: Provider[] = ALL_USAGE_PROVIDERS
       if (result.error) throw new Error(result.error);
       uploaded = result.uploaded;
       recordUploadedUsage(cache, changed);
+      if (!remoteUsagePublished && (downloadedUsageChanged || changed.length > 0)) publishRemoteUsage();
       setCloudSync({ status: "idle", uploaded: result.uploaded, pending: 0, lastSyncedAt: new Date() });
     } catch (cause) {
       if (!activeAccountIsCurrent()) return;
+      if (downloadedUsageChanged && !remoteUsagePublished) publishRemoteUsage();
       const offline = typeof navigator !== "undefined" && navigator.onLine === false;
       usageError = message(cause);
       setCloudSync((current) => ({ ...current, status: offline ? "offline" : "error", pending: outgoing.length, error: usageError }));
@@ -833,7 +843,11 @@ export function useAppRuntime(enabledProviders: Provider[] = ALL_USAGE_PROVIDERS
       setCloudSync((current) => ({ ...current, status: "error", uploaded, error: metadataErrors.join(" ") }));
     }
     await syncDeviceInventoriesForOwner(generation, activeOwner, currentPhysicalDeviceId);
-  }), [accountProjectNameOverrides, activateSession, auth.status, authService, client, enabledProviders, local.allEvents, local.cacheReady, local.events, local.getCodexCumulative, local.getCodexRetiredSessionFilter, local.inferredProjectNames, local.refresh, providerEvents, providerKey, remoteProjectNames, sessionTitles, signOut, syncDeviceInventoriesForOwner, syncService, updateLocalUsageOwnership]);
+  }), [accountProjectNameOverrides, activateSession, auth.status, authService, client, enabledProviders, local.allEvents, local.cacheReady, local.events, local.getCodexCumulative, local.getCodexRetiredSessionFilter, local.inferredProjectNames, local.refresh, providerEvents, remoteProjectNames, signOut, syncDeviceInventoriesForOwner, syncService, updateLocalUsageOwnership]);
+  const syncNow = useCallback(
+    () => enqueueSync(accountGenerationRef.current, providerKey),
+    [enqueueSync, providerKey],
+  );
 
   const syncNowRef = useRef(syncNow);
   syncNowRef.current = syncNow;
@@ -970,13 +984,14 @@ export function useAppRuntime(enabledProviders: Provider[] = ALL_USAGE_PROVIDERS
   }, [refreshProviderUsage]);
 
   const updateSessionTitle = useCallback(async (sessionId: string, title: string) => {
-    const next = { ...sessionTitles };
+    const next = { ...sessionTitlesRef.current };
     const normalized = title.trim();
     if (normalized) next[sessionId] = normalized;
     else delete next[sessionId];
+    sessionTitlesRef.current = next;
     setSessionTitles(next);
     writeSessionTitles(auth.status === "authenticated" ? accountOwnerRef.current : undefined, next);
-  }, [auth.status, sessionTitles]);
+  }, [auth.status]);
 
   const updateProjectName = useCallback(async (projectId: string, name: string) => {
     const normalized = sanitizeProjectName(name);
@@ -1407,7 +1422,8 @@ export function reconcileDownloadedUsage(
   downloaded: SyncUsageEvent[],
   fullReconcile: boolean,
   now = Date.now(),
-): void {
+): boolean {
+  let changed = fullReconcile;
   if (fullReconcile) {
     cache.fingerprints.clear();
     cache.remoteEvents.clear();
@@ -1415,12 +1431,17 @@ export function reconcileDownloadedUsage(
     cache.lastFullAt = now;
   }
   for (const event of downloaded) {
-    cache.fingerprints.set(event.eventId, usageEventFingerprint(event));
-    cache.remoteEvents.set(event.eventId, event);
+    const fingerprint = usageEventFingerprint(event);
+    if (cache.fingerprints.get(event.eventId) !== fingerprint || !cache.remoteEvents.has(event.eventId)) {
+      cache.remoteEvents.set(event.eventId, event);
+      changed = true;
+    }
+    cache.fingerprints.set(event.eventId, fingerprint);
     advanceUsageCursor(cache, event.createdAt);
   }
   cache.cursor ??= new Date(now - 5 * 60_000).toISOString();
   cache.initialized = true;
+  return changed;
 }
 
 export function selectChangedUsageEvents(cache: UsageSyncCache, outgoing: SyncUsageEvent[]): SyncUsageEvent[] {
