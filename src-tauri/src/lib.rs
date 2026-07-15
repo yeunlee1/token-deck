@@ -442,6 +442,22 @@ mod tests {
     }
 
     #[test]
+    fn tray_icon_uses_the_default_window_image() {
+        let default_icon = tauri::image::Image::new_owned(vec![16, 32, 48, 255], 1, 1);
+
+        let tray_icon = super::required_tray_icon(Some(&default_icon)).unwrap();
+
+        assert_eq!(tray_icon.rgba(), default_icon.rgba());
+        assert_eq!(tray_icon.width(), 1);
+        assert_eq!(tray_icon.height(), 1);
+    }
+
+    #[test]
+    fn tray_icon_creation_fails_when_the_default_image_is_missing() {
+        assert!(super::required_tray_icon(None).is_err());
+    }
+
+    #[test]
     fn existing_webview_device_id_is_migrated_to_durable_native_state() {
         let home = temporary_home("device-id-migration");
         let existing = "00000000-0000-4000-8000-000000000001";
@@ -3244,6 +3260,17 @@ fn integration_status(providers: Option<Vec<UsageProvider>>) -> serde_json::Valu
     })
 }
 
+fn required_tray_icon<'a>(
+    icon: Option<&tauri::image::Image<'a>>,
+) -> std::io::Result<tauri::image::Image<'a>> {
+    icon.cloned().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "Token Deck 기본 아이콘을 불러오지 못했습니다",
+        )
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -3269,7 +3296,9 @@ pub fn run() {
             let show = MenuItem::with_id(app, "show", "Token Deck 열기", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "종료", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show, &quit])?;
+            let tray_icon = required_tray_icon(app.default_window_icon())?;
             let _tray = TrayIconBuilder::new()
+                .icon(tray_icon)
                 .tooltip("Token Deck")
                 .menu(&menu)
                 .on_menu_event(|app, event| match event.id.as_ref() {
